@@ -105,4 +105,5 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" --generate-notes coop-*.tar.gz SHA256SUMS
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --generate-notes coop-*.tar.gz SHA256SUMS
