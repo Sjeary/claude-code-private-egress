@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Installer for coop — downloads a prebuilt binary from GitHub Releases.
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/OWNER/coop/main/install.sh | sh
+#   curl -fsSL ... | VERSION=v0.1.0 sh
+#   curl -fsSL ... | INSTALL_DIR=/usr/local/bin sh
+
+REPO="trailofbits/coop"
+BINARY="coop"
+INSTALL_DIR="${INSTALL_DIR:-${HOME}/.coop/bin}"
+
+# --- helpers ----------------------------------------------------------------
+
+die() { printf 'Error: %s\n' "$1" >&2; exit 1; }
+
+info() { printf '  %s\n' "$1"; }
+
+need() {
+    command -v "$1" > /dev/null 2>&1 || die "'$1' is required but not found"
+}
+
+detect_platform() {
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+
+    case "$os" in
+        Linux)  OS="linux" ;;
+        Darwin) OS="darwin" ;;
+        *)      die "Unsupported OS: $os" ;;
+    esac
+
+    case "$arch" in
+        x86_64|amd64)  ARCH="x86_64" ;;
+        aarch64|arm64) ARCH="aarch64" ;;
+        *)             die "Unsupported architecture: $arch" ;;
+    esac
+}
+
+target_triple() {
+    case "${OS}-${ARCH}" in
+        linux-x86_64)   echo "x86_64-unknown-linux-musl" ;;
+        linux-aarch64)  echo "aarch64-unknown-linux-musl" ;;
+        darwin-x86_64)  echo "x86_64-apple-darwin" ;;
+        darwin-aarch64) echo "aarch64-apple-darwin" ;;
+        *)              die "No prebuilt binary for ${OS}-${ARCH}" ;;
+    esac
+}
+
+latest_version() {
+    local url="https://api.github.com/repos/${REPO}/releases/latest"
+    curl -fsSL "$url" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
+}
+
+verify_checksum() {
+    local file="$1" expected="$2"
+    local actual
+    if command -v sha256sum > /dev/null 2>&1; then
+        actual="$(sha256sum "$file" | cut -d' ' -f1)"
+    elif command -v shasum > /dev/null 2>&1; then
+        actual="$(shasum -a 256 "$file" | cut -d' ' -f1)"
+    else
+        info "Warning: no sha256sum or shasum found, skipping checksum verification"
+        return 0
+    fi
+
+    if [ "$actual" != "$expected" ]; then
+        die "Checksum mismatch for $(basename "$file"): expected $expected, got $actual"
+    fi
+}
+
+# --- main -------------------------------------------------------------------
+
+need curl
+detect_platform
+
+VERSION="${VERSION:-$(latest_version)}"
+[ -n "$VERSION" ] || die "Could not determine latest version. Set VERSION= explicitly."
+
+TRIPLE="$(target_triple)"
+TARBALL="${BINARY}-${VERSION}-${TRIPLE}.tar.gz"
+BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+TARBALL_URL="${BASE_URL}/${TARBALL}"
+CHECKSUMS_URL="${BASE_URL}/SHA256SUMS"
+
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+printf 'Installing %s %s (%s)\n' "$BINARY" "$VERSION" "$TRIPLE"
+
+info "Downloading ${TARBALL}..."
+curl -fsSL -o "${TMPDIR}/${TARBALL}" "$TARBALL_URL"
+
+info "Downloading checksums..."
+curl -fsSL -o "${TMPDIR}/SHA256SUMS" "$CHECKSUMS_URL"
+
+info "Verifying checksum..."
+EXPECTED="$(grep "${TARBALL}" "${TMPDIR}/SHA256SUMS" | cut -d' ' -f1)"
+[ -n "$EXPECTED" ] || die "Tarball ${TARBALL} not found in SHA256SUMS"
+verify_checksum "${TMPDIR}/${TARBALL}" "$EXPECTED"
+
+info "Extracting..."
+tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
+
+info "Installing to ${INSTALL_DIR}..."
+mkdir -p "$INSTALL_DIR"
+mv "${TMPDIR}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+chmod +x "${INSTALL_DIR}/${BINARY}"
+
+printf '\n✓ %s %s installed to %s/%s\n' "$BINARY" "$VERSION" "$INSTALL_DIR" "$BINARY"
+
+# Check if INSTALL_DIR is on PATH
+case ":${PATH}:" in
+    *":${INSTALL_DIR}:"*) ;;
+    *)
+        printf '\nAdd %s to your PATH:\n' "$INSTALL_DIR"
+        # shellcheck disable=SC2016
+        printf '  export PATH="%s:$PATH"\n' "$INSTALL_DIR"
+        ;;
+esac

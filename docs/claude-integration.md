@@ -1,0 +1,190 @@
+# Claude Code Integration
+
+coop sets up Claude Code inside guest VMs and gives you a single command to launch it. This guide covers the `coop claude` command, the configuration that controls what gets injected into the guest, and the bootstrap sequence that runs at `coop start`.
+
+## Launching Claude Code
+
+```bash
+coop claude [instance-name] [-- extra-args...]
+```
+
+This SSHes into the guest and runs the `claude` CLI. By default, coop passes `--dangerously-skip-permissions` so Claude operates without confirmation prompts. The VM is the isolation boundary; permission prompts inside it are redundant.
+
+To restore permission prompts:
+
+```bash
+coop claude --ask
+```
+
+Trailing arguments go straight through to the `claude` CLI:
+
+```bash
+coop claude -- --model sonnet --verbose
+```
+
+### tmux session persistence
+
+`coop claude` runs inside a tmux session named `claude` by default. If the SSH connection drops, the Claude process survives in the guest. Running `coop claude` again reattaches to the existing session rather than starting a new one.
+
+To bypass tmux and get a raw SSH session:
+
+```bash
+coop claude --no-tmux
+```
+
+## Configuration
+
+All Claude-related settings live under the `[claude]` section in `config.toml`:
+
+```toml
+[claude]
+api_key = "sk-ant-..."
+env_forward = ["MYORG_KEY"]
+github = "auto"
+global_claude_md = "~/.claude/CLAUDE.md"
+rules = ["~/.claude/rules/my-rules.md"]
+marketplaces = [
+  "https://github.com/anthropics/claude-plugins-official",
+  "/path/to/local/marketplace",
+]
+plugins = ["rust-analyzer-lsp@claude-plugins-official"]
+
+[claude.mcp_servers.sentry]
+type = "http"
+url = "https://mcp.sentry.dev/mcp"
+```
+
+Every field is optional. An empty `[claude]` section (or omitting it entirely) skips all bootstrap steps.
+
+### API key forwarding
+
+coop forwards `ANTHROPIC_API_KEY` to the guest via SSH `SendEnv` on every session -- `coop claude`, `coop ssh`, and `coop exec` alike. The key is never written to disk inside the guest.
+
+Resolution order:
+
+1. `claude.api_key` in `config.toml`
+2. `ANTHROPIC_API_KEY` environment variable on the host
+
+If neither is set, the guest starts without an API key. You can authenticate interactively the first time you run `claude` inside the VM.
+
+### GitHub auth
+
+The `github` field controls how coop obtains a `GITHUB_TOKEN` for the guest. This token enables private repo cloning and `gh` CLI usage inside the VM.
+
+| Value    | Behavior |
+|----------|----------|
+| `"auto"` | Check the `GITHUB_TOKEN` env var first. If unset, run `gh auth token` on the host to extract a token from the GitHub CLI. |
+| `"env"`  | Require `GITHUB_TOKEN` in the host environment. Warns if missing. |
+| `"off"`  | Skip GitHub token forwarding entirely. This is the default when `github` is unset. |
+
+When a token is available, coop runs `gh auth setup-git` in the guest during bootstrap. This configures the git credential helper so `git clone` works against private repositories without further setup.
+
+### CLAUDE.md injection
+
+`global_claude_md` points to a file on the host that coop copies into the guest at `~/.claude/CLAUDE.md`. This is Claude Code's global instructions file -- it applies to every conversation in the VM.
+
+```toml
+[claude]
+global_claude_md = "~/.claude/CLAUDE.md"
+```
+
+### Rules files
+
+`rules` lists host paths to rule files. Each one gets copied into `~/.claude/rules/` in the guest, preserving its filename.
+
+```toml
+[claude]
+rules = [
+  "~/.claude/rules/security.md",
+  "~/.claude/rules/style.md",
+]
+```
+
+### Environment variable forwarding
+
+`env_forward` lists additional environment variable names to forward from the host to the guest via SSH `SendEnv`. These are forwarded on every SSH session, not just during bootstrap.
+
+`ANTHROPIC_API_KEY` and `GITHUB_TOKEN` are handled through their own mechanisms (described above) and do not need to appear here.
+
+```toml
+[claude]
+env_forward = ["MYORG_KEY", "OPENAI_API_KEY"]
+```
+
+Each variable must be set in the host environment at the time of the SSH session. Unset variables are silently skipped.
+
+### Plugin marketplaces
+
+`marketplaces` lists plugin marketplace sources. Each entry is either a remote URL (typically a GitHub repository) or an absolute path to a local directory.
+
+```toml
+[claude]
+marketplaces = [
+  "https://github.com/anthropics/claude-plugins-official",
+  "/Users/me/dev/my-marketplace",
+]
+```
+
+Remote URLs are passed directly to `claude plugin marketplace add --scope user` inside the guest.
+
+Local directories are first copied into the guest at `~/.coop/marketplaces/<dirname>/` via SCP, then registered using the guest-side path. This is useful when you're developing a marketplace and want to test plugins without publishing them to a remote source.
+
+### Plugin installation
+
+`plugins` lists plugins to install from the registered marketplaces. Each entry is passed to `claude plugin install <name> -s user` inside the guest.
+
+```toml
+[claude]
+plugins = [
+  "rust-analyzer-lsp@claude-plugins-official",
+  "devcontainer-setup@trailofbits",
+]
+```
+
+Plugins are installed after marketplaces are registered. If a plugin references a marketplace that hasn't been added, installation will fail.
+
+### MCP server registration
+
+`mcp_servers` maps server names to their definitions. Each server is registered via `claude mcp add-json <name> <json> -s user` inside the guest.
+
+Two server types are supported:
+
+**stdio** -- a local command that communicates over stdin/stdout:
+
+```toml
+[claude.mcp_servers.my-tool]
+command = "/usr/local/bin/my-tool"
+args = ["--verbose"]
+```
+
+**HTTP** -- a remote server accessed by URL:
+
+```toml
+[claude.mcp_servers.sentry]
+type = "http"
+url = "https://mcp.sentry.dev/mcp"
+```
+
+Server definitions can also include an `env` map for environment variable name mappings passed through to the MCP server configuration.
+
+## Bootstrap sequence
+
+When `coop start` runs (without `--no-claude`), it executes the following steps after the VM boots and SSH becomes available:
+
+1. **GitHub auth** -- If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
+2. **User content** -- Copy `global_claude_md` to `~/.claude/CLAUDE.md` and `rules` files to `~/.claude/rules/`.
+3. **Marketplaces** -- Register each marketplace source (local directories are copied to the guest first). On first boot, coop compares the configured marketplaces against those already baked into the golden image (from `coop setup --profile`) and only installs the ones that are missing.
+4. **Plugins** -- Install each plugin from the registered marketplaces. Like marketplaces, coop computes the delta against plugins already present in the golden image and skips those that are already installed.
+5. **MCP servers** -- Register each MCP server definition.
+
+On restart (`coop start` of a stopped instance), only ephemeral state is refreshed: GitHub auth (step 1), CLAUDE.md, and rules (step 2). Marketplaces, plugins, and MCP servers persist on the guest disk and are not re-installed.
+
+### Skipping bootstrap
+
+To start a VM without any Claude Code configuration:
+
+```bash
+coop start --no-claude
+```
+
+This skips the entire bootstrap sequence. The VM boots normally but gets no API key, no GitHub token, no plugins, and no MCP servers. You can still run `coop claude` afterward -- that session will forward `ANTHROPIC_API_KEY` and any `env_forward` variables via SSH -- but plugins and MCP servers won't be available unless you configure them manually inside the guest.

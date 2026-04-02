@@ -1,0 +1,8 @@
+/target
+*.ext4
+*.img
+vmlinux
+firecracker
+.env
+*.swp
+*.swo

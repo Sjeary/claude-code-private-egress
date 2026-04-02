@@ -1,0 +1,91 @@
+# coop
+
+Isolated VM environments for running Claude Code.
+
+coop is a Rust CLI that manages disposable virtual machines where Claude Code has full tool access -- Docker, git, compilers, package managers -- without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy. On Linux, coop runs Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. The backend is selected automatically based on platform.
+
+## Quick start
+
+Install:
+
+```
+curl -fsSL https://raw.githubusercontent.com/OWNER/coop/main/install.sh | bash
+```
+
+Or build from source (requires [Rust](https://rustup.rs/)):
+
+```
+cargo build --release
+cp target/release/coop /usr/local/bin/
+```
+
+Set up the VM template, start an instance, and launch Claude Code:
+
+```
+export ANTHROPIC_API_KEY=sk-ant-...
+coop setup
+coop start my-project --workspace ~/code/my-project
+coop claude
+```
+
+That gives you a Claude Code session running inside an isolated VM with your project synced in. By default, `coop claude` launches with `--dangerously-skip-permissions` since the VM is the isolation boundary. Pass `--ask` to prompt for permissions instead.
+
+## Features
+
+- **Two backends** -- Firecracker microVMs (Linux/KVM) and Lima VMs (macOS/Virtualization.framework), auto-detected by platform
+- **Workspace sync** -- push a local directory into the VM, or clone a git repo directly with `--git-repo`
+- **Profiles** -- customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing
+- **Named images** -- build multiple template images with different profiles (`coop setup --image ml-dev --profile python`)
+- **Claude Code integration** -- API key forwarding, CLAUDE.md injection, plugin/marketplace support, MCP server configuration
+- **VS Code remote SSH** -- `coop vscode` opens VS Code connected to the guest
+- **Multi-instance** -- run multiple VMs side by side, each with its own name and disk
+- **Disk resize** -- grow a stopped instance's disk with `coop resize --size +20`
+- **Config optional** -- works with sensible defaults; customize via `~/.coop/config.toml` when needed
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `setup` | Install backend runtime, fetch kernel, build template rootfs |
+| `build` | Rebuild rootfs image and fetch kernel |
+| `start` | Launch a new VM instance |
+| `stop` | Stop a running VM (preserves disk) |
+| `destroy` | Stop and remove a VM instance |
+| `ssh` | Interactive SSH session to a running VM |
+| `claude` | Launch Claude Code inside the VM |
+| `exec` | Run a command in the VM non-interactively |
+| `push` | Sync local directory into the VM |
+| `pull` | Sync VM workspace back to the host |
+| `status` | Show instance status and resource usage |
+| `logs` | Stream VM serial console output |
+| `vscode` | Open VS Code connected to the guest |
+| `images` | List or delete template images |
+| `resize` | Grow a stopped instance's disk |
+| `validate` | Check config and prerequisites |
+
+## Requirements
+
+**macOS (Lima backend)**
+
+- macOS with Apple Silicon or Intel
+- [Lima](https://github.com/lima-vm/lima) with `limactl` on your PATH (installed automatically by `coop setup`)
+- Rosetta 2 for x86_64 guests on Apple Silicon: `softwareupdate --install-rosetta`
+
+**Linux (Firecracker backend)**
+
+- x86_64 architecture
+- KVM access (`/dev/kvm` must exist and be writable by your user)
+- `sudo` privileges (Firecracker uses jailer and TAP networking)
+- `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
+
+## Documentation
+
+- [Getting started](docs/getting-started.md)
+- [Command reference](docs/commands.md)
+- [Configuration reference](docs/configuration.md)
+- [Images and profiles](docs/images-and-profiles.md)
+- [Workspace sync](docs/workspaces.md)
+- [Claude Code integration](docs/claude-integration.md)
+- [VS Code integration](docs/vscode.md)
+- [Multi-instance](docs/multi-instance.md)
+- [Platform backends](docs/backends.md)

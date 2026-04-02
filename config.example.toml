@@ -1,0 +1,38 @@
+# coop configuration
+# Copy to ~/.coop/config.toml and uncomment fields to override defaults.
+# An empty file (or no file at all) gives you sensible defaults.
+# Run `coop validate` to check your config.
+
+# data_dir = "~/.coop"          # VM artifacts: images, instances, keys
+# ssh_port = 22                 # Guest SSH port
+# firecracker_bin = "~/.coop/firecracker"  # Linux only
+
+# [vm]
+# vcpu_count = 2                # vCPUs per VM (override: --vcpus)
+# mem_size_mib = 4096           # Memory in MiB (override: --mem)
+# template_size_gib = 8         # Template disk in GiB (override: --template-size)
+# kernel_path = "~/.coop/vmlinux"          # Linux/Firecracker only
+# boot_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
+
+# [network]                     # Linux/Firecracker only
+# host_ip = "172.16.0.1"
+# subnet_mask = "/24"
+# host_iface = "auto"           # "auto" detects at runtime
+
+# [claude]
+# github = "auto"               # "auto", "env", or "off"
+# global_claude_md = "~/.claude/CLAUDE.md"
+# rules = ["~/.claude/rules/style.md"]
+# env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
+# marketplaces = ["https://github.com/anthropics/claude-plugins-official"]
+# plugins = ["rust-analyzer-lsp@claude-plugins-official"]
+
+# [claude.mcp_servers.my-server]
+# command = "/usr/bin/my-mcp-server"
+# args = ["--verbose"]
+# env = { API_KEY = "MY_HOST_ENV_VAR" }
+
+# [profiles.my-tools]
+# apt_packages = ["ripgrep", "fd-find", "jq"]
+# pre_install = "curl -fsSL https://example.com/setup.sh | bash"
+# post_install = "echo 'done'"
