@@ -4,9 +4,9 @@ set -euo pipefail
 # Installer for coop — downloads a prebuilt binary from GitHub Releases.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/coop/main/install.sh | sh
-#   curl -fsSL ... | VERSION=v0.1.0 sh
-#   curl -fsSL ... | INSTALL_DIR=/usr/local/bin sh
+#   ./install.sh                          # latest version, uses gh or GITHUB_TOKEN
+#   VERSION=v0.2.1 ./install.sh           # specific version
+#   INSTALL_DIR=/usr/local/bin ./install.sh
 
 REPO="trailofbits/coop"
 BINARY="coop"
@@ -20,6 +20,10 @@ info() { printf '  %s\n' "$1"; }
 
 need() {
     command -v "$1" > /dev/null 2>&1 || die "'$1' is required but not found"
+}
+
+has() {
+    command -v "$1" > /dev/null 2>&1
 }
 
 detect_platform() {
@@ -51,8 +55,36 @@ target_triple() {
 }
 
 latest_version() {
+    if has gh; then
+        gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null && return
+    fi
     local url="https://api.github.com/repos/${REPO}/releases/latest"
-    curl -fsSL "$url" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
+    local auth_args=()
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        auth_args=(-H "Authorization: token ${GITHUB_TOKEN}")
+    fi
+    curl -fsSL "${auth_args[@]}" "$url" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
+}
+
+# Download a release asset. Tries gh first, then curl with token, then plain curl.
+download_asset() {
+    local filename="$1" dest="$2"
+
+    if has gh; then
+        info "Downloading ${filename} (via gh)..."
+        gh release download "$VERSION" --repo "$REPO" --pattern "$filename" --dir "$(dirname "$dest")" 2>/dev/null \
+            && return
+        info "gh download failed, falling back to curl..."
+    fi
+
+    local url="https://github.com/${REPO}/releases/download/${VERSION}/${filename}"
+    local auth_args=()
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        auth_args=(-H "Authorization: token ${GITHUB_TOKEN}")
+    fi
+
+    info "Downloading ${filename}..."
+    curl -fsSL "${auth_args[@]}" -o "$dest" "$url"
 }
 
 verify_checksum() {
@@ -82,20 +114,14 @@ VERSION="${VERSION:-$(latest_version)}"
 
 TRIPLE="$(target_triple)"
 TARBALL="${BINARY}-${VERSION}-${TRIPLE}.tar.gz"
-BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
-TARBALL_URL="${BASE_URL}/${TARBALL}"
-CHECKSUMS_URL="${BASE_URL}/SHA256SUMS"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 printf 'Installing %s %s (%s)\n' "$BINARY" "$VERSION" "$TRIPLE"
 
-info "Downloading ${TARBALL}..."
-curl -fsSL -o "${TMPDIR}/${TARBALL}" "$TARBALL_URL"
-
-info "Downloading checksums..."
-curl -fsSL -o "${TMPDIR}/SHA256SUMS" "$CHECKSUMS_URL"
+download_asset "$TARBALL" "${TMPDIR}/${TARBALL}"
+download_asset "SHA256SUMS" "${TMPDIR}/SHA256SUMS"
 
 info "Verifying checksum..."
 EXPECTED="$(grep "${TARBALL}" "${TMPDIR}/SHA256SUMS" | cut -d' ' -f1)"
@@ -107,10 +133,13 @@ tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
 
 info "Installing to ${INSTALL_DIR}..."
 mkdir -p "$INSTALL_DIR"
-mv "${TMPDIR}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+# Binary is inside a versioned subdirectory in the tarball
+EXTRACTED=$(find "${TMPDIR}" -name "${BINARY}" -type f -perm +111 | head -1)
+[ -n "$EXTRACTED" ] || die "Binary not found in tarball"
+mv "$EXTRACTED" "${INSTALL_DIR}/${BINARY}"
 chmod +x "${INSTALL_DIR}/${BINARY}"
 
-printf '\n✓ %s %s installed to %s/%s\n' "$BINARY" "$VERSION" "$INSTALL_DIR" "$BINARY"
+printf '\n  %s %s installed to %s/%s\n' "$BINARY" "$VERSION" "$INSTALL_DIR" "$BINARY"
 
 # Check if INSTALL_DIR is on PATH
 case ":${PATH}:" in
