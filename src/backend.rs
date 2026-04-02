@@ -860,7 +860,7 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig) -> EnvForward {
     }
 
     // GITHUB_TOKEN: resolve via configured strategy
-    if let Some(token) = resolve_github_token(claude.github.as_ref()) {
+    if let Some(token) = resolve_github_token(cfg.github.as_ref()) {
         env.set("GITHUB_TOKEN", token);
     }
 

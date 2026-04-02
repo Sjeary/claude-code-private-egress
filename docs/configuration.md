@@ -13,6 +13,19 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `data_dir` | string (path) | `~/.coop` | Directory for VM artifacts: images, instances, keys, kernel, Firecracker binary. |
 | `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
+| `github` | string | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
+
+## GitHub auth
+
+The `github` field determines how coop obtains a `GITHUB_TOKEN` for the guest:
+
+| Value | Behavior |
+|-------|----------|
+| `"auto"` | Checks `$GITHUB_TOKEN` first. Falls back to `gh auth token` if unset. |
+| `"env"` | Reads `$GITHUB_TOKEN` from the environment only. Warns if unset. |
+| `"off"` | No GitHub token forwarding. |
+
+When a token is present, coop runs `gh auth setup-git` inside the guest to wire up git credential helpers.
 
 ## `vm` section
 
@@ -43,25 +56,12 @@ Claude Code configuration injected into the guest VM at start time. Every field 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `api_key` | string | unset (reads `$ANTHROPIC_API_KEY` from environment) | Anthropic API key. Forwarded to the guest via SSH `SendEnv`. Never written to disk inside the VM. |
-| `github` | string | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
 | `global_claude_md` | string (path) | unset | Host path to a `CLAUDE.md` file. Copied to `~/.claude/CLAUDE.md` in the guest on start. Supports `~` expansion. |
 | `rules` | array of strings | `[]` | Host paths to rule files. Copied to `~/.claude/rules/` in the guest on start. Supports `~` expansion. |
 | `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `ANTHROPIC_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set; list additional variables here. |
 | `marketplaces` | array of strings | `[]` | Plugin marketplace sources. Each entry is a GitHub repo URL or an absolute local directory path. Local directories are copied into the guest before registration. |
 | `plugins` | array of strings | `[]` | Plugins to install from registered marketplaces. Format: `plugin-name@marketplace-name`. |
 | `mcp_servers` | table | `{}` | MCP servers to register in the guest. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
-
-### GitHub auth
-
-The `github` field determines how coop obtains a `GITHUB_TOKEN` for the guest:
-
-| Value | Behavior |
-|-------|----------|
-| `"auto"` | Checks `$GITHUB_TOKEN` first. Falls back to `gh auth token` if unset. |
-| `"env"` | Reads `$GITHUB_TOKEN` from the environment only. Warns if unset. |
-| `"off"` | No GitHub token forwarding. |
-
-When a token is present, coop runs `gh auth setup-git` inside the guest to wire up git credential helpers.
 
 ### MCP servers
 
@@ -145,6 +145,7 @@ An empty file gives you all defaults (2 vCPUs, 4 GiB RAM, 8 GiB disk).
 data_dir = "~/.coop"
 ssh_port = 22
 firecracker_bin = "~/.coop/firecracker"
+github = "auto"  # must be set explicitly; default is off
 
 [vm]
 vcpu_count = 4
@@ -159,7 +160,6 @@ subnet_mask = "/24"
 host_iface = "auto"
 
 [claude]
-github = "auto"  # must be set explicitly; default is off
 global_claude_md = "~/.claude/CLAUDE.md"
 rules = ["~/.claude/rules/style.md"]
 env_forward = ["CUSTOM_TOKEN"]

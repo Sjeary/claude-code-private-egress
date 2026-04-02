@@ -6,6 +6,7 @@
 # data_dir = "~/.coop"          # VM artifacts: images, instances, keys
 # ssh_port = 22                 # Guest SSH port
 # firecracker_bin = "~/.coop/firecracker"  # Linux only
+# github = "auto"               # "auto", "env", or "off"
 
 # [vm]
 # vcpu_count = 2                # vCPUs per VM (override: --vcpus)
@@ -20,7 +21,6 @@
 # host_iface = "auto"           # "auto" detects at runtime
 
 # [claude]
-# github = "auto"               # "auto", "env", or "off"
 # global_claude_md = "~/.claude/CLAUDE.md"
 # rules = ["~/.claude/rules/style.md"]
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest

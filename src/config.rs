@@ -192,6 +192,10 @@ pub struct CoopConfig {
     #[serde(default = "default_firecracker_bin")]
     pub firecracker_bin: PathBuf,
 
+    /// GitHub auth strategy for the guest
+    #[serde(default)]
+    pub github: Option<GitHubAuth>,
+
     /// Claude Code config forwarding settings
     #[serde(default)]
     pub claude: ClaudeConfig,
@@ -355,10 +359,6 @@ pub struct ClaudeConfig {
     /// Additional env var names to forward from host to guest via SSH
     #[serde(default)]
     pub env_forward: Vec<String>,
-
-    /// GitHub auth strategy for the guest
-    #[serde(default)]
-    pub github: Option<GitHubAuth>,
 
     /// Plugin marketplace sources (URL, path, or GitHub repo)
     #[serde(default)]
@@ -806,6 +806,7 @@ impl Default for CoopConfig {
             network: NetworkConfig::default(),
             ssh_port: default_ssh_port(),
             firecracker_bin: default_firecracker_bin(),
+            github: None,
             claude: ClaudeConfig::default(),
             profiles: HashMap::new(),
         }
@@ -839,7 +840,6 @@ impl Default for ClaudeConfig {
         Self {
             api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             env_forward: Vec::new(),
-            github: None,
             marketplaces: Vec::new(),
             plugins: Vec::new(),
             mcp_servers: HashMap::new(),
@@ -1417,7 +1417,6 @@ mod tests {
         let json = r#"{
             "api_key": "sk-ant-test",
             "env_forward": ["MYORG_KEY"],
-            "github": "auto",
             "marketplaces": ["https://github.com/anthropics/plugins"],
             "plugins": ["context7"],
             "mcp_servers": {
@@ -1430,7 +1429,6 @@ mod tests {
         let cfg: ClaudeConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.api_key.as_deref(), Some("sk-ant-test"));
         assert_eq!(cfg.env_forward, vec!["MYORG_KEY"]);
-        assert!(matches!(cfg.github, Some(GitHubAuth::Auto)));
         assert_eq!(cfg.marketplaces.len(), 1);
         assert_eq!(cfg.plugins, vec!["context7"]);
         assert_eq!(cfg.mcp_servers.len(), 1);
@@ -1443,7 +1441,6 @@ mod tests {
         let cfg: ClaudeConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.api_key.is_none());
         assert!(cfg.env_forward.is_empty());
-        assert!(cfg.github.is_none());
         assert!(cfg.marketplaces.is_empty());
         assert!(cfg.plugins.is_empty());
         assert!(cfg.mcp_servers.is_empty());
