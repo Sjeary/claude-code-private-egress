@@ -10,7 +10,7 @@ set -euo pipefail
 
 REPO="trailofbits/coop"
 BINARY="coop"
-INSTALL_DIR="${INSTALL_DIR:-${HOME}/.coop/bin}"
+INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 
 # --- helpers ----------------------------------------------------------------
 
