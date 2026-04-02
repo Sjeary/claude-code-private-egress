@@ -14,11 +14,11 @@ Tasks to complete before making coop public, ordered by priority.
 
 ## Pre-publish (requires GitHub)
 
-- [ ] Rename repo directory from `claude-harness/` to `coop/`
-- [ ] Create GitHub repo and push `main`
-- [ ] Add CI workflow (clippy, fmt, test on PR/push)
-- [ ] Verify install.sh works against a real release
-- [ ] Tag and publish v0.1.0
+- [x] Rename repo directory from `claude-harness/` to `coop/`
+- [x] Create GitHub repo and push `main`
+- [x] Add CI workflow (clippy, fmt, test on PR/push)
+- [x] Verify install.sh works against a real release
+- [x] Tag and publish v0.2.2
 
 ## Fast follow (post-publish)
 
