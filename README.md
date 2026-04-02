@@ -9,7 +9,7 @@ coop is a Rust CLI that manages disposable virtual machines where Claude Code ha
 Install:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/OWNER/coop/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | bash
 ```
 
 Or build from source (requires [Rust](https://rustup.rs/)):
@@ -65,15 +65,17 @@ That gives you a Claude Code session running inside an isolated VM with your pro
 
 ## Requirements
 
+Tested on macOS arm64 (Apple Silicon) and Linux x86_64. Linux arm64 builds are available but untested.
+
 **macOS (Lima backend)**
 
-- macOS with Apple Silicon or Intel
+- macOS with Apple Silicon
 - [Lima](https://github.com/lima-vm/lima) with `limactl` on your PATH (installed automatically by `coop setup`)
 - Rosetta 2 for x86_64 guests on Apple Silicon: `softwareupdate --install-rosetta`
 
 **Linux (Firecracker backend)**
 
-- x86_64 architecture
+- x86_64 or arm64 architecture
 - KVM access (`/dev/kvm` must exist and be writable by your user)
 - `sudo` privileges (Firecracker uses jailer and TAP networking)
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
