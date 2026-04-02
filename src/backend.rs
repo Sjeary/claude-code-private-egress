@@ -173,6 +173,7 @@ impl SshTarget {
     /// SCP options (uses -P for port instead of -p).
     pub fn scp_opts(&self) -> Vec<String> {
         vec![
+            "-q".into(),
             "-o".into(),
             "StrictHostKeyChecking=no".into(),
             "-o".into(),
