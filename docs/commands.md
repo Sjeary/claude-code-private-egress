@@ -8,6 +8,7 @@ coop creates isolated VM environments for running Claude Code. It runs Firecrack
 |------|-------------|
 | `--config <path>` | Path to config file (default: `~/.coop/config.toml`) |
 | `-v`, `--verbose` | Increase log verbosity. Once for debug, twice for trace. |
+| `--version` | Print version and exit. |
 
 ## Instance Name Resolution
 
@@ -18,6 +19,16 @@ Most commands accept an optional instance name. coop resolves the target instanc
 - **Multiple instances exist.** The name is required. coop lists available instances on error.
 
 ## Commands
+
+### `init`
+
+Generate a starter config file at `~/.coop/config.toml`.
+
+```
+coop init
+```
+
+No additional flags.
 
 ### `setup`
 

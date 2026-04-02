@@ -21,8 +21,7 @@
 # host_iface = "auto"           # "auto" detects at runtime
 
 # [claude]
-# global_claude_md = "~/.claude/CLAUDE.md"
-# rules = ["~/.claude/rules/style.md"]
+# config_dir = "~/.claude"  # path to copy CLAUDE.md, rules/, commands/ from (false to disable)
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
 # marketplaces = ["https://github.com/anthropics/claude-plugins-official"]
 # plugins = ["rust-analyzer-lsp@claude-plugins-official"]

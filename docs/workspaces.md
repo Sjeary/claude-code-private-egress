@@ -1,6 +1,6 @@
 # Workspace Sync
 
-coop moves code between the host and guest VM. There are three ways to get code in, and two commands -- `push` and `pull` -- for ongoing sync.
+coop moves code between the host and guest VM. There are three ways to get code in, and two commands, `push` and `pull`, for ongoing sync.
 
 ## Getting Code into the VM
 

@@ -1,13 +1,13 @@
 # Getting Started
 
-coop runs Claude Code inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon -- Claude Code never touches your host.
+coop runs Claude Code inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Claude Code never touches your host.
 
 ## Prerequisites
 
 **macOS (Lima backend)**
 
 - [Lima](https://github.com/lima-vm/lima) installed with `limactl` on your `PATH`
-- Apple Silicon (arm64) or Intel Mac
+- Apple Silicon (arm64)
 - Rosetta 2 for x86_64 guests on Apple Silicon: `softwareupdate --install-rosetta`
 
 **Linux (Firecracker backend)**
@@ -29,9 +29,9 @@ The binary lands at `target/release/coop`.
 
 ## Configuration
 
-coop reads `~/.coop/config.toml` by default. Override the path with `--config`. If the file doesn't exist, coop falls back to built-in defaults.
+coop reads `~/.coop/config.toml` by default. Override the path with `--config`. If the file doesn't exist, coop falls back to built-in defaults. Run `coop init` to generate a starter config file.
 
-A minimal config (an empty file is valid — all fields have defaults):
+A minimal config (an empty file is valid; all fields have defaults):
 
 ```toml
 ```
@@ -45,27 +45,28 @@ mem_size_mib = 8192
 template_size_gib = 20
 ```
 
-All VM artifacts -- kernel, rootfs images, instance disks -- live under `~/.coop/`.
+All VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/`.
 
 ### Claude Code integration
 
 Forward your Anthropic API key and GitHub credentials into the guest:
 
 ```toml
+github = "auto"
+
 [vm]
 vcpu_count = 4
 mem_size_mib = 8192
 
 [claude]
-github = "auto"
-global_claude_md = "~/.claude/CLAUDE.md"
+config_dir = "~/.claude"
 ```
 
 The `github` field controls how coop resolves a GitHub token for the guest:
 
-- `"off"` (default) -- disables GitHub auth forwarding
-- `"auto"` -- runs `gh auth token` if the GitHub CLI is installed, falls back to `GITHUB_TOKEN` env var
-- `"env"` -- requires `GITHUB_TOKEN` in your environment
+- `"off"` (default): disables GitHub auth forwarding
+- `"auto"`: checks `$GITHUB_TOKEN` env var first, falls back to `gh auth token` if unset
+- `"env"`: requires `GITHUB_TOKEN` in your environment
 
 GitHub auth is off by default. Set `github = "auto"` explicitly to enable it.
 
@@ -95,7 +96,7 @@ Skip confirmation prompts with `-y`:
 coop setup -y --profile python
 ```
 
-Setup is idempotent -- rerunning with the same profiles skips completed work. Pass `--rebuild` to force a fresh template build.
+Setup is idempotent. Rerunning with the same profiles skips completed work. Pass `--rebuild` to force a fresh template build.
 
 ### 2. Start an instance
 
@@ -158,7 +159,7 @@ coop start my-project --no-claude
 coop claude
 ```
 
-This runs Claude Code with `--dangerously-skip-permissions` by default -- the VM itself is the isolation boundary. For permission prompts:
+This runs Claude Code with `--dangerously-skip-permissions` by default. The VM itself is the isolation boundary. For permission prompts:
 
 ```
 coop claude --ask
@@ -234,7 +235,7 @@ Destroy an instance (deletes its disk and resources):
 coop destroy my-project
 ```
 
-Remove everything -- all instances, images, kernel, and Firecracker binary:
+Remove everything, including all instances, images, kernel, and Firecracker binary:
 
 ```
 coop destroy --all

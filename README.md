@@ -2,7 +2,7 @@
 
 Isolated VM environments for running Claude Code.
 
-coop is a Rust CLI that manages disposable virtual machines where Claude Code has full tool access -- Docker, git, compilers, package managers -- without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy. On Linux, coop runs Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. The backend is selected automatically based on platform.
+coop is a Rust CLI that manages disposable virtual machines where Claude Code has full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy. On Linux, coop runs Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. The backend is selected automatically based on platform.
 
 ## Quick start
 
@@ -38,15 +38,15 @@ That gives you a Claude Code session running inside an isolated VM with your pro
 
 ## Features
 
-- **Two backends** -- Firecracker microVMs (Linux/KVM) and Lima VMs (macOS/Virtualization.framework), auto-detected by platform
-- **Workspace sync** -- push a local directory into the VM, or clone a git repo directly with `--git-repo`
-- **Profiles** -- customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing
-- **Named images** -- build multiple template images with different profiles (`coop setup --image ml-dev --profile python`)
-- **Claude Code integration** -- API key forwarding, CLAUDE.md injection, plugin/marketplace support, MCP server configuration
-- **VS Code remote SSH** -- `coop vscode` opens VS Code connected to the guest
-- **Multi-instance** -- run multiple VMs side by side, each with its own name and disk
-- **Disk resize** -- grow a stopped instance's disk with `coop resize --size +20`
-- **Config optional** -- works with sensible defaults; customize via `~/.coop/config.toml` when needed
+- **Two backends**: Firecracker microVMs (Linux/KVM) and Lima VMs (macOS/Virtualization.framework), auto-detected by platform
+- **Workspace sync**: push a local directory into the VM, or clone a git repo directly with `--git-repo`
+- **Profiles**: customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing
+- **Named images**: build multiple template images with different profiles (`coop setup --image ml-dev --profile python`)
+- **Claude Code integration**: API key forwarding, CLAUDE.md injection, plugin/marketplace support, MCP server configuration
+- **VS Code remote SSH**: `coop vscode` opens VS Code connected to the guest
+- **Multi-instance**: run multiple VMs side by side, each with its own name and disk
+- **Disk resize**: grow a stopped instance's disk with `coop resize --size +20`
+- **Config optional**: works with sensible defaults; customize via `~/.coop/config.toml` when needed
 
 ## Commands
 

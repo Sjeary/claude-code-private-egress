@@ -78,7 +78,7 @@ The "insecure" label refers to the fact that without raw table rules, other host
 
 Modern scp (OpenSSH 9+) uses SFTP by default, which does **not** expand `~` in remote paths. `scp file user@host:~/.claude/CLAUDE.md` silently creates a literal `~` directory instead of writing to the home directory.
 
-Fix: `scp_resolve_home()` in `src/backend.rs` replaces `~/` with `./` in remote paths. SFTP defaults to the user's home directory, so `./path` is equivalent to `~/path`. This is applied in both `scp_to` and `scp_to_recursive`.
+Fix: `GuestPath` values use `./` instead of `~/` in remote paths (e.g., `GuestPath::new("./.claude")`). SFTP defaults to the user's home directory, so `./path` is equivalent to `~/path`. This convention is used in `scp_to` and `scp_to_recursive`.
 
 SSH commands (`exec`) are unaffected — the remote shell expands `~` normally. Only scp's SFTP mode has this issue.
 

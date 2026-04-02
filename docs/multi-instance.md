@@ -108,7 +108,7 @@ coop resize my-project --size 150
 coop resize my-project --size +20
 ```
 
-The instance must be stopped first. coop rejects the resize and tells you to stop it if it is running.
+The instance must be stopped first. coop rejects the resize and tells you to stop the instance if it is running.
 
 ## Independent lifecycle
 
