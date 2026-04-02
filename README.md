@@ -12,6 +12,12 @@ Install:
 curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | bash
 ```
 
+For internal/private repos (requires [GitHub CLI](https://cli.github.com/)):
+
+```
+gh api repos/trailofbits/coop/contents/install.sh -H "Accept: application/vnd.github.raw" | bash
+```
+
 Or build from source (requires [Rust](https://rustup.rs/)):
 
 ```
