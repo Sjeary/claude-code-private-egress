@@ -133,9 +133,8 @@ tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
 
 info "Installing to ${INSTALL_DIR}..."
 mkdir -p "$INSTALL_DIR"
-# Binary is inside a versioned subdirectory in the tarball
-EXTRACTED=$(find "${TMPDIR}" -name "${BINARY}" -type f -perm +111 | head -1)
-[ -n "$EXTRACTED" ] || die "Binary not found in tarball"
+EXTRACTED="${TMPDIR}/${BINARY}-${VERSION}-${TRIPLE}/${BINARY}"
+[ -f "$EXTRACTED" ] || die "Binary not found in tarball"
 mv "$EXTRACTED" "${INSTALL_DIR}/${BINARY}"
 chmod +x "${INSTALL_DIR}/${BINARY}"
 
