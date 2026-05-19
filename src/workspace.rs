@@ -34,6 +34,14 @@ pub struct WorkspaceState {
     pub guest_path: String,
     /// How the workspace was created
     pub source: WorkspaceSource,
+    /// Original repo URL when source is [`WorkspaceSource::GitRepo`].
+    ///
+    /// Recorded so that follow-up commands (`coop shell`, `claude`, etc.)
+    /// can re-derive the `owner/repo` slug without re-asking — pat-mode
+    /// otherwise has no way to look up the entry for a git-repo instance
+    /// where `host_path` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_repo_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -287,6 +295,7 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
             host_path: None,
             guest_path: GUEST_WORKSPACE.to_string(),
             source: WorkspaceSource::Workspace,
+            git_repo_url: None,
         });
     }
     bail!(
@@ -393,16 +402,25 @@ pub fn sync_mounts(
         }
     }
 
-    // Save state for the first mount so push/pull work
+    record_mount_state(inst, mounts)
+}
+
+/// Persist mount metadata to `workspace.json`.
+///
+/// Records the first mount's host path as the canonical workspace so
+/// that `push`/`pull` and PAT slug detection (`detect_instance_repo`)
+/// work on follow-up commands. Used by `sync_mounts` after a Firecracker
+/// rsync, and directly on Lima where mounts are live (no sync step).
+pub fn record_mount_state(inst: &Instance, mounts: &[crate::config::Mount]) -> Result<()> {
     if let Some(m) = mounts.first() {
         let state = WorkspaceState {
             host_path: Some(m.host_path.clone()),
             guest_path: m.guest_path.clone(),
             source: WorkspaceSource::Mount,
+            git_repo_url: None,
         };
         state.save(inst)?;
     }
-
     Ok(())
 }
 
@@ -1040,6 +1058,7 @@ mod tests {
             host_path: Some(PathBuf::from("/tmp/project")),
             guest_path: "/workspace".to_string(),
             source: WorkspaceSource::Workspace,
+            git_repo_url: None,
         };
         state.save(&inst).expect("save");
         let loaded = WorkspaceState::try_load(&inst)
@@ -1066,6 +1085,7 @@ mod tests {
             host_path: Some(PathBuf::from("/host/dir")),
             guest_path: "/custom".to_string(),
             source: WorkspaceSource::GitRepo,
+            git_repo_url: None,
         };
         state.save(&inst).expect("save");
         let loaded = load_or_default(&inst, None, "push").expect("load");
@@ -1080,6 +1100,45 @@ mod tests {
         let loaded = load_or_default(&inst, Some("./project"), "push").expect("load");
         assert_eq!(loaded.guest_path, GUEST_WORKSPACE);
         assert!(loaded.host_path.is_none());
+    }
+
+    #[test]
+    fn record_mount_state_persists_first_mount() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let primary = tempfile::tempdir().expect("primary");
+        let secondary = tempfile::tempdir().expect("secondary");
+        let mounts = vec![
+            crate::config::Mount {
+                host_path: primary.path().to_path_buf(),
+                guest_path: "/workspace".to_string(),
+            },
+            crate::config::Mount {
+                host_path: secondary.path().to_path_buf(),
+                guest_path: "/data".to_string(),
+            },
+        ];
+        record_mount_state(&inst, &mounts).expect("save");
+        let loaded = WorkspaceState::try_load(&inst)
+            .expect("no IO error")
+            .expect("state should exist");
+        assert!(matches!(loaded.source, WorkspaceSource::Mount));
+        assert_eq!(loaded.host_path.as_deref(), Some(primary.path()));
+        assert_eq!(loaded.guest_path, "/workspace");
+        assert!(loaded.git_repo_url.is_none());
+    }
+
+    #[test]
+    fn record_mount_state_noop_on_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        record_mount_state(&inst, &[]).expect("ok");
+        assert!(
+            WorkspaceState::try_load(&inst)
+                .expect("no IO error")
+                .is_none(),
+            "empty mounts should not write state"
+        );
     }
 
     #[test]

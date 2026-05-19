@@ -3,7 +3,11 @@ mod cmd;
 mod completions;
 mod config;
 mod fs_util;
+mod github_pat;
+mod github_repo;
 mod guest;
+mod pat_prompt;
+mod secret_store;
 // Lima is an interactive CLI workflow — stderr output is intentional user communication.
 #[cfg_attr(not(target_os = "macos"), expect(dead_code, reason = "Lima-only"))]
 #[expect(
@@ -169,6 +173,10 @@ enum Commands {
         /// Skip the `.git` directory when syncing the workspace
         #[arg(long, conflicts_with = "git_repo")]
         exclude_git: bool,
+        /// Suppress the interactive prompt to set up a scoped GitHub PAT
+        /// when one is missing for the resolved repo.
+        #[arg(long)]
+        no_prompt: bool,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
     #[command(alias = "ssh")]
@@ -318,8 +326,17 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ProfilesAction>,
     },
+    /// Manage GitHub authentication (fine-grained PAT wizard, status, rotate, forget)
+    Github {
+        #[command(subcommand)]
+        action: GithubAction,
+    },
     /// Validate configuration and check prerequisites
-    Validate,
+    Validate {
+        /// Probe live state for each `[github.pat]` entry (talks to api.github.com)
+        #[arg(long)]
+        probe: bool,
+    },
     /// Generate a starter config file at ~/.coop/config.toml
     Init,
     /// Replace the running coop binary with the latest GitHub release
@@ -388,6 +405,35 @@ enum ProfilesAction {
         /// Profile name to inspect
         #[arg(add = ArgValueCandidates::new(completions::profile_candidates))]
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GithubAction {
+    /// Run the fine-grained PAT wizard for a repo
+    SetupPat {
+        /// Repo slug to scope to (auto-detected if omitted)
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Re-run the wizard against an existing entry
+    RotatePat {
+        /// Repo slug to rotate
+        #[arg(long, required = true)]
+        repo: String,
+    },
+    /// Print configured PAT entries and their validation state
+    Status {
+        /// Resolve each entry's `cmd:` invocation (may trigger Keychain /
+        /// 1Password prompts) to confirm the secret store still serves it.
+        #[arg(long)]
+        probe: bool,
+    },
+    /// Remove a configured PAT entry and its stored secret
+    ForgetPat {
+        /// Repo slug whose entry should be removed
+        #[arg(long, required = true)]
+        repo: String,
     },
 }
 
@@ -537,6 +583,7 @@ fn main() -> Result<()> {
             mount,
             image,
             exclude_git,
+            no_prompt,
         } => {
             if raw_args_use_deprecated_no_claude(std::env::args()) {
                 tracing::warn!(
@@ -550,18 +597,20 @@ fn main() -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             cmd_start(
                 &be,
-                &cfg,
+                &mut cfg,
                 &StartOpts {
                     name: name.as_deref(),
                     image: &image,
                     workspace_dir: workspace.as_deref(),
                     git_repo: git_repo.as_deref(),
                     no_agents,
+                    no_prompt,
                     disk: disk
                         .map(|d| config::GiB::new(d).context("--disk must be > 0"))
                         .transpose()?,
                     mounts,
                     exclude_git,
+                    config_path: &cli.config,
                 },
             )
         }
@@ -665,13 +714,38 @@ fn main() -> Result<()> {
         Commands::Profiles { action } => {
             cmd_profiles(&cfg, &action.unwrap_or(ProfilesAction::List))
         }
-        Commands::Validate => cmd_validate(&cfg, &be),
+        Commands::Github { action } => cmd_github(&cfg, &cli.config, &action),
+        Commands::Validate { probe } => cmd_validate(&cfg, &be, probe),
         Commands::Init
         | Commands::Update { .. }
         | Commands::Uninstall { .. }
         | Commands::Completions { .. } => {
             unreachable!("handled before config loading")
         }
+    }
+}
+
+fn cmd_github(cfg: &config::CoopConfig, config_path: &Path, action: &GithubAction) -> Result<()> {
+    match action {
+        GithubAction::SetupPat { repo } => {
+            let opts = github_pat::SetupOpts {
+                repo: repo.as_deref(),
+                config_path,
+            };
+            github_pat::run_setup_pat(cfg, &opts)
+        }
+        GithubAction::RotatePat { repo } => {
+            let opts = github_pat::SetupOpts {
+                repo: Some(repo),
+                config_path,
+            };
+            github_pat::run_rotate_pat(cfg, &opts)
+        }
+        GithubAction::Status { probe } => {
+            github_pat::run_status(cfg, *probe);
+            Ok(())
+        }
+        GithubAction::ForgetPat { repo } => github_pat::run_forget_pat(cfg, repo, config_path),
     }
 }
 
@@ -698,7 +772,11 @@ fn cmd_init(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_validate(cfg: &config::CoopConfig, be: &backend::PlatformBackend) -> Result<()> {
+fn cmd_validate(
+    cfg: &config::CoopConfig,
+    be: &backend::PlatformBackend,
+    probe: bool,
+) -> Result<()> {
     writeln!(std::io::stdout(), "Validating config (backend: {be})...",).ok();
 
     let warnings = cfg.validate()?;
@@ -707,8 +785,72 @@ fn cmd_validate(cfg: &config::CoopConfig, be: &backend::PlatformBackend) -> Resu
         writeln!(std::io::stdout(), "  warning: {w}").ok();
     }
 
+    // Per-repo PAT validation
+    if let Some(config::GitHubAuth::Pat(pat)) = cfg.github.as_ref() {
+        for (repo, entry) in &pat.entries {
+            match config::resolve_cmd_value(&entry.token) {
+                Ok(token) => {
+                    if token.starts_with(github_pat::TOKEN_PREFIX) {
+                        writeln!(
+                            std::io::stdout(),
+                            "  github.pat.\"{repo}\": ok (resolves, fine-grained PAT format)"
+                        )
+                        .ok();
+                    } else {
+                        writeln!(
+                            std::io::stdout(),
+                            "  github.pat.\"{repo}\": warning — token resolves but is not \
+                             a fine-grained PAT (no '{prefix}' prefix)",
+                            prefix = github_pat::TOKEN_PREFIX,
+                        )
+                        .ok();
+                    }
+                    if probe {
+                        match probe_pat_token(&token) {
+                            Ok(login) => {
+                                writeln!(std::io::stdout(), "    probe: /user as '{login}'").ok();
+                            }
+                            Err(e) => {
+                                writeln!(std::io::stdout(), "    probe: FAILED ({e})").ok();
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    writeln!(
+                        std::io::stdout(),
+                        "  github.pat.\"{repo}\": FAILED to resolve token ({e})"
+                    )
+                    .ok();
+                }
+            }
+        }
+    }
+
     writeln!(std::io::stdout(), "Config OK").ok();
     Ok(())
+}
+
+/// Issue `GET https://api.github.com/user` with `token`. Returns the
+/// authenticated user's login on success.
+fn probe_pat_token(token: &str) -> Result<String> {
+    let body = cmd::Cmd::new("curl")
+        .arg("-fsSL")
+        .arg("-H")
+        .arg("Accept: application/vnd.github+json")
+        .arg("-H")
+        .arg("@-")
+        .stdin_input(format!("Authorization: token {token}\n"))
+        .arg("https://api.github.com/user")
+        .capture()
+        .context("curl /user failed")?;
+    // Naive extraction: grab the first `"login": "..."`. Avoids a JSON dep.
+    let login = body
+        .split("\"login\"")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(1))
+        .unwrap_or("?");
+    Ok(login.to_string())
 }
 
 fn apply_vm_overrides(
@@ -742,14 +884,19 @@ struct StartOpts<'a> {
     workspace_dir: Option<&'a str>,
     git_repo: Option<&'a str>,
     no_agents: bool,
+    /// Skip the interactive PAT auto-prompt unconditionally.
+    no_prompt: bool,
     disk: Option<config::GiB>,
     mounts: Vec<config::Mount>,
     exclude_git: bool,
+    /// Path to the on-disk config file. Re-read after the auto-prompt
+    /// in case the wizard added a new `[github.pat."..."]` entry.
+    config_path: &'a Path,
 }
 
 fn cmd_start(
     be: &backend::PlatformBackend,
-    cfg: &config::CoopConfig,
+    cfg: &mut config::CoopConfig,
     opts: &StartOpts<'_>,
 ) -> Result<()> {
     let ws_path = opts.workspace_dir.map(Path::new);
@@ -772,14 +919,14 @@ fn cmd_start(
             );
         }
 
-        return restart_instance(be, cfg, &inst, opts.no_agents);
+        return restart_instance(be, cfg, &inst, opts);
     }
 
     let inst = cfg.allocate_instance(opts.name, opts.image, ws_path)?;
     tracing::info!("Starting instance '{}' (index {})", inst.name, inst.index);
 
     let _guard = signal::install_handlers();
-    let result = start_instance(be, cfg, &inst, opts);
+    let result = start_instance(be, &mut *cfg, &inst, opts);
 
     if let Err(e) = &result {
         tracing::error!("Failed to start instance '{}': {e}", inst.name);
@@ -901,13 +1048,18 @@ fn find_stopped_instance(
 /// Restart a stopped instance: boot VM, wait for SSH, re-bootstrap guest tools.
 fn restart_instance(
     be: &backend::PlatformBackend,
-    cfg: &config::CoopConfig,
+    cfg: &mut config::CoopConfig,
     inst: &config::Instance,
-    no_agents: bool,
+    opts: &StartOpts<'_>,
 ) -> Result<()> {
     tracing::info!("Restarting stopped instance '{}'", inst.name);
 
     let _guard = signal::install_handlers();
+
+    // Pre-flight: same auto-prompt as a fresh start. Uses the instance's
+    // recorded workspace-state to recover the repo slug.
+    let repo = backend::detect_instance_repo(inst);
+    pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_deref(), opts.no_prompt)?;
 
     be.start_existing(cfg, inst)?;
 
@@ -920,10 +1072,10 @@ fn restart_instance(
 
     signal::check_shutdown()?;
 
-    if no_agents {
+    if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let env = backend::prepare_env_forwarding(cfg)?;
+        let env = backend::prepare_env_forwarding(cfg, repo.as_deref())?;
         let session = backend::SshSession {
             target: target.clone(),
             env,
@@ -940,12 +1092,49 @@ fn restart_instance(
     Ok(())
 }
 
+/// Best-effort GitHub repo resolution for `coop start`.
+///
+/// Order: `--git-repo` URL → `--workspace` `.git/config` origin → first
+/// `--mount` host path's `.git/config` origin → `None`.
+///
+/// The mount fallback matches the "first mount is the workspace"
+/// convention used by `push`/`pull`, so the slug a user sees here is the
+/// same one `detect_instance_repo` will recover on `coop shell` / `exec`
+/// / `restart`.
+fn resolve_start_repo(opts: &StartOpts<'_>) -> Result<Option<String>> {
+    if let Some(url) = opts.git_repo
+        && let Some(slug) = github_repo::parse_repo_slug_from_url(url)
+    {
+        return Ok(Some(slug));
+    }
+    if let Some(ws_dir) = opts.workspace_dir {
+        let path = Path::new(ws_dir);
+        if path.is_dir()
+            && let Some(slug) = github_repo::detect_workspace_repo(path)?
+        {
+            return Ok(Some(slug));
+        }
+    }
+    if let Some(m) = opts.mounts.first()
+        && let Some(slug) = github_repo::detect_workspace_repo(&m.host_path)?
+    {
+        return Ok(Some(slug));
+    }
+    Ok(None)
+}
+
 fn start_instance(
     be: &backend::PlatformBackend,
-    cfg: &config::CoopConfig,
+    cfg: &mut config::CoopConfig,
     inst: &config::Instance,
     opts: &StartOpts<'_>,
 ) -> Result<()> {
+    // Derive the GitHub repo slug as early as possible so the auto-prompt
+    // can fire before any VM cost is incurred, and so pat-mode token
+    // forwarding works at bootstrap time.
+    let repo = resolve_start_repo(opts)?;
+    pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_deref(), opts.no_prompt)?;
+
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
 
     signal::check_shutdown()?;
@@ -960,7 +1149,7 @@ fn start_instance(
     if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let env = backend::prepare_env_forwarding(cfg)?;
+        let env = backend::prepare_env_forwarding(cfg, repo.as_deref())?;
         let session = backend::SshSession {
             target: target.clone(),
             env,
@@ -989,6 +1178,7 @@ fn start_instance(
             host_path: Some(abs_path),
             guest_path: "/workspace".to_string(),
             source: workspace::WorkspaceSource::Workspace,
+            git_repo_url: None,
         };
         state.save(inst)?;
     } else if let Some(repo_url) = opts.git_repo {
@@ -998,14 +1188,22 @@ fn start_instance(
             host_path: None,
             guest_path: "/workspace".to_string(),
             source: workspace::WorkspaceSource::GitRepo,
+            git_repo_url: Some(repo_url.to_string()),
         };
         state.save(inst)?;
-    } else if !opts.mounts.is_empty() && !be.mounts_are_live() {
-        workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
-        tracing::warn!(
-            "Firecracker mounts use one-time sync, not live filesystem sharing. \
-             Use `coop push` / `coop pull` to sync changes."
-        );
+    } else if !opts.mounts.is_empty() {
+        if be.mounts_are_live() {
+            // Lima: virtiofs already serves the host directory live. No
+            // sync step, but we still record state so `push`/`pull` and
+            // PAT slug detection work for follow-up commands.
+            workspace::record_mount_state(inst, &opts.mounts)?;
+        } else {
+            workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
+            tracing::warn!(
+                "Firecracker mounts use one-time sync, not live filesystem sharing. \
+                 Use `coop push` / `coop pull` to sync changes."
+            );
+        }
     }
 
     tracing::info!(
@@ -1130,7 +1328,8 @@ fn open_ssh_session(
     name: Option<&str>,
 ) -> Result<backend::SshSession> {
     let running = resolve_running(be, cfg, name)?;
-    let env = backend::prepare_env_forwarding(cfg)?;
+    let repo = backend::detect_instance_repo(&running.inst);
+    let env = backend::prepare_env_forwarding(cfg, repo.as_deref())?;
     Ok(backend::SshSession {
         target: running.target,
         env,
@@ -1692,6 +1891,7 @@ fn dir_size_display(dir: &std::path::Path) -> String {
 #[cfg(test)]
 #[expect(clippy::panic, reason = "tests use panic for unreachable branches")]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
+#[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
     use clap::Parser;
 
@@ -2225,6 +2425,95 @@ mod tests {
     fn completions_subcommand_requires_shell() {
         let err = parse_err(&["completions"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        // Clear inherited env and restore only what `git` needs. This
+        // protects against parent contexts that export GIT_DIR /
+        // GIT_WORK_TREE / GIT_INDEX_FILE (e.g. a pre-commit hook
+        // running `cargo test`), which would otherwise hijack the
+        // tempdir-scoped operations below.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("git command runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn start_opts(
+        mounts: Vec<super::config::Mount>,
+        config_path: &std::path::Path,
+    ) -> super::StartOpts<'_> {
+        super::StartOpts {
+            name: None,
+            image: super::config::DEFAULT_IMAGE,
+            workspace_dir: None,
+            git_repo: None,
+            no_agents: false,
+            no_prompt: true,
+            disk: None,
+            mounts,
+            exclude_git: false,
+            config_path,
+        }
+    }
+
+    #[test]
+    fn resolve_start_repo_uses_first_mount_origin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q"]);
+        run_git(
+            tmp.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/trailofbits/coop.git",
+            ],
+        );
+        let mount = super::config::Mount {
+            host_path: tmp.path().to_path_buf(),
+            guest_path: "/workspace".to_string(),
+        };
+        let cfg_path = tmp.path().join("config.toml");
+        let opts = start_opts(vec![mount], &cfg_path);
+        let slug = super::resolve_start_repo(&opts).expect("ok");
+        assert_eq!(slug.as_deref(), Some("trailofbits/coop"));
+    }
+
+    #[test]
+    fn resolve_start_repo_returns_none_for_non_github_mount() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q"]);
+        run_git(
+            tmp.path(),
+            &["remote", "add", "origin", "https://gitlab.com/x/y.git"],
+        );
+        let mount = super::config::Mount {
+            host_path: tmp.path().to_path_buf(),
+            guest_path: "/workspace".to_string(),
+        };
+        let cfg_path = tmp.path().join("config.toml");
+        let opts = start_opts(vec![mount], &cfg_path);
+        let slug = super::resolve_start_repo(&opts).expect("ok");
+        assert!(slug.is_none(), "got {slug:?}");
+    }
+
+    #[test]
+    fn resolve_start_repo_returns_none_for_no_mounts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("config.toml");
+        let opts = start_opts(Vec::new(), &cfg_path);
+        let slug = super::resolve_start_repo(&opts).expect("ok");
+        assert!(slug.is_none());
     }
 
     #[test]
