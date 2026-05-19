@@ -38,6 +38,19 @@ Mounts a host directory into the guest. Behavior differs by backend:
 
 If GUEST_PATH is omitted, defaults to `/workspace`. Conflicts with `--workspace` and `--git-repo`.
 
+#### Mounting a git repository (live-mount caveat)
+
+When a `--mount` source contains a `.git` entry and the backend is a live mount (Lima), git operations inside the guest can write absolute guest paths into the shared `.git/config`. Common triggers:
+
+- `git worktree add` records `core.worktree = /workspace/...` in the worktree's config.
+- `prek install` (and `git config core.hooksPath`) records `core.hooksPath = /workspace/.git/hooks`.
+
+Because the mount is live, those entries appear on the host as well. After the VM exits, every host `git` invocation fails with `fatal: Invalid path '/workspace': No such file or directory`. The workaround is to remove the offending lines from `.git/config` (and `.git/worktrees/*/config`).
+
+coop prints a warning at start time when a live-mount source is a git repo. To avoid the issue, do not run commands inside the guest that record absolute paths in `.git/config` — in particular, `git worktree add` and `prek install` (or any other tool that calls `git config core.hooksPath`).
+
+Switching from `--mount` to `--workspace` does not on its own fix this: `--workspace` copies the repo into the guest, but `.git/` is included by default and is brought back by `coop pull`, so corrupted config entries written inside the guest still reach the host. Either avoid the offending commands or pass `--exclude-git` on `coop pull`.
+
 ### Manual via SSH
 
 ```bash

@@ -1189,6 +1189,7 @@ fn start_instance(
             // sync step, but we still record state so `push`/`pull` and
             // PAT slug detection work for follow-up commands.
             workspace::record_mount_state(inst, &opts.mounts)?;
+            warn_on_live_git_mounts(&opts.mounts);
         } else {
             workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
             tracing::warn!(
@@ -1205,6 +1206,28 @@ fn start_instance(
         target.port,
     );
     Ok(())
+}
+
+/// Emit a warning for each live-mounted host directory that contains a
+/// `.git` entry. Git operations inside the guest (worktree creation,
+/// `prek install`, etc.) may write absolute `/workspace`-prefixed paths
+/// into `.git/config`, which the host then sees and chokes on. See
+/// issue #102.
+fn warn_on_live_git_mounts(mounts: &[config::Mount]) {
+    for m in mounts.iter().filter(|m| m.host_is_git_repo()) {
+        tracing::warn!(
+            "Live-mounting git repo '{}' at guest path '{}'. Avoid running \
+             commands inside the guest that record absolute paths in \
+             .git/config (in particular `git worktree add` and \
+             `prek install`): they write '{}/...' values for \
+             core.worktree / core.hooksPath that are visible on the host \
+             through the live mount and break host-side `git` after the \
+             VM exits.",
+            m.host_path.display(),
+            m.guest_path,
+            m.guest_path,
+        );
+    }
 }
 
 /// Resolve an instance that must be running.
