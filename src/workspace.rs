@@ -28,28 +28,39 @@ const GIT_EXCLUDE: &str = ".git/";
 /// Persisted workspace metadata written during `start`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceState {
-    /// Host directory path (None for git-repo clones with no local origin)
-    pub host_path: Option<PathBuf>,
-    /// Path inside the guest VM
+    /// Path inside the guest VM.
     pub guest_path: String,
-    /// How the workspace was created
+    /// How the workspace was created. Variant-specific fields (host
+    /// path, original repo URL) live inside the source so invalid
+    /// combinations can't be expressed.
     pub source: WorkspaceSource,
-    /// Original repo URL when source is [`WorkspaceSource::GitRepo`].
-    ///
-    /// Recorded so that follow-up commands (`coop shell`, `claude`, etc.)
-    /// can re-derive the `owner/repo` slug without re-asking — pat-mode
-    /// otherwise has no way to look up the entry for a git-repo instance
-    /// where `host_path` is `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_repo_url: Option<String>,
 }
 
+/// How the workspace contents arrived in the guest.
+///
+/// `Workspace` and `Mount` always have a host directory (pushed/synced
+/// or live-mounted). `GitRepo` clones happen entirely inside the guest
+/// — there is no host-side copy, only the original URL used to
+/// re-derive the `owner/repo` slug for follow-up commands.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkspaceSource {
-    Workspace,
-    GitRepo,
-    Mount,
+    Workspace { host_path: PathBuf },
+    GitRepo { url: String },
+    Mount { host_path: PathBuf },
+}
+
+impl WorkspaceSource {
+    /// Return the host path associated with this source, if any.
+    ///
+    /// `GitRepo` has no host path: the clone exists only inside the
+    /// guest.
+    pub fn host_path(&self) -> Option<&Path> {
+        match self {
+            Self::Workspace { host_path } | Self::Mount { host_path } => Some(host_path),
+            Self::GitRepo { .. } => None,
+        }
+    }
 }
 
 impl WorkspaceState {
@@ -65,15 +76,27 @@ impl WorkspaceState {
 
     pub fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.workspace_state_path();
-        match fs::read_to_string(&path) {
-            Ok(content) => {
-                let state =
-                    serde_json::from_str(&content).context("Failed to parse workspace.json")?;
-                Ok(Some(state))
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(
+                    anyhow::anyhow!(e).context(format!("Failed to read {}", path.display()))
+                );
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(anyhow::anyhow!(e).context(format!("Failed to read {}", path.display()))),
-        }
+        };
+        serde_json::from_str(&content)
+            .with_context(|| {
+                format!(
+                    "Failed to parse {}.\n\
+                     If this file was written by a pre-#147 coop the on-disk \
+                     shape changed; delete it and run `coop start` again to \
+                     regenerate, or `coop destroy <name>` if the instance is \
+                     no longer needed.",
+                    path.display()
+                )
+            })
+            .map(Some)
     }
 }
 
@@ -290,12 +313,12 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
     if let Some(state) = WorkspaceState::try_load(inst)? {
         return Ok(state);
     }
-    if dir.is_some() {
+    if let Some(d) = dir {
         return Ok(WorkspaceState {
-            host_path: None,
             guest_path: GUEST_WORKSPACE.to_string(),
-            source: WorkspaceSource::Workspace,
-            git_repo_url: None,
+            source: WorkspaceSource::Workspace {
+                host_path: PathBuf::from(d),
+            },
         });
     }
     bail!(
@@ -314,7 +337,7 @@ pub fn push(
     exclude_git: bool,
 ) -> Result<()> {
     let state = load_or_default(inst, dir, "push")?;
-    let source_dir = resolve_host_dir(dir, &state)?;
+    let source_dir = resolve_host_dir(dir, &state, "push")?;
 
     if !source_dir.is_dir() {
         bail!("Source directory {} does not exist", source_dir.display());
@@ -350,7 +373,7 @@ pub fn pull(
     exclude_git: bool,
 ) -> Result<()> {
     let state = load_or_default(inst, dir, "pull")?;
-    let dest_dir = resolve_host_dir_for_pull(dir, &state)?;
+    let dest_dir = resolve_host_dir(dir, &state, "pull")?;
 
     if !force && dest_dir.exists() {
         check_local_dirty(&dest_dir)?;
@@ -414,10 +437,10 @@ pub fn sync_mounts(
 pub fn record_mount_state(inst: &Instance, mounts: &[crate::config::Mount]) -> Result<()> {
     if let Some(m) = mounts.first() {
         let state = WorkspaceState {
-            host_path: Some(m.host_path.clone()),
             guest_path: m.guest_path.clone(),
-            source: WorkspaceSource::Mount,
-            git_repo_url: None,
+            source: WorkspaceSource::Mount {
+                host_path: m.host_path.clone(),
+            },
         };
         state.save(inst)?;
     }
@@ -658,27 +681,20 @@ fn tar_pipe_pull(
 
 // ── Helpers ───────────────────────────────────────────────────
 
-fn resolve_host_dir(explicit: Option<&str>, state: &WorkspaceState) -> Result<PathBuf> {
+fn resolve_host_dir(explicit: Option<&str>, state: &WorkspaceState, cmd: &str) -> Result<PathBuf> {
     if let Some(d) = explicit {
         return Ok(PathBuf::from(d));
     }
-    state.host_path.clone().context(
-        "No host_path in workspace.json and no --dir given.\n\
-         Provide a directory: coop push --dir ./my-project",
-    )
-}
-
-fn resolve_host_dir_for_pull(explicit: Option<&str>, state: &WorkspaceState) -> Result<PathBuf> {
-    if let Some(d) = explicit {
-        return Ok(PathBuf::from(d));
-    }
-    if let Some(ref hp) = state.host_path {
-        return Ok(hp.clone());
-    }
-    bail!(
-        "No host_path in workspace.json and no --dir given.\n\
-         Provide a destination: coop pull --dir ./my-project"
-    )
+    state
+        .source
+        .host_path()
+        .map(Path::to_path_buf)
+        .with_context(|| {
+            format!(
+                "No host_path in workspace.json and no --dir given.\n\
+                 Provide a directory: coop {cmd} --dir ./my-project"
+            )
+        })
 }
 
 fn check_guest_dirty(target: &SshTarget, guest_path: &str) -> Result<()> {
@@ -1051,24 +1067,6 @@ mod tests {
     }
 
     #[test]
-    fn try_load_returns_state_when_present() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let inst = temp_instance(dir.path());
-        let state = WorkspaceState {
-            host_path: Some(PathBuf::from("/tmp/project")),
-            guest_path: "/workspace".to_string(),
-            source: WorkspaceSource::Workspace,
-            git_repo_url: None,
-        };
-        state.save(&inst).expect("save");
-        let loaded = WorkspaceState::try_load(&inst)
-            .expect("no IO error")
-            .expect("should be Some");
-        assert_eq!(loaded.guest_path, "/workspace");
-        assert_eq!(loaded.host_path.as_deref(), Some(Path::new("/tmp/project")));
-    }
-
-    #[test]
     fn try_load_errors_on_invalid_json() {
         let dir = tempfile::tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
@@ -1082,24 +1080,33 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         let state = WorkspaceState {
-            host_path: Some(PathBuf::from("/host/dir")),
             guest_path: "/custom".to_string(),
-            source: WorkspaceSource::GitRepo,
-            git_repo_url: None,
+            source: WorkspaceSource::GitRepo {
+                url: "https://github.com/x/y.git".to_string(),
+            },
         };
         state.save(&inst).expect("save");
         let loaded = load_or_default(&inst, None, "push").expect("load");
         assert_eq!(loaded.guest_path, "/custom");
+        assert!(matches!(
+            loaded.source,
+            WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
+        ));
     }
 
     #[test]
     fn load_or_default_falls_back_with_dir_arg() {
         let dir = tempfile::tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
-        // No workspace.json exists
+        // No workspace.json exists; the synthetic state carries the
+        // explicit --dir as its host_path so consumers can read it
+        // uniformly.
         let loaded = load_or_default(&inst, Some("./project"), "push").expect("load");
         assert_eq!(loaded.guest_path, GUEST_WORKSPACE);
-        assert!(loaded.host_path.is_none());
+        assert!(matches!(
+            loaded.source,
+            WorkspaceSource::Workspace { ref host_path } if host_path == Path::new("./project")
+        ));
     }
 
     #[test]
@@ -1122,10 +1129,11 @@ mod tests {
         let loaded = WorkspaceState::try_load(&inst)
             .expect("no IO error")
             .expect("state should exist");
-        assert!(matches!(loaded.source, WorkspaceSource::Mount));
-        assert_eq!(loaded.host_path.as_deref(), Some(primary.path()));
+        assert!(matches!(
+            loaded.source,
+            WorkspaceSource::Mount { ref host_path } if host_path == primary.path()
+        ));
         assert_eq!(loaded.guest_path, "/workspace");
-        assert!(loaded.git_repo_url.is_none());
     }
 
     #[test]
@@ -1279,6 +1287,54 @@ Host coop-0\n\
         assert!(
             !args.iter().any(|a| a == "--filter=+ /.git/***"),
             "exclude_git=true must drop the protective filter: {args:?}"
+        );
+    }
+
+    // ── WorkspaceState serialization ──────────────────────────
+
+    #[test]
+    fn workspace_state_round_trip_workspace() {
+        // The only direct serde test for the Workspace variant; the
+        // other variants are exercised end-to-end through
+        // `record_mount_state_persists_first_mount` (Mount) and
+        // `load_or_default_uses_saved_state` (GitRepo).
+        let state = WorkspaceState {
+            guest_path: "/workspace".to_string(),
+            source: WorkspaceSource::Workspace {
+                host_path: PathBuf::from("/host/dir"),
+            },
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let back: WorkspaceState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.guest_path, "/workspace");
+        assert!(matches!(
+            back.source,
+            WorkspaceSource::Workspace { ref host_path } if host_path == Path::new("/host/dir")
+        ));
+    }
+
+    #[test]
+    fn try_load_legacy_shape_emits_migration_hint() {
+        // The pre-#147 flat shape no longer parses; the error context
+        // points the user at the remediation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        fs::write(
+            inst.workspace_state_path(),
+            r#"{
+                "host_path": "/legacy/project",
+                "guest_path": "/workspace",
+                "source": "workspace"
+            }"#,
+        )
+        .expect("write");
+
+        let err = WorkspaceState::try_load(&inst).expect_err("legacy shape must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pre-#147"), "expected migration hint: {msg}");
+        assert!(
+            msg.contains("coop start") || msg.contains("coop destroy"),
+            "expected remediation pointer: {msg}"
         );
     }
 }

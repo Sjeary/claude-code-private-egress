@@ -897,20 +897,19 @@ pub type PlatformBackend = FirecrackerBackend;
 /// `origin`. Returns `None` when no slug can be derived — pat-mode
 /// then falls back to a clear error.
 pub fn detect_instance_repo(inst: &crate::config::Instance) -> Option<String> {
+    use crate::workspace::WorkspaceSource;
+
     let state = crate::workspace::WorkspaceState::try_load(inst)
         .ok()
         .flatten()?;
-    if let Some(url) = state.git_repo_url.as_deref()
-        && let Some(slug) = crate::github_repo::parse_repo_slug_from_url(url)
-    {
-        return Some(slug);
+    match &state.source {
+        WorkspaceSource::GitRepo { url } => crate::github_repo::parse_repo_slug_from_url(url),
+        WorkspaceSource::Workspace { host_path } | WorkspaceSource::Mount { host_path } => {
+            crate::github_repo::detect_workspace_repo(host_path)
+                .ok()
+                .flatten()
+        }
     }
-    if let Some(host) = state.host_path.as_deref()
-        && let Ok(Some(slug)) = crate::github_repo::detect_workspace_repo(host)
-    {
-        return Some(slug);
-    }
-    None
 }
 
 /// Resolve tokens and build env vars to forward via SSH `SendEnv`.
