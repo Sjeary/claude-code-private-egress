@@ -1309,14 +1309,30 @@ test_list_empty() {
     echo ""
     echo "=== Phase: list (no instances) ==="
 
-    if coop list; then
-        if echo "$HARNESS_OUT" | grep -q "No instances found"; then
-            pass "list shows empty-state message"
-        else
-            fail "list shows empty-state message" "got: $HARNESS_OUT"
-        fi
-    else
+    if ! coop list; then
         fail "list exits 0 with no instances" "exit code: $?"
+        return
+    fi
+
+    # Dev/CI hosts may carry long-lived instances unrelated to this run.
+    # Assert what this phase actually owns: the just-destroyed `$INSTANCE`
+    # is gone. The empty-state message is only asserted on a clean host.
+    local instance_count
+    instance_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -cE "running|stopped" || true)
+
+    if [[ "$instance_count" -gt 0 ]]; then
+        if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} "; then
+            fail "destroyed instance no longer in list" "still present: $HARNESS_OUT"
+        else
+            pass "destroyed instance no longer in list ($instance_count other(s) present)"
+        fi
+        return
+    fi
+
+    if echo "$HARNESS_OUT" | grep -q "No instances found"; then
+        pass "list shows empty-state message"
+    else
+        fail "list shows empty-state message" "got: $HARNESS_OUT"
     fi
 }
 
@@ -2333,12 +2349,28 @@ test_port_forwards() {
 
     GUEST_INSTANCE="$fwd_instance"
 
-    # Run a one-shot HTTP listener in the guest. `nc -l -p` is in the
-    # ubuntu-minimal CI image; pipe a canned HTTP response and exit.
-    # Backgrounded via nohup so the SSH exec returns immediately.
+    # Run a one-shot HTTP listener in the guest. The Firecracker CI rootfs
+    # ships no netcat variant (only socat among net listeners), so we use
+    # python3, which is present on both Firecracker (pulled in via
+    # python3-boto3) and Lima (Ubuntu cloud image default). The listener
+    # script is embedded as a heredoc; coop shell single-quotes each arg,
+    # so newlines pass through to the remote sh -c untouched.
     local payload
     payload=$(cat "$content_file")
-    guest_exec sh -c "nohup sh -c 'printf \"HTTP/1.1 200 OK\\r\\nContent-Length: ${#payload}\\r\\n\\r\\n${payload}\" | nc -l -p ${guest_port} -q 1 > /tmp/fwd.log 2>&1' >/dev/null 2>&1 &" || true
+    guest_exec sh -c "cat > /tmp/fwd.py <<'PYEOF'
+import socket, sys
+port = int(sys.argv[1])
+body = sys.argv[2].encode()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', port))
+s.listen(1)
+c, _ = s.accept()
+c.recv(65536)
+c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s' % (len(body), body))
+c.close()
+PYEOF
+nohup python3 /tmp/fwd.py ${guest_port} ${payload} > /tmp/fwd.log 2>&1 &" || true
     sleep 1
 
     if curl -fsS --max-time 3 "http://127.0.0.1:${host_port}/" > "$content_file.got"; then
@@ -2354,17 +2386,20 @@ test_port_forwards() {
     fi
 
     # Collision: starting another forward to the same host port should error.
+    # The coop() wrapper captures the binary's stderr into $HARNESS_ERR — an
+    # outer `2>` redirect here would be shadowed by the wrapper's internal
+    # redirect and silently capture nothing.
     local fwd_instance2="${INSTANCE}-fwd2"
-    if coop start "$fwd_instance2" --no-agents --forward-port "9999:${host_port}" 2>"$content_file.err"; then
+    if coop start "$fwd_instance2" --no-agents --forward-port "9999:${host_port}"; then
         STARTED_INSTANCES+=("$fwd_instance2")
         fail "collision detection rejects in-use host port" "start unexpectedly succeeded"
         coop destroy "$fwd_instance2" 2>/dev/null || true
         untrack_instance "$fwd_instance2"
     else
-        if grep -q "already in use" "$content_file.err"; then
+        if grep -q "already in use" <<<"$HARNESS_ERR"; then
             pass "collision detection rejects in-use host port"
         else
-            fail "collision detection rejects in-use host port" "stderr: $(cat "$content_file.err")"
+            fail "collision detection rejects in-use host port" "stderr: $HARNESS_ERR"
         fi
     fi
 
@@ -2383,7 +2418,7 @@ test_port_forwards() {
 
     coop destroy "$fwd_instance" 2>/dev/null || true
     untrack_instance "$fwd_instance"
-    rm -f "$content_file" "$content_file.got" "$content_file.err"
+    rm -f "$content_file" "$content_file.got"
 }
 
 test_mount_conflicts() {
@@ -2823,6 +2858,160 @@ test_interrupted_setup() {
     coop images --delete "$img" 2>/dev/null || true
 }
 
+# ── devcontainer.json translator (pre-VM + --full) ────────────
+
+# Write a sample devcontainer.json into $1/.devcontainer/devcontainer.json.
+# Exercises JSONC features (comments + trailing commas) so the integration
+# run also catches parser regressions, not just the unit tests.
+_write_devcontainer() {
+    local dir="$1"
+    mkdir -p "$dir/.devcontainer"
+    cat > "$dir/.devcontainer/devcontainer.json" <<'EOF'
+{
+    // sample devcontainer.json — coop reads a subset.
+    "name": "coop-it-demo",
+    "image": "ubuntu:22.04",
+    "hostRequirements": {
+        "cpus": 2,
+        "memory": "1GiB",
+    },
+    "containerEnv": {
+        "COOP_TEST_DEVCONTAINER": "applied",
+    },
+    "forwardPorts": [3000],
+    "postStartCommand": "echo dc-hooked > /tmp/coop-dc-marker",
+    "remoteUser": "root",
+}
+EOF
+}
+
+test_devcontainer_translator() {
+    echo ""
+    echo "=== Phase: devcontainer.json translator (dry-run) ==="
+
+    local dcdir="$tmpdir/devcontainer-ws"
+    _write_devcontainer "$dcdir"
+    local dcfile="$dcdir/.devcontainer/devcontainer.json"
+
+    # --dry-run with auto-discovery: report is printed to stderr, no VM work.
+    if coop start "${INSTANCE}-dc-dry" --workspace "$dcdir" --dry-run --no-agents; then
+        pass "start --workspace ... --dry-run exits 0"
+    else
+        fail "start --workspace ... --dry-run exits 0" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    # Report content lands on stderr (per the CLAUDE.md "tracing → stderr" rule).
+    if grep -q "hostRequirements.cpus" <<< "$HARNESS_ERR" \
+        && grep -q "applied" <<< "$HARNESS_ERR"; then
+        pass "dry-run report covers hostRequirements"
+    else
+        fail "dry-run report covers hostRequirements" "stderr: $HARNESS_ERR"
+    fi
+
+    # JSONC: the file uses //-comments and trailing commas; parser must accept.
+    if grep -q "containerEnv" <<< "$HARNESS_ERR"; then
+        pass "JSONC (comments + trailing commas) parses"
+    else
+        fail "JSONC (comments + trailing commas) parses" "stderr: $HARNESS_ERR"
+    fi
+
+    # remoteUser != ubuntu must surface as unsupported.
+    if grep -q "remoteUser" <<< "$HARNESS_ERR" \
+        && grep -q "unsupported" <<< "$HARNESS_ERR"; then
+        pass "remoteUser != ubuntu is reported unsupported"
+    else
+        fail "remoteUser != ubuntu is reported unsupported" "stderr: $HARNESS_ERR"
+    fi
+
+    # --no-devcontainer silently skips the file: the report header must NOT appear.
+    # `--dry-run` lets us exercise the discovery path without any VM work.
+    if coop start "${INSTANCE}-dc-skip" --workspace "$dcdir" \
+        --no-devcontainer --dry-run --no-agents; then
+        if grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
+            fail "--no-devcontainer suppresses discovery" "report header still appeared: $HARNESS_ERR"
+        else
+            pass "--no-devcontainer suppresses discovery"
+        fi
+    else
+        fail "--no-devcontainer suppresses discovery" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    # Non-interactive + discovered file + no escape hatch must error with the
+    # hint pointing at --devcontainer / --no-devcontainer.
+    if moat_fails start "${INSTANCE}-dc-noopt" --workspace "$dcdir" --no-agents; then
+        if grep -qi "devcontainer" <<< "$HARNESS_ERR" \
+            && grep -q -- "--no-devcontainer" <<< "$HARNESS_ERR"; then
+            pass "non-TTY without escape hatch errors with hint"
+        else
+            fail "non-TTY without escape hatch errors with hint" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "non-TTY without escape hatch errors with hint" "expected non-zero exit"
+    fi
+
+    # CLI overrides devcontainer.json values — report should mark cpus as
+    # "overridden" with source = CLI.
+    if coop start "${INSTANCE}-dc-override" --workspace "$dcdir" \
+        --vcpus 8 --dry-run --no-agents; then
+        pass "start --dry-run with overriding CLI flag exits 0"
+    else
+        fail "start --dry-run with overriding CLI flag exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if grep "hostRequirements.cpus" <<< "$HARNESS_ERR" | grep -q "overridden"; then
+        pass "CLI --vcpus is reported as overriding devcontainer.json"
+    else
+        fail "CLI --vcpus is reported as overriding devcontainer.json" "stderr: $HARNESS_ERR"
+    fi
+}
+
+# ── devcontainer.json apply (--full only) ─────────────────────
+
+test_devcontainer_apply() {
+    echo ""
+    echo "=== Phase: devcontainer.json apply (--full) ==="
+
+    local dcdir="$tmpdir/devcontainer-apply-ws"
+    _write_devcontainer "$dcdir"
+    local dcfile="$dcdir/.devcontainer/devcontainer.json"
+    local inst_name="${INSTANCE}-dc-apply"
+
+    # Use explicit --devcontainer to skip the prompt in CI.
+    if coop start "$inst_name" --workspace "$dcdir" \
+        --devcontainer "$dcfile" --no-agents; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "start with --devcontainer exits 0"
+    else
+        fail "start with --devcontainer exits 0" "exit code: $? stderr: $HARNESS_ERR"
+        return
+    fi
+
+    GUEST_INSTANCE="$inst_name"
+
+    # containerEnv must reach the guest as a literal env var.
+    local seen_env
+    seen_env=$(guest_exec printenv COOP_TEST_DEVCONTAINER 2>/dev/null) || seen_env=""
+    if [[ "$seen_env" == "applied" ]]; then
+        pass "containerEnv reached the guest"
+    else
+        fail "containerEnv reached the guest" "got: '$seen_env'"
+    fi
+
+    # postStartCommand must have written the marker.
+    local seen_marker
+    seen_marker=$(guest_exec cat /tmp/coop-dc-marker 2>/dev/null) || seen_marker=""
+    if [[ "$seen_marker" == *dc-hooked* ]]; then
+        pass "postStartCommand ran in the guest"
+    else
+        fail "postStartCommand ran in the guest" "marker contents: '$seen_marker'"
+    fi
+
+    unset GUEST_INSTANCE
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+}
+
 # ── post_start hook (--full only) ──────────────────────────────
 
 test_post_start() {
@@ -2932,6 +3121,7 @@ main() {
     test_invalid_names
     test_profiles_cli
     test_completions
+    test_devcontainer_translator
 
     # Setup + primary instance
     test_setup
@@ -2986,6 +3176,7 @@ main() {
         test_custom_profiles
         test_builtin_profiles
         test_post_start
+        test_devcontainer_apply
 
         # Local marketplace directory copy
         test_local_marketplace

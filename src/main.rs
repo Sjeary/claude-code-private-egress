@@ -2,10 +2,12 @@ mod backend;
 mod cmd;
 mod completions;
 mod config;
+mod devcontainer;
 mod fs_util;
 mod github_pat;
 mod github_repo;
 mod guest;
+mod guest_env_state;
 mod pat_prompt;
 mod port_forward;
 mod secret_store;
@@ -136,6 +138,21 @@ enum Commands {
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         image: String,
+        /// Workspace directory to scan for `.devcontainer/devcontainer.json`.
+        /// When present (and `--no-devcontainer` is not set), coop offers to
+        /// apply the file's `features` and `hostRequirements` to this setup.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Explicit path to a `devcontainer.json` to use (skips discovery).
+        #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
+        devcontainer: Option<String>,
+        /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
+        #[arg(long)]
+        no_devcontainer: bool,
+        /// Translate `devcontainer.json` and print the report, then exit
+        /// before doing any setup work.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Build rootfs image and fetch kernel (use `setup` for first-time install)
     Build,
@@ -193,6 +210,16 @@ enum Commands {
         /// values with the same name.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         guest_env: Vec<String>,
+        /// Explicit path to a `devcontainer.json` to use (skips discovery).
+        #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
+        devcontainer: Option<String>,
+        /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
+        #[arg(long)]
+        no_devcontainer: bool,
+        /// Translate `devcontainer.json` and print the report, then exit
+        /// before doing any VM work.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
     #[command(alias = "ssh")]
@@ -572,8 +599,45 @@ fn main() -> Result<()> {
             post_install,
             template_size,
             image,
+            workspace,
+            devcontainer,
+            no_devcontainer,
+            dry_run,
         } => {
+            let ws_path = workspace.as_deref().map(Path::new);
+            let inputs = devcontainer::TranslatorInputs {
+                cli_vcpus: vcpus,
+                cli_mem_mib: mem,
+                cli_profiles: profile.clone(),
+                ..devcontainer::TranslatorInputs::default()
+            };
+            let translation = resolve_devcontainer(
+                &DevcontainerOpts {
+                    explicit_path: devcontainer.as_deref(),
+                    no_devcontainer,
+                    dry_run,
+                    workspace: ws_path,
+                    mounts: &[],
+                },
+                &inputs,
+                devcontainer::Stage::Setup,
+            )?;
+            if dry_run {
+                return Ok(());
+            }
+            let mut profile = profile;
+            if let Some(t) = &translation {
+                for p in &t.profiles {
+                    if !profile.contains(p) {
+                        profile.push(p.clone());
+                    }
+                }
+            }
+            // CLI flags first; translation values then fill in any blanks.
             apply_vm_overrides(&mut cfg, vcpus, mem, template_size)?;
+            if let Some(t) = &translation {
+                devcontainer::apply_to_config(&mut cfg, t)?;
+            }
             let _guard = signal::install_handlers();
             be.setup(
                 &cfg,
@@ -603,22 +667,100 @@ fn main() -> Result<()> {
             post_start,
             guest_env,
             forward_port,
+            devcontainer,
+            no_devcontainer,
+            dry_run,
         } => {
             if raw_args_use_deprecated_no_claude(std::env::args()) {
                 tracing::warn!(
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
                 );
             }
-            apply_vm_overrides(&mut cfg, vcpus, mem, None)?;
-            merge_cli_guest_env(&mut cfg, &guest_env)?;
             let mounts = mount
                 .iter()
                 .map(|s| config::Mount::parse(s))
                 .collect::<Result<Vec<_>>>()?;
-            let forward_ports = forward_port
+            let mut forward_ports = forward_port
                 .iter()
                 .map(|s| config::PortForward::parse(s))
                 .collect::<Result<Vec<_>>>()?;
+
+            let cli_env_keys = guest_env
+                .iter()
+                .filter_map(|s| s.split_once('=').map(|(k, _)| k.to_string()))
+                .collect();
+            let inputs = devcontainer::TranslatorInputs {
+                cli_vcpus: vcpus,
+                cli_mem_mib: mem,
+                cli_disk_gib: disk,
+                cli_post_start: post_start.clone(),
+                cli_guest_env_keys: cli_env_keys,
+                cli_forward_ports: forward_ports.clone(),
+                cli_mounts: mounts.clone(),
+                cli_profiles: Vec::new(),
+                cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
+            };
+            let ws_path = workspace.as_deref().map(Path::new);
+            let translation = resolve_devcontainer(
+                &DevcontainerOpts {
+                    explicit_path: devcontainer.as_deref(),
+                    no_devcontainer,
+                    dry_run,
+                    workspace: ws_path,
+                    mounts: &mounts,
+                },
+                &inputs,
+                devcontainer::Stage::Start,
+            )?;
+            if dry_run {
+                return Ok(());
+            }
+            // CLI flags are applied first; the translation only carries
+            // values that survived the "CLI > devcontainer.json" precedence
+            // check inside `translate`, so the two cannot fight here.
+            apply_vm_overrides(&mut cfg, vcpus, mem, None)?;
+            if let Some(t) = &translation {
+                devcontainer::apply_to_config(&mut cfg, t)?;
+                forward_ports =
+                    devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
+            }
+            let cli_guest_env = guest_env_state::parse_cli_env_args(&guest_env)?;
+            for (key, value) in &cli_guest_env {
+                cfg.guest_env.insert(key.clone(), value.clone());
+            }
+            // Union of CLI `--env` and devcontainer `containerEnv`. Both
+            // are start-time inputs that won't be re-derived by later
+            // `coop shell`/`exec`, so they belong in the on-disk snapshot
+            // (see `guest_env_state` module docs for the rationale).
+            let dc_guest_env = translation
+                .as_ref()
+                .map(|t| t.guest_env.clone())
+                .unwrap_or_default();
+            let persisted_guest_env =
+                guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
+            let cli_disk = disk
+                .map(|d| config::GiB::new(d).context("--disk must be > 0"))
+                .transpose()?;
+            let default_translation = devcontainer::Translation::default();
+            let effective_disk = devcontainer::effective_disk(
+                cli_disk,
+                translation.as_ref().unwrap_or(&default_translation),
+            );
+            let post_start_override = post_start
+                .clone()
+                .or_else(|| translation.as_ref().and_then(|t| t.post_start.clone()));
+            // `--mount` and devcontainer `mounts` aren't combined: --mount is
+            // a complete replacement of the mount set (its `conflicts_with`
+            // rules with --workspace/--git-repo encode this). The CLI-wins
+            // outcome is reported by `translate`.
+            let final_mounts = if mounts.is_empty() {
+                translation
+                    .as_ref()
+                    .map(|t| t.mounts.clone())
+                    .unwrap_or_default()
+            } else {
+                mounts
+            };
             cmd_start(
                 &be,
                 &mut cfg,
@@ -629,14 +771,13 @@ fn main() -> Result<()> {
                     git_repo: git_repo.as_deref(),
                     no_agents,
                     no_prompt,
-                    disk: disk
-                        .map(|d| config::GiB::new(d).context("--disk must be > 0"))
-                        .transpose()?,
-                    mounts,
+                    disk: effective_disk,
+                    mounts: final_mounts,
                     exclude_git,
                     forward_ports,
                     config_path: &cli.config,
-                    post_start_override: post_start.as_deref(),
+                    post_start_override: post_start_override.as_deref(),
+                    persisted_guest_env,
                 },
             )
         }
@@ -897,21 +1038,84 @@ fn apply_vm_overrides(
     Ok(())
 }
 
-/// Merge `--env KEY=VALUE` arguments into `cfg.guest_env`.
+/// CLI surface controlling devcontainer.json discovery and apply.
 ///
-/// CLI values override config entries with the same key. Empty keys
-/// and values without `=` are rejected; empty values are allowed.
-fn merge_cli_guest_env(cfg: &mut config::CoopConfig, args: &[String]) -> Result<()> {
-    for entry in args {
-        let (key, value) = entry
-            .split_once('=')
-            .with_context(|| format!("--env expects KEY=VALUE, got '{entry}' (missing '=')"))?;
-        if key.is_empty() {
-            bail!("--env KEY must not be empty (got '{entry}')");
-        }
-        cfg.guest_env.insert(key.to_string(), value.to_string());
+/// `explicit_path` opts the caller in to a specific file (skips the
+/// prompt). `no_devcontainer` opts out entirely (skips discovery).
+/// `dry_run` prints the report and exits before any side effects.
+struct DevcontainerOpts<'a> {
+    explicit_path: Option<&'a str>,
+    no_devcontainer: bool,
+    dry_run: bool,
+    workspace: Option<&'a Path>,
+    mounts: &'a [config::Mount],
+}
+
+/// Discover, prompt, and translate a `devcontainer.json` for the given
+/// lifecycle `stage`.
+///
+/// Returns `None` when the user opts out, no file is found, or stdin is
+/// not a TTY with no explicit flag (in which case an error is returned
+/// instead — the issue forbids silently choosing). The report is always
+/// emitted to stderr when a file is loaded, so the user sees every key
+/// that did and didn't take effect.
+#[expect(
+    clippy::print_stderr,
+    reason = "devcontainer report is intentional user-facing CLI output"
+)]
+fn resolve_devcontainer(
+    opts: &DevcontainerOpts<'_>,
+    inputs: &devcontainer::TranslatorInputs,
+    stage: devcontainer::Stage,
+) -> Result<Option<devcontainer::Translation>> {
+    use std::io::IsTerminal as _;
+
+    if opts.no_devcontainer {
+        return Ok(None);
     }
-    Ok(())
+
+    let (path, losers) = if let Some(p) = opts.explicit_path {
+        (PathBuf::from(p), Vec::new())
+    } else {
+        let found = devcontainer::discover(opts.workspace, opts.mounts);
+        if let Some((winner, losers)) = devcontainer::pick_winner(found) {
+            (winner.path, losers)
+        } else {
+            return Ok(None);
+        }
+    };
+
+    // When discovery (not an explicit flag) found the file, defer to the
+    // user. CI/scripted callers must pass --devcontainer or --no-devcontainer.
+    if opts.explicit_path.is_none() && !opts.dry_run {
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "Found {} but stdin is not a TTY.\n\
+                 Pass --devcontainer {} to apply it, or --no-devcontainer to ignore.\n\
+                 coop reads a subset of devcontainer.json — see docs/devcontainer.md for the supported keys.",
+                path.display(),
+                path.display()
+            );
+        }
+        let answer =
+            prompt::confirm_default_yes(&format!("Use devcontainer.json at {}?", path.display()))?;
+        if !answer {
+            tracing::info!(
+                "Skipping {}. Re-run with --devcontainer {} to apply it later.",
+                path.display(),
+                path.display()
+            );
+            return Ok(None);
+        }
+    }
+
+    let parsed = devcontainer::ParsedDevcontainer::load(&path)?;
+    let mut translation = devcontainer::translate(&parsed, inputs, stage);
+    translation.report.ignored_paths = losers;
+
+    eprintln!("{}", translation.report.render());
+
+    Ok(Some(translation))
 }
 
 fn cmd_build(cfg: &config::CoopConfig) -> Result<()> {
@@ -942,6 +1146,13 @@ struct StartOpts<'a> {
     /// CLI override for `post_start` from `config.toml`. `None` means
     /// "use the configured value (if any)"; `Some` always wins.
     post_start_override: Option<&'a str>,
+    /// Start-time guest-env entries to persist as the per-instance
+    /// snapshot, so later `coop shell`/`exec` runs see them. This is
+    /// the union of CLI `--env KEY=VALUE` and the devcontainer
+    /// translator's `containerEnv` map (CLI wins per-key). `[guest_env]`
+    /// from `config.toml` is re-read every invocation and deliberately
+    /// not saved here.
+    persisted_guest_env: std::collections::BTreeMap<String, String>,
 }
 
 fn cmd_start(
@@ -1123,6 +1334,21 @@ fn restart_instance(
     let forwards = config::merge_forward_ports(&saved, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
+    // Re-apply the persisted guest-env set from the initial start
+    // (CLI `--env` ∪ devcontainer `containerEnv`). New start-time
+    // entries on restart override per-key; the merged result is what
+    // gets persisted (and forwarded for this restart's bootstrap).
+    let saved_guest_env = guest_env_state::GuestEnvState::try_load(inst)?
+        .map(|s| s.entries)
+        .unwrap_or_default();
+    let mut merged_guest_env = saved_guest_env;
+    for (key, value) in &opts.persisted_guest_env {
+        merged_guest_env.insert(key.clone(), value.clone());
+    }
+    for (key, value) in &merged_guest_env {
+        cfg.guest_env.insert(key.clone(), value.clone());
+    }
+
     be.start_existing(cfg, inst)?;
 
     signal::check_shutdown()?;
@@ -1140,11 +1366,16 @@ fn restart_instance(
     .save(inst)?;
     port_forward::spawn_ssh_forwards(inst, &target, &forwards)?;
 
+    guest_env_state::GuestEnvState {
+        entries: merged_guest_env,
+    }
+    .save(inst)?;
+
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let session = prepare_session_from_target(cfg, target.clone(), repo.as_deref())?;
+        let session = prepare_session_from_target(cfg, None, target.clone(), repo.as_deref())?;
         if opts.no_agents {
             tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         } else {
@@ -1230,11 +1461,22 @@ fn start_instance(
     .save(inst)?;
     port_forward::spawn_ssh_forwards(inst, &target, &forwards)?;
 
+    // Persist start-time guest-env entries (CLI `--env` ∪ devcontainer
+    // `containerEnv`) so later commands targeting this instance — which
+    // reload `config.toml` from scratch and do not re-parse
+    // `--devcontainer` — still forward these values via SSH `SendEnv`.
+    // The in-memory `cfg.guest_env` already contains them for this
+    // process's bootstrap pass.
+    guest_env_state::GuestEnvState {
+        entries: opts.persisted_guest_env.clone(),
+    }
+    .save(inst)?;
+
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let session = prepare_session_from_target(cfg, target.clone(), repo.as_deref())?;
+        let session = prepare_session_from_target(cfg, None, target.clone(), repo.as_deref())?;
         if opts.no_agents {
             tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         } else {
@@ -1440,7 +1682,7 @@ fn open_ssh_session(
 ) -> Result<backend::SshSession> {
     let running = resolve_running(be, cfg, name)?;
     let repo = backend::detect_instance_repo(&running.inst);
-    prepare_session_from_target(cfg, running.target, repo.as_deref())
+    prepare_session_from_target(cfg, Some(&running.inst), running.target, repo.as_deref())
 }
 
 /// Build an `SshSession` from an already-resolved target.
@@ -1449,12 +1691,29 @@ fn open_ssh_session(
 /// target without going through `resolve_running` — namely the
 /// post-boot bootstrap in fresh start and restart, where the
 /// instance isn't yet registered as running.
+///
+/// When `inst` is `Some`, any persisted `--env` snapshot for that
+/// instance is overlaid onto the resolved env-forward set so values
+/// passed at `coop start --env KEY=VAL` survive across the
+/// per-invocation config reload. Bootstrap callers inside fresh
+/// `start_instance` pass `None` because the in-memory `cfg.guest_env`
+/// is already authoritative for that one process; restart and every
+/// post-start command pass `Some` because the on-disk snapshot is
+/// the only place the original `--env` set still lives.
 fn prepare_session_from_target(
     cfg: &config::CoopConfig,
+    inst: Option<&config::Instance>,
     target: backend::SshTarget,
     repo: Option<&str>,
 ) -> Result<backend::SshSession> {
-    let env = backend::prepare_env_forwarding(cfg, repo)?;
+    let mut env = backend::prepare_env_forwarding(cfg, repo)?;
+    if let Some(inst) = inst
+        && let Some(state) = guest_env_state::GuestEnvState::try_load(inst)?
+    {
+        for (name, value) in &state.entries {
+            env.set(name.as_str(), value.as_str());
+        }
+    }
     Ok(backend::SshSession { target, env })
 }
 
@@ -2248,62 +2507,77 @@ mod tests {
         );
     }
 
+    /// `prepare_session_from_target` must overlay the on-disk
+    /// `GuestEnvState` for the running instance on top of values
+    /// resolved from `cfg.guest_env` and forwarded host env vars.
+    /// This is the regression test for issue #131: `coop start --env`
+    /// values must survive across a fresh config reload by later
+    /// `coop shell`/`exec` invocations.
     #[test]
-    fn merge_cli_guest_env_inserts_and_overrides_config() {
+    fn prepare_session_overlays_persisted_guest_env() {
+        use std::num::NonZeroU16;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("valid name"),
+            index: super::config::InstanceIndex::new(0),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::DEFAULT_IMAGE.to_string(),
+        };
+        let mut state = super::guest_env_state::GuestEnvState::default();
+        state
+            .entries
+            .insert("FROM_CLI".to_string(), "saved-value".to_string());
+        state.save(&inst).expect("save snapshot");
+
         let mut cfg = super::config::CoopConfig::default();
+        // Sanity: an entry in cfg without a CLI override should still
+        // appear (so the overlay is additive, not replacing).
         cfg.guest_env
-            .insert("KEEP".to_string(), "from-config".to_string());
-        cfg.guest_env
-            .insert("OVERWRITE".to_string(), "from-config".to_string());
+            .insert("FROM_CFG".to_string(), "cfg-value".to_string());
 
-        super::merge_cli_guest_env(
-            &mut cfg,
-            &["OVERWRITE=from-cli".to_string(), "NEW=cli-only".to_string()],
-        )
-        .unwrap();
+        let target = super::backend::SshTarget {
+            host: "127.0.0.1".to_string(),
+            port: NonZeroU16::new(22).expect("non-zero"),
+            user: "ubuntu".to_string(),
+            key_path: tmp.path().join("id_test"),
+        };
 
+        let session =
+            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+
+        let envs = session.env.as_envs();
         assert_eq!(
-            cfg.guest_env.get("KEEP").map(String::as_str),
-            Some("from-config")
+            envs.get("FROM_CLI").map(String::as_str),
+            Some("saved-value"),
+            "persisted CLI --env entry must reach SshSession",
         );
         assert_eq!(
-            cfg.guest_env.get("OVERWRITE").map(String::as_str),
-            Some("from-cli")
-        );
-        assert_eq!(
-            cfg.guest_env.get("NEW").map(String::as_str),
-            Some("cli-only")
+            envs.get("FROM_CFG").map(String::as_str),
+            Some("cfg-value"),
+            "config.toml [guest_env] entries must still flow through",
         );
     }
 
     #[test]
-    fn merge_cli_guest_env_allows_empty_value() {
-        let mut cfg = super::config::CoopConfig::default();
-        super::merge_cli_guest_env(&mut cfg, &["CLEAR=".to_string()]).unwrap();
-        assert_eq!(cfg.guest_env.get("CLEAR").map(String::as_str), Some(""));
-    }
+    fn prepare_session_skips_overlay_without_instance() {
+        use std::num::NonZeroU16;
 
-    #[test]
-    fn merge_cli_guest_env_rejects_missing_equals() {
-        let mut cfg = super::config::CoopConfig::default();
-        let err = super::merge_cli_guest_env(&mut cfg, &["NO_EQUALS".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("KEY=VALUE"));
-    }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = super::config::CoopConfig::default();
+        let target = super::backend::SshTarget {
+            host: "127.0.0.1".to_string(),
+            port: NonZeroU16::new(22).expect("non-zero"),
+            user: "ubuntu".to_string(),
+            key_path: tmp.path().join("id_test"),
+        };
 
-    #[test]
-    fn merge_cli_guest_env_rejects_empty_key() {
-        let mut cfg = super::config::CoopConfig::default();
-        let err = super::merge_cli_guest_env(&mut cfg, &["=value".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("KEY"));
-    }
+        let session =
+            super::prepare_session_from_target(&cfg, None, target, None).expect("session");
 
-    #[test]
-    fn merge_cli_guest_env_value_may_contain_equals() {
-        let mut cfg = super::config::CoopConfig::default();
-        super::merge_cli_guest_env(&mut cfg, &["URL=https://x?a=b&c=d".to_string()]).unwrap();
-        assert_eq!(
-            cfg.guest_env.get("URL").map(String::as_str),
-            Some("https://x?a=b&c=d"),
+        assert!(
+            !session.env.contains("FROM_CLI"),
+            "without an instance, no persisted overlay should be applied",
         );
     }
 
@@ -2680,6 +2954,7 @@ mod tests {
             forward_ports: Vec::new(),
             config_path,
             post_start_override: None,
+            persisted_guest_env: std::collections::BTreeMap::new(),
         }
     }
 
