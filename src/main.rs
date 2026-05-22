@@ -522,14 +522,6 @@ fn init_tracing(verbosity: u8) {
         .init();
 }
 
-fn load_and_validate_config(path: &Path) -> Result<config::CoopConfig> {
-    let cfg = config::CoopConfig::load(path)?;
-    for w in cfg.validate()? {
-        tracing::warn!("{w}");
-    }
-    Ok(cfg)
-}
-
 /// Returns true if the raw argv contains the deprecated `--no-claude`
 /// alias. Clap rewrites the alias to `--no-agents` before the `Start`
 /// variant is matched, so we inspect the raw args to emit a one-time
@@ -610,7 +602,7 @@ fn main() -> Result<()> {
         );
     }
 
-    let mut cfg = load_and_validate_config(&cli.config)?;
+    let mut cfg = config::CoopConfig::load(&cli.config)?;
     update::maybe_print_notify(&cfg.updates);
     update::maybe_run_background_check(&cfg.updates);
     let be: backend::PlatformBackend = backend::PlatformBackend::new();
@@ -632,6 +624,7 @@ fn main() -> Result<()> {
             no_devcontainer,
             dry_run,
         } => {
+            let validated = cfg.validate_and_warn()?;
             let ws_path = workspace.as_deref().map(Path::new);
             let inputs = devcontainer::TranslatorInputs {
                 cli_vcpus: vcpus,
@@ -671,6 +664,7 @@ fn main() -> Result<()> {
             let _guard = signal::install_handlers();
             be.setup(
                 &cfg,
+                &validated,
                 &setup::SetupOptions {
                     skip_confirm: yes,
                     rebuild,
@@ -681,7 +675,10 @@ fn main() -> Result<()> {
                 },
             )
         }
-        Commands::Build => cmd_build(&cfg),
+        Commands::Build => {
+            let validated = cfg.validate_and_warn()?;
+            cmd_build(&cfg, &validated)
+        }
         Commands::Start {
             name,
             workspace,
@@ -701,6 +698,7 @@ fn main() -> Result<()> {
             no_devcontainer,
             dry_run,
         } => {
+            let validated = cfg.validate_and_warn()?;
             if raw_args_use_deprecated_no_claude(std::env::args()) {
                 tracing::warn!(
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
@@ -782,6 +780,7 @@ fn main() -> Result<()> {
             cmd_start(
                 &be,
                 &mut cfg,
+                &validated,
                 &StartOpts {
                     name: name.as_ref(),
                     image: &image,
@@ -1121,7 +1120,7 @@ fn resolve_devcontainer(
     Ok(Some(translation))
 }
 
-fn cmd_build(cfg: &config::CoopConfig) -> Result<()> {
+fn cmd_build(cfg: &config::CoopConfig, _: &config::Validated) -> Result<()> {
     tracing::info!("Building rootfs and fetching kernel");
     rootfs::build(cfg)?;
     tracing::info!("Build complete");
@@ -1161,6 +1160,7 @@ struct StartOpts<'a> {
 fn cmd_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
+    _: &config::Validated,
     opts: &StartOpts<'_>,
 ) -> Result<()> {
     let ws_path = opts.workspace_dir.map(Path::new);
