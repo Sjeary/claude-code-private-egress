@@ -80,8 +80,8 @@ enum Commands {
         #[arg(long)]
         vcpus: Option<u8>,
         /// Memory in MiB (overrides config)
-        #[arg(long)]
-        mem: Option<u32>,
+        #[arg(long, value_parser = config::MiB::parse_cli)]
+        mem: Option<config::MiB>,
         /// Force rebuild of template rootfs
         #[arg(long)]
         rebuild: bool,
@@ -99,8 +99,8 @@ enum Commands {
         #[arg(long)]
         post_install: Option<String>,
         /// Template rootfs size in GiB (default: 8)
-        #[arg(long)]
-        template_size: Option<u32>,
+        #[arg(long, value_parser = config::GiB::parse_cli)]
+        template_size: Option<config::GiB>,
         /// Named image to build (default: "default")
         #[arg(
             long,
@@ -142,11 +142,11 @@ enum Commands {
         #[arg(long)]
         vcpus: Option<u8>,
         /// Memory in MiB (overrides config)
-        #[arg(long)]
-        mem: Option<u32>,
+        #[arg(long, value_parser = config::MiB::parse_cli)]
+        mem: Option<config::MiB>,
         /// Instance disk size in GiB (grows from template size if larger)
-        #[arg(long)]
-        disk: Option<u32>,
+        #[arg(long, value_parser = config::GiB::parse_cli)]
+        disk: Option<config::GiB>,
         /// Skip injecting Claude Code and Codex credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
@@ -759,12 +759,9 @@ fn main() -> Result<()> {
                 .unwrap_or_default();
             let persisted_guest_env =
                 guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
-            let cli_disk = disk
-                .map(|d| config::GiB::new(d).context("--disk must be > 0"))
-                .transpose()?;
             let default_translation = devcontainer::Translation::default();
             let effective_disk = devcontainer::effective_disk(
-                cli_disk,
+                disk,
                 translation.as_ref().unwrap_or(&default_translation),
             );
             let post_start_override = post_start
@@ -1029,17 +1026,17 @@ fn probe_pat_token(token: &str) -> Result<String> {
 fn apply_vm_overrides(
     cfg: &mut config::CoopConfig,
     vcpus: Option<u8>,
-    mem: Option<u32>,
-    template_size: Option<u32>,
+    mem: Option<config::MiB>,
+    template_size: Option<config::GiB>,
 ) -> Result<()> {
     if let Some(v) = vcpus {
         cfg.vm.vcpu_count = std::num::NonZeroU8::new(v).context("--vcpus must be > 0")?;
     }
     if let Some(m) = mem {
-        cfg.vm.mem_size_mib = config::MiB::new(m).context("--mem must be > 0")?;
+        cfg.vm.mem_size_mib = m;
     }
     if let Some(ts) = template_size {
-        cfg.vm.template_size_gib = config::GiB::new(ts).context("--template-size must be > 0")?;
+        cfg.vm.template_size_gib = ts;
     }
     Ok(())
 }
@@ -2072,20 +2069,21 @@ fn cmd_resize(
     let inst = cfg.resolve_instance(name)?;
     let disk_size = config::DiskSize::parse(size)?;
 
-    let current_gib = current_disk_gib(be, &inst)?;
-    let new_size = disk_size.resolve(current_gib)?;
+    let current = current_disk_gib(be, &inst)?;
+    let new_size = disk_size.resolve(current)?;
 
     be.resize_disk(cfg, &inst, new_size)
 }
 
-fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<u32> {
+fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<config::GiB> {
     let path = be.disk_path(inst)?;
     let bytes = std::fs::metadata(&path)
         .with_context(|| format!("Failed to stat {}", path.display()))?
         .len();
     #[expect(clippy::cast_possible_truncation, reason = "disk GiB fits in u32")]
     let gib = (bytes / (1024 * 1024 * 1024)) as u32;
-    Ok(gib)
+    config::GiB::new(gib)
+        .with_context(|| format!("Disk at {} is smaller than 1 GiB", path.display()))
 }
 
 fn cmd_profiles(cfg: &config::CoopConfig, action: &ProfilesAction) -> Result<()> {
