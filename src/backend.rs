@@ -914,10 +914,11 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
+        let guest_user = persisted_guest_user(cfg, &inst.image);
         Ok(SshTarget {
             host: Hostname::new(inst.guest_ip())?,
             port: cfg.ssh_port,
-            user: SshUser::new(crate::guest::GUEST_USER)?,
+            user: SshUser::new(guest_user.as_str())?,
             key_path: cfg.ssh_key_path(),
         })
     }
@@ -1226,17 +1227,14 @@ fn bootstrap_claude(
     mode: BootMode,
 ) -> Result<()> {
     let claude = &cfg.claude;
+    let claude_bin = persisted_guest_user(cfg, &inst.image).claude_bin();
 
     if let BootMode::FirstBoot = mode {
         let needs_claude_cli = !claude.marketplaces.is_empty()
             || !claude.plugins.is_empty()
             || !claude.mcp_servers.is_empty();
 
-        if needs_claude_cli
-            && !session
-                .target
-                .exec_ok(&format!("test -x {}", crate::guest::CLAUDE_BIN))
-        {
+        if needs_claude_cli && !session.target.exec_ok(&format!("test -x {claude_bin}")) {
             bail!(
                 "Claude Code CLI is not installed in the guest.\n\
                  The golden image may have been built before the \
@@ -1261,15 +1259,15 @@ fn bootstrap_claude(
         let (missing_marketplaces, missing_plugins) = compute_plugin_delta(cfg, &inst.image);
 
         if !missing_marketplaces.is_empty() {
-            install_marketplaces(session, &missing_marketplaces)?;
+            install_marketplaces(session, &claude_bin, &missing_marketplaces)?;
         }
 
         if !missing_plugins.is_empty() {
-            install_plugins(session, &missing_plugins)?;
+            install_plugins(session, &claude_bin, &missing_plugins)?;
         }
 
         if !claude.mcp_servers.is_empty() {
-            register_mcp_servers(session, &claude.mcp_servers)?;
+            register_mcp_servers(session, &claude_bin, &claude.mcp_servers)?;
         }
     }
 
@@ -1293,7 +1291,7 @@ fn bootstrap_codex(session: &SshSession, cfg: &CoopConfig, mode: BootMode) -> Re
 
     if !session
         .target
-        .exec_ok(&format!("test -x {}", crate::guest::CODEX_BIN))
+        .exec_ok(&format!("test -x {}", crate::guest::codex_bin()))
     {
         bail!("{}", codex_missing_guest_cli_message());
     }
@@ -1315,6 +1313,17 @@ fn codex_missing_guest_cli_message() -> &'static str {
      If you want to skip Codex bootstrap for now, retry with \
      `--no-agents` (the `--no-claude` alias is deprecated).\n\
      Otherwise run `coop setup --rebuild` to rebuild the image."
+}
+
+/// Load the persisted guest user for an image, falling back to the
+/// default `ubuntu` when no `template_config.json` exists yet (e.g.
+/// the SSH target is being requested before setup has written the
+/// config). Returning the default keeps pre-existing call sites
+/// working unchanged on legacy images.
+pub fn persisted_guest_user(cfg: &CoopConfig, image: &ImageName) -> crate::guest::GuestUser {
+    crate::setup::TemplateConfig::load_for(cfg, image)
+        .map(|tc| tc.guest_user)
+        .unwrap_or_default()
 }
 
 /// Compute which marketplaces and plugins are missing from the
@@ -1758,7 +1767,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 const GUEST_MARKETPLACE_DIR: &str = "~/.coop/marketplaces";
 
-pub(crate) fn install_marketplaces(session: &SshSession, marketplaces: &[String]) -> Result<()> {
+pub(crate) fn install_marketplaces(
+    session: &SshSession,
+    claude_bin: &GuestPath,
+    marketplaces: &[String],
+) -> Result<()> {
     let mut has_local = false;
 
     for source in marketplaces {
@@ -1795,8 +1808,7 @@ pub(crate) fn install_marketplaces(session: &SshSession, marketplaces: &[String]
 
         tracing::info!("Adding marketplace: {guest_source}");
         let cmd = format!(
-            "{} plugin marketplace add {} --scope user",
-            crate::guest::CLAUDE_BIN,
+            "{claude_bin} plugin marketplace add {} --scope user",
             shell_escape(&guest_source),
         );
         session
@@ -1806,12 +1818,15 @@ pub(crate) fn install_marketplaces(session: &SshSession, marketplaces: &[String]
     Ok(())
 }
 
-pub(crate) fn install_plugins(session: &SshSession, plugins: &[String]) -> Result<()> {
+pub(crate) fn install_plugins(
+    session: &SshSession,
+    claude_bin: &GuestPath,
+    plugins: &[String],
+) -> Result<()> {
     for plugin in plugins {
         tracing::info!("Installing plugin: {plugin}");
         let cmd = format!(
-            "{} plugin install {} -s user",
-            crate::guest::CLAUDE_BIN,
+            "{claude_bin} plugin install {} -s user",
             shell_escape(plugin),
         );
         session
@@ -1823,6 +1838,7 @@ pub(crate) fn install_plugins(session: &SshSession, plugins: &[String]) -> Resul
 
 fn register_mcp_servers(
     session: &SshSession,
+    claude_bin: &GuestPath,
     servers: &std::collections::HashMap<String, McpServerDef>,
 ) -> Result<()> {
     for (name, def) in servers {
@@ -1834,8 +1850,7 @@ fn register_mcp_servers(
         let json = serde_json::to_string(&resolved)
             .context("Failed to serialize MCP server definition")?;
         let cmd = format!(
-            "{} mcp add-json -s user {} {}",
-            crate::guest::CLAUDE_BIN,
+            "{claude_bin} mcp add-json -s user {} {}",
             shell_escape(name),
             shell_escape(&json),
         );
