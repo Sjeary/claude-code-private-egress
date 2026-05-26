@@ -71,6 +71,20 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// One-shot: ensure default image, start an instance for cwd, launch Claude.
+    ///
+    /// Re-runnable: if an instance already exists for the current workspace it
+    /// is reconnected (running) or restarted (stopped) instead of being
+    /// recreated. For per-instance tuning (profiles, mounts, image, ...) use
+    /// `coop setup` / `coop start` directly.
+    Quickstart {
+        /// Skip mounting the current directory as the workspace.
+        #[arg(long)]
+        no_workspace: bool,
+        /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
+        #[arg(long)]
+        no_devcontainer: bool,
+    },
     /// Check prerequisites, install Firecracker, fetch kernel and build template rootfs
     Setup {
         /// Skip confirmation prompts (accept all)
@@ -618,6 +632,18 @@ fn main() -> Result<()> {
     tracing::debug!("Using backend: {be}");
 
     match cli.command {
+        Commands::Quickstart {
+            no_workspace,
+            no_devcontainer,
+        } => cmd_quickstart(
+            &be,
+            &mut cfg,
+            &cli.config,
+            &QuickstartOpts {
+                no_workspace,
+                no_devcontainer,
+            },
+        ),
         Commands::Setup {
             yes,
             vcpus,
@@ -816,6 +842,7 @@ fn main() -> Result<()> {
                     persisted_guest_env,
                 },
             )
+            .map(|_| ())
         }
         Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
         Commands::Claude {
@@ -1046,6 +1073,289 @@ fn probe_pat_token(token: &str) -> Result<String> {
     Ok(login.to_string())
 }
 
+struct QuickstartOpts {
+    no_workspace: bool,
+    no_devcontainer: bool,
+}
+
+/// One-shot `setup → start → claude`. See `Commands::Quickstart`.
+///
+/// The flow short-circuits any step that's already done:
+/// * skips `setup` when the default template rootfs already exists;
+/// * reconnects to a running instance for the current workspace, or restarts
+///   a stopped one, instead of allocating fresh.
+///
+/// `--no-workspace` skips workspace affinity entirely and falls back to the
+/// same "single running / single stopped" rules used by `coop start` and
+/// `coop claude` when called without a name.
+fn cmd_quickstart(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    config_path: &Path,
+    opts: &QuickstartOpts,
+) -> Result<()> {
+    let validated = cfg.validate_and_warn()?;
+    let image = config::default_image_name();
+
+    if be.image_is_built(cfg, &image) {
+        tracing::debug!("Image '{image}' already built — skipping setup");
+    } else {
+        tracing::info!("No '{image}' image found — running setup");
+        let _guard = signal::install_handlers();
+        be.setup(
+            cfg,
+            &validated,
+            &setup::SetupOptions {
+                skip_confirm: true,
+                rebuild: false,
+                profiles: Vec::new(),
+                extra_packages: Vec::new(),
+                post_install: None,
+                image: image.clone(),
+                guest_user: guest::GuestUser::default(),
+            },
+        )?;
+    }
+
+    let workspace_dir = resolve_quickstart_workspace(opts.no_workspace)?;
+
+    let existing = match &workspace_dir {
+        Some(ws) => find_workspace_instance(cfg, ws)?,
+        None => None,
+    };
+
+    let inst = match existing {
+        Some(inst) if be.is_running(&inst) => {
+            tracing::info!("Reusing running instance '{}'", inst.name);
+            inst
+        }
+        Some(inst) => {
+            tracing::info!("Restarting stopped instance '{}'", inst.name);
+            // Use the existing instance's image, not the default — the two
+            // can diverge if the instance was created via `coop start
+            // --image <other>`. On restart this is currently ignored, but
+            // passing `&image` would silently allocate fresh with the
+            // wrong image if `find_stopped_instance` lost the race to a
+            // concurrent destroy.
+            cmd_start(
+                be,
+                cfg,
+                &validated,
+                &StartOpts {
+                    name: Some(&inst.name),
+                    image: &inst.image,
+                    workspace_dir: None,
+                    git_repo: None,
+                    no_agents: false,
+                    no_prompt: false,
+                    disk: None,
+                    mounts: Vec::new(),
+                    exclude_git: false,
+                    forward_ports: Vec::new(),
+                    config_path,
+                    post_start_override: None,
+                    persisted_guest_env: std::collections::BTreeMap::new(),
+                },
+            )?
+        }
+        None => quickstart_fresh_start(
+            be,
+            cfg,
+            config_path,
+            &validated,
+            &image,
+            workspace_dir.as_deref(),
+            opts.no_devcontainer,
+        )?,
+    };
+
+    let sess = open_ssh_session(be, cfg, Some(&inst.name))?;
+    let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
+    ssh::run_interactive(&sess, &prepend_binary(&claude_bin.to_string(), Vec::new()))
+}
+
+/// Drives a fresh start with `--workspace <ws>` defaults (no mounts, no
+/// `--env`, no forwards, no `--post-start`), folding any discovered
+/// `devcontainer.json` into the start. Returns the started instance.
+///
+/// With `workspace_dir = None` (i.e. `--no-workspace`) this calls
+/// `allocate_and_start` directly rather than `cmd_start`, deliberately
+/// bypassing `find_stopped_instance`'s "single stopped instance" fallback
+/// — that fallback would silently restart an unrelated stopped instance.
+fn quickstart_fresh_start(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    config_path: &Path,
+    validated: &config::Validated,
+    image: &config::ImageName,
+    workspace_dir: Option<&Path>,
+    no_devcontainer: bool,
+) -> Result<config::Instance> {
+    let inputs = devcontainer::TranslatorInputs {
+        cli_workspace_or_git_repo: workspace_dir.is_some(),
+        ..devcontainer::TranslatorInputs::default()
+    };
+    let translation = resolve_devcontainer(
+        &DevcontainerOpts {
+            explicit_path: None,
+            no_devcontainer,
+            dry_run: false,
+            workspace: workspace_dir,
+            mounts: &[],
+        },
+        &inputs,
+        devcontainer::Stage::Start,
+    )?;
+
+    if let Some(t) = &translation {
+        devcontainer::apply_to_config(cfg, t)?;
+    }
+
+    // `cfg.forward_ports` is folded in by `start_instance` itself, so it
+    // doesn't need to be merged in here.
+    let forward_ports = translation
+        .as_ref()
+        .map(|t| devcontainer::merge_into_forward_ports(&t.forward_ports, &[]))
+        .unwrap_or_default();
+
+    let dc_guest_env = translation
+        .as_ref()
+        .map(|t| t.guest_env.clone())
+        .unwrap_or_default();
+    let persisted_guest_env =
+        guest_env_state::merge_persisted_entries(&dc_guest_env, &std::collections::BTreeMap::new());
+
+    let default_translation = devcontainer::Translation::default();
+    let effective_disk =
+        devcontainer::effective_disk(None, translation.as_ref().unwrap_or(&default_translation));
+    let post_start_override = translation.as_ref().and_then(|t| t.post_start.clone());
+
+    let final_mounts = translation
+        .as_ref()
+        .map(|t| t.mounts.clone())
+        .unwrap_or_default();
+
+    let workspace_str = workspace_dir
+        .map(|p| {
+            p.to_str()
+                .with_context(|| format!("Workspace path is not valid UTF-8: {}", p.display()))
+        })
+        .transpose()?;
+
+    let start_opts = StartOpts {
+        name: None,
+        image,
+        workspace_dir: workspace_str,
+        git_repo: None,
+        no_agents: false,
+        no_prompt: false,
+        disk: effective_disk,
+        mounts: final_mounts,
+        exclude_git: false,
+        forward_ports,
+        config_path,
+        post_start_override: post_start_override.as_deref(),
+        persisted_guest_env,
+    };
+
+    if workspace_dir.is_some() {
+        cmd_start(be, cfg, validated, &start_opts)
+    } else {
+        // `--no-workspace`: skip the "single stopped instance" fallback in
+        // `find_stopped_instance` so we never hijack an unrelated VM. Each
+        // quickstart with `--no-workspace` allocates a fresh instance.
+        allocate_and_start(be, cfg, None, image, None, &start_opts)
+    }
+}
+
+/// Resolve the workspace directory for `coop quickstart`.
+///
+/// Returns `None` when `--no-workspace` is set or when the user declines a
+/// `$HOME` / `/` prompt; `Some(cwd)` otherwise. Non-TTY callers in a
+/// sensitive directory get an explicit bail rather than a silent mount.
+fn resolve_quickstart_workspace(no_workspace: bool) -> Result<Option<PathBuf>> {
+    if no_workspace {
+        return Ok(None);
+    }
+
+    let cwd = std::env::current_dir().context("Failed to read current directory")?;
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if is_sensitive_workspace(&cwd, home.as_deref()) {
+        use std::io::IsTerminal as _;
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "Current directory {} looks like your home or root — refusing to mount silently.\n\
+                 Pass --no-workspace to skip the mount, or run from a project directory.",
+                cwd.display(),
+            );
+        }
+        let prompt = format!("Mount {} into the guest? This may be large.", cwd.display());
+        if !prompt::confirm(&prompt)? {
+            tracing::info!("Skipping workspace mount (declined at prompt)");
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(cwd))
+}
+
+/// True when `p` is the user's `$HOME` (per the `home` argument) or the root
+/// directory `/`.
+///
+/// `home` is passed in rather than read from the process env so the function
+/// is pure and testable without env mutation. The comparison is byte-equality
+/// — symlinks (e.g. macOS `/var` → `/private/var`) and trailing slashes are
+/// intentionally *not* normalised, so this is a best-effort guardrail rather
+/// than a hard safety check. The fallback behaviour (proceed with the cwd
+/// mount) is benign for any user who deliberately runs in a normalised
+/// project directory; users who land here from an unusual cwd can still
+/// opt out with `--no-workspace`.
+fn is_sensitive_workspace(p: &Path, home: Option<&Path>) -> bool {
+    if p == Path::new("/") {
+        return true;
+    }
+    home.is_some_and(|h| p == h)
+}
+
+/// Find the (single) instance whose persisted workspace state's `host_path`
+/// matches `workspace` (after canonicalisation). Returns `None` when no
+/// instance has been started for this directory; bails when multiple do
+/// (the caller has to pick one explicitly).
+fn find_workspace_instance(
+    cfg: &config::CoopConfig,
+    workspace: &Path,
+) -> Result<Option<config::Instance>> {
+    let canonical = workspace
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve workspace path {}", workspace.display()))?;
+    let instances = cfg.list_instances()?;
+    let mut matching: Vec<config::Instance> = instances
+        .into_iter()
+        .filter(|inst| {
+            workspace::WorkspaceState::try_load(inst)
+                .ok()
+                .flatten()
+                .and_then(|s| s.source.host_path().map(Path::to_path_buf))
+                .is_some_and(|hp| hp == canonical)
+        })
+        .collect();
+    match matching.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matching.swap_remove(0))),
+        _ => {
+            let names: Vec<_> = matching.iter().map(|i| i.name.as_str()).collect();
+            bail!(
+                "Multiple instances share workspace {}:\n  {}\n\
+                 Pick one explicitly with `coop start <name>` (for a stopped\n\
+                 instance) or `coop claude <name>` (for a running one).",
+                canonical.display(),
+                names.join(", "),
+            )
+        }
+    }
+}
+
 fn apply_vm_overrides(
     cfg: &mut config::CoopConfig,
     vcpus: Option<u8>,
@@ -1201,7 +1511,7 @@ fn cmd_start(
     cfg: &mut config::CoopConfig,
     _: &config::Validated,
     opts: &StartOpts<'_>,
-) -> Result<()> {
+) -> Result<config::Instance> {
     let ws_path = opts.workspace_dir.map(Path::new);
 
     // Creation-only flags (`--mount`, `--git-repo`, `--disk`, `--exclude-git`)
@@ -1235,10 +1545,27 @@ fn cmd_start(
             );
         }
 
-        return restart_instance(be, cfg, &inst, opts);
+        restart_instance(be, cfg, &inst, opts)?;
+        return Ok(inst);
     }
 
-    let inst = cfg.allocate_instance(opts.name, opts.image, ws_path)?;
+    allocate_and_start(be, cfg, opts.name, opts.image, ws_path, opts)
+}
+
+/// Allocate a fresh instance and run the first-boot start, cleaning up any
+/// partial state on error. Used by `cmd_start`'s "no stopped instance to
+/// restart" path and by `cmd_quickstart`'s `--no-workspace` fresh path
+/// (which skips the `find_stopped_instance` "single stopped" rule to avoid
+/// hijacking an unrelated instance).
+fn allocate_and_start(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    name: Option<&config::InstanceName>,
+    image: &config::ImageName,
+    workspace_path: Option<&Path>,
+    opts: &StartOpts<'_>,
+) -> Result<config::Instance> {
+    let inst = cfg.allocate_instance(name, image, workspace_path)?;
     tracing::info!("Starting instance '{}' (index {})", inst.name, inst.index);
 
     let _guard = signal::install_handlers();
@@ -1257,7 +1584,7 @@ fn cmd_start(
         }
     }
 
-    result
+    result.map(|()| inst)
 }
 
 /// Find a stopped instance to restart, if applicable.
@@ -3128,6 +3455,179 @@ mod tests {
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(Vec::new(), &cfg_path);
         assert!(!super::creation_intent_without_target(&opts));
+    }
+
+    #[test]
+    fn quickstart_subcommand_parses_with_defaults() {
+        let cli = parse(&["quickstart"]);
+        let super::Commands::Quickstart {
+            no_workspace,
+            no_devcontainer,
+        } = cli.command
+        else {
+            panic!("expected Quickstart variant");
+        };
+        assert!(!no_workspace);
+        assert!(!no_devcontainer);
+    }
+
+    #[test]
+    fn quickstart_no_workspace_flag_parses() {
+        let cli = parse(&["quickstart", "--no-workspace"]);
+        let super::Commands::Quickstart { no_workspace, .. } = cli.command else {
+            panic!("expected Quickstart variant");
+        };
+        assert!(no_workspace);
+    }
+
+    #[test]
+    fn quickstart_no_devcontainer_flag_parses() {
+        let cli = parse(&["quickstart", "--no-devcontainer"]);
+        let super::Commands::Quickstart {
+            no_devcontainer, ..
+        } = cli.command
+        else {
+            panic!("expected Quickstart variant");
+        };
+        assert!(no_devcontainer);
+    }
+
+    #[test]
+    fn quickstart_rejects_unknown_flag() {
+        let err = parse_err(&["quickstart", "--name", "foo"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn is_sensitive_workspace_detects_root() {
+        let home = std::path::Path::new("/home/alice");
+        assert!(super::is_sensitive_workspace(
+            std::path::Path::new("/"),
+            Some(home),
+        ));
+    }
+
+    #[test]
+    fn is_sensitive_workspace_detects_home() {
+        let home = std::path::Path::new("/home/alice");
+        assert!(super::is_sensitive_workspace(home, Some(home)));
+    }
+
+    #[test]
+    fn is_sensitive_workspace_passes_through_project_dir() {
+        let home = std::path::Path::new("/home/alice");
+        let project = std::path::Path::new("/home/alice/projects/coop");
+        assert!(!super::is_sensitive_workspace(project, Some(home)));
+    }
+
+    #[test]
+    fn is_sensitive_workspace_handles_missing_home() {
+        // When HOME is unset, only `/` should be flagged.
+        let project = std::path::Path::new("/tmp/work");
+        assert!(!super::is_sensitive_workspace(project, None));
+        assert!(super::is_sensitive_workspace(
+            std::path::Path::new("/"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn resolve_quickstart_workspace_returns_none_when_opted_out() {
+        // --no-workspace takes precedence over everything; doesn't even
+        // touch the filesystem.
+        let result = super::resolve_quickstart_workspace(true).expect("ok");
+        assert_eq!(result, None);
+    }
+
+    fn write_workspace_state(inst: &super::config::Instance, host_path: &std::path::Path) {
+        let state = super::workspace::WorkspaceState {
+            guest_path: super::workspace::default_workspace_path(),
+            source: super::workspace::WorkspaceSource::Workspace {
+                host_path: host_path.to_path_buf(),
+            },
+        };
+        state.save(inst).expect("save workspace state");
+    }
+
+    #[test]
+    fn find_workspace_instance_returns_none_when_no_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let ws = tmp.path().join("project");
+        std::fs::create_dir(&ws).expect("create_dir");
+        let result = super::find_workspace_instance(&cfg, &ws).expect("ok");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_workspace_instance_finds_single_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let ws = tmp.path().join("project");
+        std::fs::create_dir(&ws).expect("create_dir");
+        let canonical = ws.canonicalize().expect("canonicalize");
+        let inst = cfg
+            .allocate_instance(None, &img, Some(&canonical))
+            .expect("allocate");
+        write_workspace_state(&inst, &canonical);
+
+        let found = super::find_workspace_instance(&cfg, &ws)
+            .expect("ok")
+            .expect("expected one match");
+        assert_eq!(found.name.as_str(), inst.name.as_str());
+    }
+
+    #[test]
+    fn find_workspace_instance_bails_on_multiple_matches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let ws = tmp.path().join("project");
+        std::fs::create_dir(&ws).expect("create_dir");
+        let canonical = ws.canonicalize().expect("canonicalize");
+
+        let inst_a = cfg
+            .allocate_instance(
+                Some(&super::config::InstanceName::new("alpha").unwrap()),
+                &img,
+                Some(&canonical),
+            )
+            .expect("allocate alpha");
+        let inst_b = cfg
+            .allocate_instance(
+                Some(&super::config::InstanceName::new("beta").unwrap()),
+                &img,
+                Some(&canonical),
+            )
+            .expect("allocate beta");
+        write_workspace_state(&inst_a, &canonical);
+        write_workspace_state(&inst_b, &canonical);
+
+        let err = super::find_workspace_instance(&cfg, &ws).expect_err("expected bail");
+        let msg = format!("{err}");
+        assert!(msg.contains("alpha"), "{msg}");
+        assert!(msg.contains("beta"), "{msg}");
+    }
+
+    #[test]
+    fn find_workspace_instance_ignores_unrelated_workspaces() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let ws_a = tmp.path().join("a");
+        let ws_b = tmp.path().join("b");
+        std::fs::create_dir(&ws_a).expect("create_dir a");
+        std::fs::create_dir(&ws_b).expect("create_dir b");
+        let a = ws_a.canonicalize().expect("canon a");
+
+        let inst_a = cfg
+            .allocate_instance(None, &img, Some(&a))
+            .expect("allocate");
+        write_workspace_state(&inst_a, &a);
+
+        let found = super::find_workspace_instance(&cfg, &ws_b).expect("ok");
+        assert!(found.is_none());
     }
 
     #[test]
