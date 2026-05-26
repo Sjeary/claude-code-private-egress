@@ -24,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, GitHubAuth, resolve_cmd_value};
 use crate::github_repo::{RepoSlug, detect_workspace_repo, parse_repo_slug_from_url};
+use crate::github_submodules::{SubmoduleDiscovery, classify_urls, extract_urls};
 use crate::secret_store::{
     SERVICE, account_for_repo, available_backends, delete_secret, infer_backend, store_secret,
 };
@@ -55,6 +56,7 @@ pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
     eprintln!("\nValidating token against api.github.com…");
     probe_user(&token)?;
     probe_repo(&token, &repo)?;
+    let token = handle_submodules(token, &repo)?;
 
     let backend = pick_backend()?;
     let account = account_for_repo(&repo);
@@ -332,10 +334,14 @@ fn probe_repo(token: &str, repo: &RepoSlug) -> Result<()> {
 /// to see the response body even on 4xx for diagnostics, and the status
 /// alone is enough to drive the wizard branches.
 fn curl_with_token(token: &str, url: &str) -> Result<(u16, String)> {
+    curl_with_accept(token, url, "application/vnd.github+json")
+}
+
+fn curl_with_accept(token: &str, url: &str, accept: &str) -> Result<(u16, String)> {
     let out = Cmd::new("curl")
         .arg("-sSL")
         .arg("-H")
-        .arg("Accept: application/vnd.github+json")
+        .arg(format!("Accept: {accept}"))
         .arg("-H")
         .arg("@-")
         .stdin_input(format!("Authorization: token {token}\n"))
@@ -344,12 +350,192 @@ fn curl_with_token(token: &str, url: &str) -> Result<(u16, String)> {
         .arg(url)
         .capture()
         .with_context(|| format!("curl GET {url} failed"))?;
+    parse_curl_status_body(&out)
+}
+
+/// Anonymous (no Authorization header) GET — used to detect public
+/// GitHub repos without consuming the user's token's API budget.
+///
+/// Returns `Err` only on a curl failure; HTTP errors are returned via
+/// the status code so the caller can map them. Unauthenticated GitHub
+/// API requests share a 60/hour rate limit per IP, so we keep the use
+/// narrow (one probe per cross-owner / same-owner submodule slug).
+fn curl_anonymous(url: &str) -> Result<(u16, String)> {
+    let out = Cmd::new("curl")
+        .arg("-sSL")
+        .arg("-H")
+        .arg("Accept: application/vnd.github+json")
+        .arg("-w")
+        .arg("\n%{http_code}")
+        .arg(url)
+        .capture()
+        .with_context(|| format!("curl GET {url} failed"))?;
+    parse_curl_status_body(&out)
+}
+
+fn parse_curl_status_body(out: &str) -> Result<(u16, String)> {
     let (body, status_str) = out.rsplit_once('\n').unwrap_or(("", out.trim()));
     let status: u16 = status_str
         .trim()
         .parse()
         .with_context(|| format!("Failed to parse HTTP status from curl output: '{status_str}'"))?;
     Ok((status, body.to_string()))
+}
+
+/// Does an anonymous `GET /repos/{slug}` return 200?
+///
+/// `true` only when an unauthenticated request can read the repo —
+/// i.e. it is genuinely public. Anything else (404 for private/missing,
+/// 403 for rate-limited, network failure) is treated as "not public"
+/// so the wizard errs on the side of recommending a PAT rather than
+/// silently skipping a repo the user actually needs to authorize.
+fn is_public_repo_anonymous(slug: &RepoSlug) -> bool {
+    let url = format!("https://api.github.com/repos/{slug}");
+    match curl_anonymous(&url) {
+        Ok((200, _)) => true,
+        Ok((status, _)) => {
+            tracing::debug!("anonymous probe of {slug} returned HTTP {status}");
+            false
+        }
+        Err(e) => {
+            tracing::debug!("anonymous probe of {slug} failed: {e:#}");
+            false
+        }
+    }
+}
+
+/// Fetch `.gitmodules` from the parent's default branch and classify the URLs.
+///
+/// Returns an empty discovery for `404` (the common "no submodules" case)
+/// and for any other non-`200` status, logging a warning. We deliberately
+/// don't fail the wizard on transient or permission errors here: the user
+/// already authenticated to the parent repo, and a problem with the
+/// contents endpoint shouldn't block writing a valid PAT entry. Worst
+/// case, submodule clones will still surface a clear failure at clone
+/// time — the wizard's job is purely advisory.
+fn discover_submodule_repos(token: &str, parent: &RepoSlug) -> Result<SubmoduleDiscovery> {
+    let url = format!("https://api.github.com/repos/{parent}/contents/.gitmodules");
+    let (status, body) = curl_with_accept(token, &url, "application/vnd.github.raw+json")?;
+    match status {
+        200 => Ok(classify_urls(parent, &extract_urls(&body))),
+        404 => Ok(SubmoduleDiscovery::default()),
+        other => {
+            eprintln!(
+                "warning: GET /repos/{parent}/contents/.gitmodules returned HTTP {other} — \
+                 skipping submodule check."
+            );
+            Ok(SubmoduleDiscovery::default())
+        }
+    }
+}
+
+/// Probe each `expected` slug with `token`. Returns those that the token
+/// could not access (HTTP 403/404). Transient errors (non-2xx, non-4xx)
+/// bubble up so the wizard can report them.
+fn probe_same_owner_coverage(token: &str, expected: &[RepoSlug]) -> Result<Vec<RepoSlug>> {
+    let mut failed = Vec::new();
+    for slug in expected {
+        let url = format!("https://api.github.com/repos/{slug}");
+        let (status, _body) = curl_with_token(token, &url)?;
+        match status {
+            200 => {}
+            403 | 404 => failed.push(slug.clone()),
+            other => bail!("GET /repos/{slug} returned HTTP {other}"),
+        }
+    }
+    Ok(failed)
+}
+
+/// Surface the discovery to the user and, when same-owner submodules
+/// exist, loop until the pasted token covers them all.
+///
+/// Returns the (possibly re-pasted) token. The caller stores whatever
+/// token this returns — by construction it is the latest one that
+/// passed `probe_user` + `probe_repo` for `parent`, so the broader
+/// scope replaces the originally pasted token.
+fn handle_submodules(token: String, parent: &RepoSlug) -> Result<String> {
+    let mut discovery = discover_submodule_repos(&token, parent)?;
+
+    if discovery.is_empty() {
+        return Ok(token);
+    }
+
+    let public_skipped = discovery.drop_public(is_public_repo_anonymous);
+    if !public_skipped.is_empty() {
+        eprintln!(
+            "\nSkipping {} public submodule repo(s) — they clone without a token:",
+            public_skipped.len(),
+        );
+        for slug in &public_skipped {
+            eprintln!("  - {slug}");
+        }
+    }
+
+    if !discovery.non_github_urls.is_empty() {
+        eprintln!("\nIgnoring non-GitHub submodule URLs (this token can't cover them):");
+        for url in &discovery.non_github_urls {
+            eprintln!("  - {url}");
+        }
+    }
+
+    let mut token = token;
+    if !discovery.same_owner.is_empty() {
+        loop {
+            let failed = probe_same_owner_coverage(&token, &discovery.same_owner)?;
+            if failed.is_empty() {
+                eprintln!("  ✓ all same-owner submodule repos covered");
+                break;
+            }
+            print_widen_instructions(parent, &discovery.same_owner, &failed);
+            token = read_token_no_echo()?;
+            warn_token_format(&token);
+            eprintln!("\nValidating widened token against api.github.com…");
+            probe_user(&token)?;
+            probe_repo(&token, parent)?;
+        }
+    }
+
+    if !discovery.cross_owner.is_empty() {
+        eprintln!(
+            "\nNote: submodules under other resource owners need their own \
+             FGPAT (one form per owner). Run:"
+        );
+        for (owner, repos) in &discovery.cross_owner {
+            eprintln!("\n  Resource owner: {owner}");
+            for slug in repos {
+                eprintln!("    coop github setup-pat --repo {slug}");
+            }
+        }
+    }
+
+    eprintln!(
+        "\nNote: only depth-1 submodules were checked. Nested submodules \
+         (submodules of submodules) need their own `setup-pat` runs."
+    );
+
+    Ok(token)
+}
+
+fn print_widen_instructions(parent: &RepoSlug, expected: &[RepoSlug], failed: &[RepoSlug]) {
+    eprintln!(
+        "\n{} submodule repo(s) under '{}' are not covered by this token:",
+        failed.len(),
+        parent.owner(),
+    );
+    for slug in failed {
+        eprintln!("  - {slug}");
+    }
+    eprintln!(
+        "\nRe-open {PAT_NEW_URL} (or edit the existing token), keep \
+         Resource owner '{}', and under 'Only select repositories' \
+         include all of:",
+        parent.owner(),
+    );
+    eprintln!("  - {parent}");
+    for slug in expected {
+        eprintln!("  - {slug}");
+    }
+    eprintln!("Generate a fresh token, then paste it below. (Empty input aborts.)");
 }
 
 fn pick_backend() -> Result<crate::secret_store::Backend> {
