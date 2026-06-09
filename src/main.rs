@@ -3314,12 +3314,13 @@ fn resolve_running(
                      Create one with: coop up . --name {name}"
                 )
             })?;
-        return be.as_running(cfg, inst).with_context(|| {
-            format!(
+        let Some(running) = be.as_running(cfg, inst)? else {
+            bail!(
                 "Instance '{name}' is not running.\n\
                  Start it with: coop start {name}"
-            )
-        });
+            );
+        };
+        return Ok(running);
     }
 
     let (running, stopped): (Vec<_>, Vec<_>) =
@@ -3331,7 +3332,8 @@ fn resolve_running(
                 .into_iter()
                 .next()
                 .context("Instance list unexpectedly empty")?;
-            be.as_running(cfg, inst)
+            be.as_running(cfg, inst)?
+                .context("Instance stopped unexpectedly while resolving")
         }
         0 if stopped.len() == 1 => {
             let name = &stopped[0].name;
@@ -3455,7 +3457,7 @@ fn cmd_stop(
     // Probe live state once. The `RunningInstance` proof flows into
     // `be.stop`, so the type system witnesses that we only ask the
     // backend to stop something that was actually running.
-    if let Ok(running) = be.as_running(cfg, inst.clone()) {
+    if let Ok(Some(running)) = be.as_running(cfg, inst.clone()) {
         // Tear down forwards before shutting down the VM so the
         // control master can exit cleanly while SSH is still
         // reachable.
@@ -3745,8 +3747,14 @@ fn cmd_status(
 ) -> Result<()> {
     if let Some(name) = name {
         let inst = cfg.resolve_instance(Some(name))?;
-        let status = be.status(cfg, &inst)?;
-        writeln!(std::io::stdout(), "{status}")
+        let report = match be.as_running(cfg, inst.clone())? {
+            Some(running) => be.status(cfg, &running)?,
+            None => format!(
+                "Instance '{}' (stopped)\n  Backend: {be}\n  Image: {}",
+                inst.name, inst.image,
+            ),
+        };
+        writeln!(std::io::stdout(), "{report}")
             .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
     } else {
         let instances = cfg.list_instances()?;
@@ -3756,16 +3764,14 @@ fn cmd_status(
             return Ok(());
         }
         for inst in &instances {
-            let running = be.is_running(inst);
-            let state = if running { "running" } else { "stopped" };
-            let usage_str = if running {
-                be.ssh_target(cfg, inst)
-                    .ok()
-                    .and_then(|t| backend::query_resource_usage(&t))
-                    .map(|u| format!("  {}", u.summary()))
-                    .unwrap_or_default()
-            } else {
-                String::new()
+            let (state, usage_str) = match be.as_running(cfg, inst.clone())? {
+                Some(running) => {
+                    let usage = backend::query_resource_usage(running.target())
+                        .map(|u| format!("  {}", u.summary()))
+                        .unwrap_or_default();
+                    ("running", usage)
+                }
+                None => ("stopped", String::new()),
             };
             writeln!(
                 std::io::stdout(),
@@ -3790,10 +3796,11 @@ fn cmd_resize(
     let inst = cfg.resolve_instance(name)?;
     let disk_size = config::DiskSize::parse(size)?;
 
-    let current = current_disk_gib(be, &inst)?;
+    let stopped = be.as_stopped(inst)?;
+    let current = current_disk_gib(be, stopped.instance())?;
     let new_size = disk_size.resolve(current)?;
 
-    be.resize_disk(cfg, &inst, new_size)
+    be.resize_disk(cfg, &stopped, new_size)
 }
 
 fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<config::GiB> {
