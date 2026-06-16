@@ -541,6 +541,7 @@ fn ensure_profile_image(
             post_install: None,
             image: target.image.clone(),
             guest_user: guest::GuestUser::default(),
+            builder_timeout: None,
         },
     )
 }
@@ -880,6 +881,7 @@ pub(crate) fn cmd_quickstart(
                 post_install: None,
                 image: image.clone(),
                 guest_user: guest::GuestUser::default(),
+                builder_timeout: None,
             },
         )?;
     }

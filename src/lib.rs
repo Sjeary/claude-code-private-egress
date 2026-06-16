@@ -56,6 +56,7 @@ mod vm;
 mod workspace;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -234,6 +235,11 @@ enum Commands {
         /// images).
         #[arg(long, value_name = "NAME", value_parser = guest::GuestUser::parse)]
         guest_user: Option<guest::GuestUser>,
+        /// Duration to wait for setup image build commands before timing
+        /// out. Accepts seconds by default, or an `s`/`m`/`h` suffix
+        /// (e.g. `90s`, `30m`, `2h`).
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        builder_timeout: Option<Duration>,
         /// Workspace directory to scan for `.devcontainer/devcontainer.json`.
         /// When present (and `--no-devcontainer` is not set), coop offers to
         /// apply the file's `features` and `hostRequirements` to this setup.
@@ -861,6 +867,7 @@ pub fn run() -> Result<()> {
             template_size,
             image,
             guest_user,
+            builder_timeout,
             workspace,
             devcontainer,
             no_devcontainer,
@@ -928,6 +935,7 @@ pub fn run() -> Result<()> {
                     post_install: post_install.map(PathBuf::from),
                     image,
                     guest_user: resolved_guest_user,
+                    builder_timeout,
                 },
             )
         }
@@ -1104,11 +1112,45 @@ pub fn run() -> Result<()> {
     }
 }
 
+fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("duration cannot be empty".to_string());
+    }
+
+    let (number, multiplier) = if let Some(number) = value.strip_suffix('s') {
+        (number, 1)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 60 * 60)
+    } else {
+        (value, 1)
+    };
+
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| format!("invalid duration {value:?}; use seconds, or suffix s/m/h"))?;
+    let seconds = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("duration {value:?} is too large"))?;
+    if seconds == 0 {
+        return Err("duration must be greater than zero".to_string());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!("{}s", duration.as_secs())
+}
+
 #[cfg(test)]
 #[expect(clippy::panic, reason = "tests use panic for unreachable branches")]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
+    use std::time::Duration;
+
     use clap::Parser;
 
     use super::Cli;
@@ -1122,6 +1164,48 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected parse failure"),
         }
+    }
+
+    #[test]
+    fn setup_builder_timeout_parses() {
+        let cli = parse(&["setup", "--builder-timeout", "60m"]);
+        let super::Commands::Setup {
+            builder_timeout, ..
+        } = cli.command
+        else {
+            panic!("expected Setup variant");
+        };
+        assert_eq!(builder_timeout, Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn parse_duration_accepts_suffixes_and_bare_seconds() {
+        assert_eq!(super::parse_duration("600"), Ok(Duration::from_secs(600)));
+        assert_eq!(super::parse_duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(super::parse_duration("5m"), Ok(Duration::from_secs(300)));
+        assert_eq!(super::parse_duration("2h"), Ok(Duration::from_secs(7200)));
+        assert_eq!(super::parse_duration(" 30s "), Ok(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn setup_builder_timeout_rejects_invalid_durations() {
+        for value in ["", "0m", "abc", "1.5h", "18446744073709551615h"] {
+            assert!(
+                super::parse_duration(value).is_err(),
+                "{value:?} should not parse as a duration",
+            );
+        }
+    }
+
+    #[test]
+    fn format_duration_outputs_seconds() {
+        assert_eq!(super::format_duration(Duration::from_secs(90)), "90s");
+    }
+
+    #[test]
+    fn parse_then_format_normalizes_to_seconds() {
+        let parsed = super::parse_duration("1h").expect("1h parses");
+        assert_eq!(super::format_duration(parsed), "3600s");
     }
 
     #[test]
