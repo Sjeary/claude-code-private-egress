@@ -1,134 +1,17 @@
-//! Command implementations for the `coop` CLI.
-//!
-//! Holds every `cmd_*` entry point and its option structs, plus the helpers
-//! they share. [`crate::run`] parses the CLI and dispatches into these
-//! functions; the items it calls are `pub(crate)`. The rest stay private to
-//! this module.
+//! VM lifecycle commands: up / start / stop / destroy / shell / exec / status / list / resize.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use super::{DevcontainerInput, DevcontainerOpts, resolve_devcontainer};
+use super::{merge_runtime_guest_env, purge_all_data};
 use crate::backend::VmBackend as _;
-use crate::cmd::Cmd;
 use crate::{
-    DevcontainerCheckStage, DevcontainerCommands, GithubAction, ProfilesAction, backend, config,
-    devcontainer, devcontainer_oci, git_repo_devcontainer, github_pat, github_repo, guest,
-    guest_env_state, pat_prompt, port_forward, prompt, setup, signal, ssh, update, workspace,
+    backend, config, devcontainer, github_repo, guest, guest_env_state, pat_prompt, port_forward,
+    setup, signal, ssh, workspace,
 };
-
-pub(crate) fn cmd_github(
-    cfg: &config::CoopConfig,
-    config_path: &Path,
-    action: GithubAction,
-) -> Result<()> {
-    match action {
-        GithubAction::SetupPat { repo } => {
-            let opts = github_pat::SetupOpts { repo, config_path };
-            github_pat::run_setup_pat(cfg, &opts)
-        }
-        GithubAction::RotatePat { repo } => {
-            let opts = github_pat::SetupOpts {
-                repo: Some(repo),
-                config_path,
-            };
-            github_pat::run_rotate_pat(cfg, &opts)
-        }
-        GithubAction::Status { probe } => {
-            github_pat::run_status(cfg, probe);
-            Ok(())
-        }
-        GithubAction::ForgetPat { repo } => github_pat::run_forget_pat(cfg, &repo, config_path),
-    }
-}
-
-pub(crate) fn cmd_init(config_path: &Path) -> Result<()> {
-    if config_path.exists() {
-        bail!(
-            "Config file already exists at {}. \
-             Edit it directly or remove it first.",
-            config_path.display()
-        );
-    }
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-    std::fs::write(config_path, include_str!("../config.example.toml"))
-        .with_context(|| format!("Failed to write {}", config_path.display()))?;
-    writeln!(
-        std::io::stdout(),
-        "Created {}. Edit to customize, or leave as-is for defaults.",
-        config_path.display()
-    )
-    .ok();
-    Ok(())
-}
-
-pub(crate) fn cmd_validate(
-    cfg: &config::CoopConfig,
-    be: &backend::PlatformBackend,
-    probe: bool,
-) -> Result<()> {
-    writeln!(std::io::stdout(), "Validating config (backend: {be})...",).ok();
-
-    let warnings = cfg.validate()?;
-
-    for w in &warnings {
-        writeln!(std::io::stdout(), "  warning: {w}").ok();
-    }
-
-    // Per-repo PAT validation
-    if let Some(config::GitHubAuth::Pat(pat)) = cfg.github.as_ref() {
-        for (repo, entry) in &pat.entries {
-            match config::resolve_cmd_value(entry.token.expose()) {
-                Ok(token) => {
-                    if token.starts_with(github_pat::TOKEN_PREFIX) {
-                        writeln!(
-                            std::io::stdout(),
-                            "  github.pat.\"{repo}\": ok (resolves, fine-grained PAT format)"
-                        )
-                        .ok();
-                    } else {
-                        writeln!(
-                            std::io::stdout(),
-                            "  github.pat.\"{repo}\": warning — token resolves but is not \
-                             a fine-grained PAT (no '{prefix}' prefix)",
-                            prefix = github_pat::TOKEN_PREFIX,
-                        )
-                        .ok();
-                    }
-                    if probe {
-                        match github_pat::probe_user_login(&token) {
-                            Ok(login) => {
-                                writeln!(std::io::stdout(), "    probe: /user as '{login}'").ok();
-                            }
-                            Err(e) => {
-                                writeln!(std::io::stdout(), "    probe: FAILED ({e})").ok();
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    writeln!(
-                        std::io::stdout(),
-                        "  github.pat.\"{repo}\": FAILED to resolve token ({e})"
-                    )
-                    .ok();
-                }
-            }
-        }
-    }
-
-    writeln!(std::io::stdout(), "Config OK").ok();
-    Ok(())
-}
-
-pub(crate) struct QuickstartOpts {
-    pub(crate) no_workspace: bool,
-    pub(crate) no_devcontainer: bool,
-}
 
 pub(crate) struct UpOpts<'a> {
     pub(crate) dir: Option<&'a str>,
@@ -178,6 +61,31 @@ pub(crate) struct UpDevcontainerOpts {
 pub(crate) enum ProjectTransport {
     Copy,
     Mount,
+}
+
+pub(crate) struct ProfileImageTarget {
+    profiles: Vec<String>,
+    image: config::ImageName,
+}
+
+impl ProfileImageTarget {
+    pub(crate) fn new(profiles: &[String]) -> Result<Self> {
+        let profiles = canonical_profile_list(profiles);
+        let image = config::ImageName::new(&profiles.join("-")).with_context(|| {
+            format!(
+                "Cannot derive an image name from profile list: {}",
+                profiles.join(", ")
+            )
+        })?;
+        Ok(Self { profiles, image })
+    }
+}
+
+fn canonical_profile_list(profiles: &[String]) -> Vec<String> {
+    let mut names = profiles.to_vec();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Project-oriented start: ensure DIR has a single matching environment.
@@ -399,7 +307,7 @@ fn create_up_instance(
         }
     };
     validate_copy_workspace_mounts(opts.transport, &mounts)?;
-    validate_unique_guest_paths(&mounts)?;
+    config::validate_unique_guest_paths(&mounts)?;
 
     let start_opts = StartOpts {
         name: None,
@@ -483,8 +391,8 @@ fn create_git_repo_instance(
         .map(|t| t.mounts.clone())
         .unwrap_or_default();
     mounts.extend(opts.extra_mount.clone());
-    validate_git_repo_workspace_mounts(&mounts)?;
-    validate_unique_guest_paths(&mounts)?;
+    workspace::validate_git_repo_workspace_mounts(&mounts)?;
+    config::validate_unique_guest_paths(&mounts)?;
 
     let start_opts = StartOpts {
         name: None,
@@ -506,7 +414,7 @@ fn create_git_repo_instance(
     let derived_name = opts
         .name
         .cloned()
-        .or_else(|| git_repo_default_instance_name(repo_url));
+        .or_else(|| github_repo::git_repo_default_instance_name(repo_url));
     allocate_and_start(
         be,
         cfg,
@@ -586,27 +494,6 @@ fn runtime_start_opts_from_up<'a>(opts: &'a UpOpts<'_>, config_path: &'a Path) -
         devcontainer_path: None,
         applied_devcontainer: None,
     }
-}
-
-/// Merge guest-env entries by precedence (CLI > devcontainer.json > config.toml),
-/// persist the result into `cfg.guest_env`, and return the merged map.
-///
-/// This is the single implementation of the precedence rule. All call sites —
-/// the `start_opts`-mutating [`apply_runtime_guest_env`] and the struct-literal
-/// construction paths — route through here.
-fn merge_runtime_guest_env(
-    cfg: &mut config::CoopConfig,
-    cli_guest_env: &[(guest_env_state::EnvVarName, String)],
-    dc_guest_env: Option<&std::collections::BTreeMap<guest_env_state::EnvVarName, String>>,
-) -> std::collections::BTreeMap<guest_env_state::EnvVarName, String> {
-    let cli_guest_env: std::collections::BTreeMap<_, _> = cli_guest_env.iter().cloned().collect();
-    let dc_guest_env = dc_guest_env.cloned().unwrap_or_default();
-    let persisted_guest_env =
-        guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
-    for (key, value) in &persisted_guest_env {
-        cfg.guest_env.insert(key.clone(), value.clone());
-    }
-    persisted_guest_env
 }
 
 pub(crate) fn apply_runtime_guest_env(
@@ -800,31 +687,6 @@ fn reject_running_up_restart_inputs(inst: &config::Instance, opts: &UpOpts<'_>) 
     Ok(())
 }
 
-fn validate_unique_guest_paths(mounts: &[config::Mount]) -> Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for mount in mounts {
-        let guest_path = mount.guest_path.to_string();
-        if !seen.insert(guest_path.clone()) {
-            bail!("Duplicate mount guest path: {guest_path}");
-        }
-    }
-    Ok(())
-}
-
-fn validate_git_repo_workspace_mounts(mounts: &[config::Mount]) -> Result<()> {
-    let workspace_path = workspace::default_workspace_path().to_string();
-    if mounts
-        .iter()
-        .any(|mount| mount.guest_path.to_string() == workspace_path)
-    {
-        bail!(
-            "`coop up --git-repo` clones into /workspace. \
-             Give --extra-mount an explicit non-/workspace guest path."
-        );
-    }
-    Ok(())
-}
-
 fn validate_copy_workspace_mounts(
     transport: ProjectTransport,
     mounts: &[config::Mount],
@@ -846,242 +708,11 @@ fn validate_copy_workspace_mounts(
     Ok(())
 }
 
-/// One-shot `setup → start → claude`. See `Commands::Quickstart`.
-///
-/// The flow short-circuits any step that's already done:
-/// * skips `setup` when the default template rootfs already exists;
-/// * reconnects to a running instance for the current workspace, or restarts
-///   a stopped one, instead of allocating fresh.
-///
-/// `--no-workspace` skips workspace affinity entirely and creates a fresh
-/// instance when no running workspace instance can be reused.
-pub(crate) fn cmd_quickstart(
-    be: &backend::PlatformBackend,
-    cfg: &mut config::CoopConfig,
-    config_path: &Path,
-    opts: &QuickstartOpts,
-) -> Result<()> {
-    let validated = cfg.validate_and_warn()?;
-    let image = config::default_image_name();
-
-    if be.image_is_built(cfg, &image) {
-        tracing::debug!("Image '{image}' already built — skipping setup");
-    } else {
-        tracing::info!("No '{image}' image found — running setup");
-        let _guard = signal::install_handlers();
-        be.setup(
-            cfg,
-            &validated,
-            &setup::SetupOptions {
-                skip_confirm: true,
-                rebuild: false,
-                profiles: Vec::new(),
-                oci_features: Vec::new(),
-                extra_packages: Vec::new(),
-                post_install: None,
-                image: image.clone(),
-                guest_user: guest::GuestUser::default(),
-                builder_timeout: None,
-            },
-        )?;
-    }
-
-    let workspace_dir = resolve_quickstart_workspace(opts.no_workspace)?;
-
-    let existing = match &workspace_dir {
-        Some(ws) => find_workspace_instance(cfg, ws)?,
-        None => None,
-    };
-
-    let inst = match existing {
-        Some(inst) if be.is_running(&inst) => {
-            tracing::info!("Reusing running instance '{}'", inst.name);
-            inst
-        }
-        Some(inst) => {
-            tracing::info!("Restarting stopped instance '{}'", inst.name);
-            // Use the existing instance's image, not the default — the two
-            // can diverge if the instance was created with `coop up
-            // --image <other>`.
-            cmd_start(
-                be,
-                cfg,
-                &validated,
-                &StartOpts {
-                    name: Some(&inst.name),
-                    workspace_dir: None,
-                    git_repo: None,
-                    no_agents: false,
-                    no_prompt: false,
-                    disk: None,
-                    mounts: Vec::new(),
-                    exclude_git: false,
-                    forward_ports: Vec::new(),
-                    config_path,
-                    post_start_override: None,
-                    persisted_guest_env: std::collections::BTreeMap::new(),
-                    devcontainer_path: None,
-                    applied_devcontainer: None,
-                },
-            )?
-        }
-        None => quickstart_fresh_start(
-            be,
-            cfg,
-            config_path,
-            &validated,
-            &image,
-            workspace_dir.as_deref(),
-            opts.no_devcontainer,
-        )?,
-    };
-
-    let sess = open_ssh_session(be, cfg, Some(&inst.name))?;
-    let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-    ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), Vec::new()))
-}
-
-/// Drives a fresh start with `--workspace <ws>` defaults (no mounts, no
-/// `--env`, no forwards, no `--post-start`), folding any discovered
-/// `devcontainer.json` into the start. Returns the started instance.
-///
-/// This allocates directly rather than going through `cmd_start`; quickstart
-/// creates project environments while `start` only restarts stopped instances.
-fn quickstart_fresh_start(
-    be: &backend::PlatformBackend,
-    cfg: &mut config::CoopConfig,
-    config_path: &Path,
-    validated: &config::Validated,
-    image: &config::ImageName,
-    workspace_dir: Option<&Path>,
-    no_devcontainer: bool,
-) -> Result<config::Instance> {
-    let inputs = devcontainer::TranslatorInputs {
-        cli_workspace_or_git_repo: workspace_dir.is_some(),
-        ..devcontainer::TranslatorInputs::default()
-    };
-    let dc_input = DevcontainerInput::from_flags(None, no_devcontainer);
-    let translation = resolve_devcontainer(
-        &DevcontainerOpts {
-            input: &dc_input,
-            dry_run: false,
-            workspace: workspace_dir,
-            mounts: &[],
-            git_repo: None,
-            github_auth: cfg.github.as_ref(),
-            preference_path: Some(&cfg.devcontainer_preferences_path()),
-        },
-        &inputs,
-        devcontainer::Stage::Start,
-    )?;
-
-    if let Some(t) = &translation {
-        devcontainer::apply_to_config(cfg, t)?;
-    }
-
-    // `cfg.forward_ports` is folded in by `start_instance` itself, so it
-    // doesn't need to be merged in here.
-    let forward_ports = translation
-        .as_ref()
-        .map(|t| devcontainer::merge_into_forward_ports(&t.forward_ports, &[]))
-        .unwrap_or_default();
-
-    let persisted_guest_env =
-        merge_runtime_guest_env(cfg, &[], translation.as_ref().map(|t| &t.guest_env));
-
-    let default_translation = devcontainer::Translation::default();
-    let effective_disk =
-        devcontainer::effective_disk(None, translation.as_ref().unwrap_or(&default_translation));
-    let post_start_override = translation.as_ref().and_then(|t| t.post_start.clone());
-
-    let final_mounts = translation
-        .as_ref()
-        .map(|t| t.mounts.clone())
-        .unwrap_or_default();
-
-    let workspace_str = workspace_dir
-        .map(|p| {
-            p.to_str()
-                .with_context(|| format!("Workspace path is not valid UTF-8: {}", p.display()))
-        })
-        .transpose()?;
-
-    let start_opts = StartOpts {
-        name: None,
-        workspace_dir: workspace_str,
-        git_repo: None,
-        no_agents: false,
-        no_prompt: false,
-        disk: effective_disk,
-        mounts: final_mounts,
-        exclude_git: false,
-        forward_ports,
-        config_path,
-        post_start_override: post_start_override.as_deref(),
-        persisted_guest_env,
-        devcontainer_path: None,
-        applied_devcontainer: translation.as_ref().and_then(|t| t.applied.clone()),
-    };
-
-    let _ = validated;
-    allocate_and_start(be, cfg, None, image, workspace_dir, &start_opts)
-}
-
-/// Resolve the workspace directory for `coop quickstart`.
-///
-/// Returns `None` when `--no-workspace` is set or when the user declines a
-/// `$HOME` / `/` prompt; `Some(cwd)` otherwise. Non-TTY callers in a
-/// sensitive directory get an explicit bail rather than a silent mount.
-fn resolve_quickstart_workspace(no_workspace: bool) -> Result<Option<PathBuf>> {
-    if no_workspace {
-        return Ok(None);
-    }
-
-    let cwd = std::env::current_dir().context("Failed to read current directory")?;
-
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if is_sensitive_workspace(&cwd, home.as_deref()) {
-        use std::io::IsTerminal as _;
-        if !std::io::stdin().is_terminal() {
-            bail!(
-                "Current directory {} looks like your home or root — refusing to mount silently.\n\
-                 Pass --no-workspace to skip the mount, or run from a project directory.",
-                cwd.display(),
-            );
-        }
-        let prompt = format!("Mount {} into the guest? This may be large.", cwd.display());
-        if !prompt::confirm(&prompt)? {
-            tracing::info!("Skipping workspace mount (declined at prompt)");
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(cwd))
-}
-
-/// True when `p` is the user's `$HOME` (per the `home` argument) or the root
-/// directory `/`.
-///
-/// `home` is passed in rather than read from the process env so the function
-/// is pure and testable without env mutation. The comparison is byte-equality
-/// — symlinks (e.g. macOS `/var` → `/private/var`) and trailing slashes are
-/// intentionally *not* normalised, so this is a best-effort guardrail rather
-/// than a hard safety check. The fallback behaviour (proceed with the cwd
-/// mount) is benign for any user who deliberately runs in a normalised
-/// project directory; users who land here from an unusual cwd can still
-/// opt out with `--no-workspace`.
-fn is_sensitive_workspace(p: &Path, home: Option<&Path>) -> bool {
-    if p == Path::new("/") {
-        return true;
-    }
-    home.is_some_and(|h| p == h)
-}
-
 /// Find the (single) instance whose persisted workspace state's `host_path`
 /// matches `workspace` (after canonicalisation). Returns `None` when no
 /// instance has been started for this directory; bails when multiple do
 /// (the caller has to pick one explicitly).
-fn find_workspace_instance(
+pub(super) fn find_workspace_instance(
     cfg: &config::CoopConfig,
     workspace: &Path,
 ) -> Result<Option<config::Instance>> {
@@ -1145,34 +776,6 @@ fn find_git_repo_instance(
     }
 }
 
-fn git_repo_default_instance_name(repo_url: &str) -> Option<config::InstanceName> {
-    let base = github_repo::parse_repo_slug_from_url(repo_url)
-        .and_then(|slug| slug.as_str().rsplit('/').next().map(ToOwned::to_owned))
-        .or_else(|| {
-            repo_url
-                .trim_end_matches('/')
-                .rsplit(['/', ':'])
-                .next()
-                .map(|s| s.trim_end_matches(".git").to_string())
-        })?;
-    let sanitized: String = base
-        .chars()
-        .map(|c| {
-            if matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let sanitized = sanitized.trim_matches('-');
-    if sanitized.is_empty() {
-        return None;
-    }
-    let max = 60.min(sanitized.len());
-    config::InstanceName::new(&sanitized[..max]).ok()
-}
-
 pub(crate) fn apply_vm_overrides(
     cfg: &mut config::CoopConfig,
     vcpus: Option<u8>,
@@ -1189,431 +792,6 @@ pub(crate) fn apply_vm_overrides(
         cfg.vm.template_size_gib = ts;
     }
     Ok(())
-}
-
-/// Whether and how a `devcontainer.json` should be resolved.
-///
-/// Models the mutually exclusive `--devcontainer PATH` and `--no-devcontainer`
-/// flags as a single value, so "explicit path *and* disabled" cannot be
-/// represented.
-pub(crate) enum DevcontainerInput {
-    /// `--devcontainer PATH`: use this exact file, skipping discovery and the
-    /// prompt.
-    Explicit(PathBuf),
-    /// `--no-devcontainer`: skip discovery entirely.
-    Disabled,
-    /// Default: discover a `devcontainer.json`, then prompt before applying.
-    Discover,
-}
-
-impl DevcontainerInput {
-    /// Build from the parsed `--devcontainer` / `--no-devcontainer` flags.
-    ///
-    /// clap enforces their mutual exclusion at parse time; should both ever
-    /// arrive, `--no-devcontainer` wins (matching the opt-out's precedence).
-    pub(crate) fn from_flags(path: Option<PathBuf>, no_devcontainer: bool) -> Self {
-        match (path, no_devcontainer) {
-            (_, true) => Self::Disabled,
-            (Some(p), false) => Self::Explicit(p),
-            (None, false) => Self::Discover,
-        }
-    }
-}
-
-/// CLI surface controlling devcontainer.json discovery and apply.
-///
-/// `input` selects an explicit file, opts out entirely, or requests
-/// discovery. `dry_run` prints the report and exits before any side effects.
-pub(crate) struct DevcontainerOpts<'a> {
-    pub(crate) input: &'a DevcontainerInput,
-    pub(crate) dry_run: bool,
-    pub(crate) workspace: Option<&'a Path>,
-    pub(crate) mounts: &'a [config::Mount],
-    pub(crate) git_repo: Option<&'a str>,
-    pub(crate) github_auth: Option<&'a config::GitHubAuth>,
-    pub(crate) preference_path: Option<&'a Path>,
-}
-
-enum DevcontainerSource {
-    Path(PathBuf),
-    Contents {
-        display_path: PathBuf,
-        contents: String,
-    },
-}
-
-fn discovered_local_devcontainer(opts: &DevcontainerOpts<'_>, source: &DevcontainerSource) -> bool {
-    matches!(opts.input, DevcontainerInput::Discover)
-        && matches!(source, DevcontainerSource::Path(_))
-}
-
-fn maybe_skip_stored_devcontainer_opt_out(
-    opts: &DevcontainerOpts<'_>,
-    source: &DevcontainerSource,
-    display_path: &Path,
-) -> Result<bool> {
-    if !discovered_local_devcontainer(opts, source) {
-        return Ok(false);
-    }
-    let (Some(preference_path), Some(project)) = (opts.preference_path, opts.workspace) else {
-        return Ok(false);
-    };
-    let preferences = devcontainer::DevcontainerPreferences::load(preference_path)?;
-    let Some(project_key) = preferences.ignored_project(project)? else {
-        return Ok(false);
-    };
-
-    let mut stderr = std::io::stderr();
-    writeln!(
-        stderr,
-        "Skipping {} because a stored devcontainer opt-out is set for project {}.\n\
-         Run `coop devcontainer clear {}` to re-enable discovery, or pass --devcontainer {} to apply this file once.",
-        display_path.display(),
-        project_key,
-        project_key,
-        display_path.display(),
-    )
-    .context("Failed to write devcontainer opt-out message")?;
-    Ok(true)
-}
-
-fn maybe_record_devcontainer_opt_out(opts: &DevcontainerOpts<'_>, project: &Path) -> Result<()> {
-    let Some(preference_path) = opts.preference_path else {
-        return Ok(());
-    };
-    if !prompt::confirm(&format!(
-        "Always ignore devcontainer.json for project {}?",
-        project.display()
-    ))? {
-        return Ok(());
-    }
-
-    let mut preferences = devcontainer::DevcontainerPreferences::load(preference_path)?;
-    let project_key = preferences.set_ignored(project)?;
-    preferences.save(preference_path)?;
-    tracing::info!("Recorded persistent devcontainer opt-out for project {project_key}");
-    Ok(())
-}
-
-/// Discover, prompt, and translate a `devcontainer.json` for the given
-/// lifecycle `stage`.
-///
-/// Returns `None` when the user opts out, no file is found, or stdin is
-/// not a TTY with no explicit flag (in which case an error is returned
-/// instead — the issue forbids silently choosing). The report is always
-/// emitted to stderr when a file is loaded, so the user sees every key
-/// that did and didn't take effect.
-#[expect(
-    clippy::print_stderr,
-    reason = "devcontainer report is intentional user-facing CLI output"
-)]
-pub(crate) fn resolve_devcontainer(
-    opts: &DevcontainerOpts<'_>,
-    inputs: &devcontainer::TranslatorInputs,
-    stage: devcontainer::Stage,
-) -> Result<Option<devcontainer::Translation>> {
-    use std::io::IsTerminal as _;
-
-    if matches!(opts.input, DevcontainerInput::Disabled) {
-        return Ok(None);
-    }
-
-    let (source, losers) = if let DevcontainerInput::Explicit(p) = opts.input {
-        (DevcontainerSource::Path(p.clone()), Vec::new())
-    } else {
-        let found = devcontainer::discover(opts.workspace, opts.mounts);
-        if let Some((winner, losers)) = devcontainer::pick_winner(found) {
-            (DevcontainerSource::Path(winner.path), losers)
-        } else if let Some(repo_url) = opts.git_repo
-            && let Some(remote) = git_repo_devcontainer::discover(repo_url, opts.github_auth)?
-        {
-            (
-                DevcontainerSource::Contents {
-                    display_path: remote.display_path,
-                    contents: remote.contents,
-                },
-                Vec::new(),
-            )
-        } else {
-            return Ok(None);
-        }
-    };
-    let display_path = match &source {
-        DevcontainerSource::Path(path) => path,
-        DevcontainerSource::Contents { display_path, .. } => display_path,
-    };
-
-    if maybe_skip_stored_devcontainer_opt_out(opts, &source, display_path)? {
-        return Ok(None);
-    }
-
-    // When discovery (not an explicit flag) found the file, defer to the
-    // user. CI/scripted callers must pass --devcontainer or --no-devcontainer.
-    if matches!(opts.input, DevcontainerInput::Discover) && !opts.dry_run {
-        if !std::io::stdin().is_terminal() {
-            match &source {
-                DevcontainerSource::Path(_) => bail!(
-                    "Found {} but stdin is not a TTY.\n\
-                     Pass --devcontainer {} to apply it, or --no-devcontainer to ignore.\n\
-                     coop reads a subset of devcontainer.json — see docs/devcontainer.md for the supported keys.",
-                    display_path.display(),
-                    display_path.display()
-                ),
-                DevcontainerSource::Contents { .. } => bail!(
-                    "Found {} but stdin is not a TTY.\n\
-                     Run interactively to confirm the remote file, pass --no-devcontainer to ignore it, \
-                     or pass --devcontainer <local-path> to apply an explicit file.\n\
-                     coop reads a subset of devcontainer.json — see docs/devcontainer.md for the supported keys.",
-                    display_path.display()
-                ),
-            }
-        }
-        let answer = prompt::confirm_default_yes(&format!(
-            "Use devcontainer.json at {}?",
-            display_path.display()
-        ))?;
-        if !answer {
-            match &source {
-                DevcontainerSource::Path(_) => {
-                    tracing::info!(
-                        "Skipping {}. Re-run with --devcontainer {} to apply it later.",
-                        display_path.display(),
-                        display_path.display()
-                    );
-                    if let Some(project) = opts.workspace {
-                        maybe_record_devcontainer_opt_out(opts, project)?;
-                    }
-                }
-                DevcontainerSource::Contents { .. } => tracing::info!(
-                    "Skipping {}. Re-run interactively to apply it later.",
-                    display_path.display()
-                ),
-            }
-            return Ok(None);
-        }
-    }
-
-    let source_is_remote = matches!(source, DevcontainerSource::Contents { .. });
-    let parsed = match source {
-        DevcontainerSource::Path(path) => devcontainer::ParsedDevcontainer::load(&path)?,
-        DevcontainerSource::Contents {
-            display_path,
-            contents,
-        } => devcontainer::ParsedDevcontainer::from_str(display_path, &contents)?,
-    };
-    let mut translation = devcontainer::translate(&parsed, inputs, stage);
-    if source_is_remote && let Some(applied) = &mut translation.applied {
-        applied.source = devcontainer::AppliedDevcontainerSource::RemoteContents;
-    }
-    translation.report.ignored_paths = losers;
-    resolve_oci_feature_requests(&mut translation);
-
-    eprintln!("{}", translation.report.render());
-
-    Ok(Some(translation))
-}
-
-fn resolve_oci_feature_requests(translation: &mut devcontainer::Translation) {
-    if translation.oci_feature_requests.is_empty() {
-        return;
-    }
-    for (request, resolved) in
-        translation
-            .oci_feature_requests
-            .iter()
-            .zip(devcontainer_oci::resolve_features(
-                &translation.oci_feature_requests,
-            ))
-    {
-        let key = format!("features.{}", request.raw_id);
-        match resolved {
-            Ok(feature) => {
-                translation.report.push(
-                    key,
-                    devcontainer::ReportStatus::Applied,
-                    devcontainer::ReportSource::Devcontainer,
-                    feature.installed.digest.to_string(),
-                    format!(
-                        "OCI feature '{}' install.sh sha256 {} will run during setup",
-                        feature.installed.id, feature.installed.install_script_hash
-                    ),
-                );
-                translation.oci_features.push(feature);
-            }
-            Err(e) => translation.report.push(
-                key,
-                devcontainer::ReportStatus::Invalid,
-                devcontainer::ReportSource::Devcontainer,
-                request.raw_id.clone(),
-                format!("failed to resolve OCI feature: {e:#}"),
-            ),
-        }
-    }
-}
-
-#[expect(
-    clippy::print_stderr,
-    reason = "devcontainer check report is intentional user-facing CLI output"
-)]
-pub(crate) fn cmd_devcontainer_check(command: &DevcontainerCommands) -> Result<()> {
-    match command {
-        DevcontainerCommands::Check { path, stage } => {
-            let dc_input = DevcontainerInput::Explicit(path.clone());
-            let opts = DevcontainerOpts {
-                input: &dc_input,
-                dry_run: true,
-                workspace: None,
-                mounts: &[],
-                git_repo: None,
-                github_auth: None,
-                preference_path: None,
-            };
-            let setup_inputs = devcontainer::TranslatorInputs::default();
-
-            match stage {
-                DevcontainerCheckStage::Setup => {
-                    resolve_devcontainer(&opts, &setup_inputs, devcontainer::Stage::Setup)?;
-                }
-                DevcontainerCheckStage::Start => {
-                    let start_inputs = devcontainer::TranslatorInputs {
-                        persisted_guest_user: Some(guest::GuestUser::default()),
-                        ..devcontainer::TranslatorInputs::default()
-                    };
-                    resolve_devcontainer(&opts, &start_inputs, devcontainer::Stage::Start)?;
-                }
-                DevcontainerCheckStage::Both => {
-                    eprintln!("setup-stage translation:");
-                    let setup_translation =
-                        resolve_devcontainer(&opts, &setup_inputs, devcontainer::Stage::Setup)?;
-                    let assumed_guest_user =
-                        devcontainer_check_assumed_guest_user(setup_translation.as_ref());
-                    let start_inputs = devcontainer::TranslatorInputs {
-                        persisted_guest_user: Some(assumed_guest_user),
-                        ..devcontainer::TranslatorInputs::default()
-                    };
-                    eprintln!();
-                    eprintln!("start-stage translation:");
-                    resolve_devcontainer(&opts, &start_inputs, devcontainer::Stage::Start)?;
-                }
-            }
-            Ok(())
-        }
-        DevcontainerCommands::Ignore { .. }
-        | DevcontainerCommands::Status { .. }
-        | DevcontainerCommands::Clear { .. } => {
-            unreachable!("devcontainer preference commands require config")
-        }
-    }
-}
-
-pub(crate) fn cmd_devcontainer(
-    cfg: &config::CoopConfig,
-    command: &DevcontainerCommands,
-) -> Result<()> {
-    let preference_path = cfg.devcontainer_preferences_path();
-    match command {
-        DevcontainerCommands::Check { .. } => cmd_devcontainer_check(command),
-        DevcontainerCommands::Ignore { project } => {
-            let mut preferences = devcontainer::DevcontainerPreferences::load(&preference_path)?;
-            let project_key = preferences.set_ignored(project)?;
-            preferences.save(&preference_path)?;
-            let mut stdout = std::io::stdout();
-            writeln!(
-                stdout,
-                "Devcontainer discovery disabled for project {project_key}"
-            )
-            .context("Failed to write devcontainer ignore status")?;
-            Ok(())
-        }
-        DevcontainerCommands::Status { project } => {
-            let preferences = devcontainer::DevcontainerPreferences::load(&preference_path)?;
-            let mut stdout = std::io::stdout();
-            if let Some(project) = project {
-                if let Some(project_key) = preferences.ignored_project(project)? {
-                    writeln!(
-                        stdout,
-                        "Devcontainer discovery disabled for project {project_key}"
-                    )
-                    .context("Failed to write devcontainer status")?;
-                } else {
-                    let project_key = devcontainer::project_preference_lookup_key(project)?;
-                    writeln!(
-                        stdout,
-                        "Devcontainer discovery enabled for project {project_key}"
-                    )
-                    .context("Failed to write devcontainer status")?;
-                }
-            } else {
-                let ignored: Vec<_> = preferences.ignored_projects().collect();
-                if ignored.is_empty() {
-                    writeln!(stdout, "No persistent devcontainer opt-outs recorded.")
-                        .context("Failed to write devcontainer status")?;
-                } else {
-                    writeln!(stdout, "Persistent devcontainer opt-outs:")
-                        .context("Failed to write devcontainer status")?;
-                    for project in ignored {
-                        writeln!(stdout, "  {project}")
-                            .context("Failed to write devcontainer status")?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        DevcontainerCommands::Clear { project } => {
-            let mut preferences = devcontainer::DevcontainerPreferences::load(&preference_path)?;
-            let project_key = devcontainer::project_preference_lookup_key(project)?;
-            let removed = preferences.clear(project)?;
-            preferences.save(&preference_path)?;
-            let mut stdout = std::io::stdout();
-            if removed {
-                writeln!(
-                    stdout,
-                    "Cleared devcontainer opt-out for project {project_key}"
-                )
-                .context("Failed to write devcontainer clear status")?;
-            } else {
-                writeln!(
-                    stdout,
-                    "No persistent devcontainer opt-out recorded for project {project_key}"
-                )
-                .context("Failed to write devcontainer clear status")?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn devcontainer_check_assumed_guest_user(
-    setup_translation: Option<&devcontainer::Translation>,
-) -> guest::GuestUser {
-    setup_translation
-        .and_then(|t| t.guest_user.clone())
-        .unwrap_or_default()
-}
-
-pub(crate) struct ProfileImageTarget {
-    profiles: Vec<String>,
-    image: config::ImageName,
-}
-
-impl ProfileImageTarget {
-    pub(crate) fn new(profiles: &[String]) -> Result<Self> {
-        let profiles = canonical_profile_list(profiles);
-        let image = config::ImageName::new(&profiles.join("-")).with_context(|| {
-            format!(
-                "Cannot derive an image name from profile list: {}",
-                profiles.join(", ")
-            )
-        })?;
-        Ok(Self { profiles, image })
-    }
-}
-
-fn canonical_profile_list(profiles: &[String]) -> Vec<String> {
-    let mut names = profiles.to_vec();
-    names.sort();
-    names.dedup();
-    names
 }
 
 pub(crate) struct StartOpts<'a> {
@@ -1732,7 +910,7 @@ pub(crate) fn cmd_start(
 /// Allocate a fresh instance and run the first-boot start, cleaning up any
 /// partial state on error. Used by project-oriented flows that create
 /// instances (`coop up` and `coop quickstart`).
-fn allocate_and_start(
+pub(super) fn allocate_and_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
     name: Option<&config::InstanceName>,
@@ -2386,223 +1564,6 @@ pub(crate) fn cmd_list(be: &backend::PlatformBackend, cfg: &config::CoopConfig) 
     Ok(())
 }
 
-/// Destroy every instance, delegate backend-specific shared-state cleanup
-/// (`destroy_shared`), wipe the SSH keypair and instances dir, and strip every
-/// coop block from `~/.ssh/config`.
-///
-/// Shared by `coop destroy --all` and `coop uninstall`. Does **not** remove
-/// the `data_dir` itself or the binary — uninstall handles those.
-fn purge_all_data(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Result<()> {
-    let instances = cfg.list_instances()?;
-    for inst in &instances {
-        tracing::info!("Destroying instance '{}'", inst.name);
-        if let Ok(target) = be.ssh_target(cfg, inst) {
-            port_forward::teardown_ssh_forwards(inst, &target);
-        }
-        be.destroy_instance(cfg, inst)?;
-        workspace::remove_ssh_config(inst)?;
-    }
-
-    be.destroy_shared(cfg);
-
-    let key = cfg.ssh_key_path();
-    if let Err(e) = std::fs::remove_file(&key) {
-        tracing::debug!("Failed to remove SSH private key (non-fatal): {e}");
-    }
-    if let Err(e) = std::fs::remove_file(key.with_extension("pub")) {
-        tracing::debug!("Failed to remove SSH public key (non-fatal): {e}");
-    }
-
-    let instances_dir = cfg.instances_dir();
-    if instances_dir.exists() {
-        // Instance dirs may be root-owned (Firecracker) or user-owned (Lima)
-        if let Err(e) = std::fs::remove_dir_all(&instances_dir) {
-            tracing::debug!("User remove_dir_all failed, trying sudo: {e}");
-            if let Err(e) = Cmd::new("rm").arg("-rf").arg(&instances_dir).sudo().run() {
-                tracing::debug!(
-                    "Failed to remove instances dir {} (non-fatal): {e}",
-                    instances_dir.display()
-                );
-            }
-        }
-    }
-
-    workspace::remove_all_ssh_config()?;
-    Ok(())
-}
-
-pub(crate) struct UninstallOpts {
-    pub(crate) yes: bool,
-    pub(crate) keep_data: bool,
-    pub(crate) purge: bool,
-}
-
-pub(crate) fn cmd_uninstall(
-    be: &backend::PlatformBackend,
-    cfg: &config::CoopConfig,
-    config_path: &Path,
-    opts: &UninstallOpts,
-) -> Result<()> {
-    use std::io::IsTerminal as _;
-
-    let binary_path =
-        std::env::current_exe().context("Failed to resolve current executable path for removal")?;
-
-    // `current_exe` reads /proc/self/exe on Linux, which dereferences symlinks.
-    // Removing the resolved target leaves any PATH-level symlinks dangling —
-    // surface the resolved path so the user knows what's actually about to go.
-    tracing::debug!("Resolved binary path: {}", binary_path.display());
-
-    if !opts.yes && !std::io::stdin().is_terminal() {
-        bail!(
-            "stdin is not a TTY; pass --yes (and optionally --keep-data or --purge) \
-             for non-interactive uninstall."
-        );
-    }
-
-    print_uninstall_summary(cfg, &binary_path);
-
-    if !opts.yes && !prompt::confirm(&format!("Remove coop binary at {}?", binary_path.display()))?
-    {
-        tracing::info!("Uninstall cancelled");
-        return Ok(());
-    }
-
-    let remove_data = decide_remove_data(cfg, opts)?;
-
-    if remove_data {
-        purge_all_data(be, cfg)?;
-        wipe_data_dir(&cfg.data_dir);
-        if let Err(e) = update::remove_state() {
-            tracing::debug!("Failed to remove update-check state (non-fatal): {e}");
-        }
-        if !config_path_is_under_data_dir(config_path, &cfg.data_dir) && config_path.exists() {
-            tracing::info!(
-                "Config at {} is outside the data directory and was not removed",
-                config_path.display()
-            );
-        }
-    } else {
-        if let Err(e) = workspace::remove_all_ssh_config() {
-            tracing::debug!("SSH config cleanup failed (non-fatal): {e}");
-        }
-        if cfg.data_dir.exists() {
-            tracing::info!(
-                "Keeping {}; reinstall coop to manage existing instances.",
-                cfg.data_dir.display()
-            );
-        }
-    }
-
-    remove_self_binary(&binary_path)?;
-    tracing::info!(
-        "coop uninstalled. To reinstall: curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | sh"
-    );
-    Ok(())
-}
-
-fn print_uninstall_summary(cfg: &config::CoopConfig, binary_path: &Path) {
-    let instance_count = cfg.list_instances().map(|v| v.len()).unwrap_or(0);
-    let image_count = cfg.list_images().map(|v| v.len()).unwrap_or(0);
-    tracing::info!("This will remove:");
-    tracing::info!("  binary:    {}", binary_path.display());
-    if cfg.data_dir.exists() {
-        tracing::info!(
-            "  data dir:  {} ({instance_count} instance(s), {image_count} image(s))",
-            cfg.data_dir.display()
-        );
-    } else {
-        tracing::info!("  data dir:  {} (already absent)", cfg.data_dir.display());
-    }
-}
-
-fn decide_remove_data(cfg: &config::CoopConfig, opts: &UninstallOpts) -> Result<bool> {
-    if opts.keep_data {
-        return Ok(false);
-    }
-    if opts.yes || opts.purge {
-        return Ok(true);
-    }
-    let instance_count = cfg.list_instances().map(|v| v.len()).unwrap_or(0);
-    let image_count = cfg.list_images().map(|v| v.len()).unwrap_or(0);
-    prompt::confirm(&format!(
-        "Also remove data directory {} ({instance_count} instance(s), {image_count} image(s))?",
-        cfg.data_dir.display()
-    ))
-}
-
-fn wipe_data_dir(data_dir: &Path) {
-    if !data_dir.exists() {
-        return;
-    }
-    if let Err(e) = std::fs::remove_dir_all(data_dir) {
-        tracing::debug!("User remove_dir_all failed, trying sudo: {e}");
-        if let Err(e) = Cmd::new("rm").arg("-rf").arg(data_dir).sudo().run() {
-            tracing::warn!(
-                "Failed to remove data dir {} (non-fatal): {e}",
-                data_dir.display()
-            );
-        }
-    }
-}
-
-/// True when `config_path` lives inside `data_dir`.
-///
-/// Canonicalises both sides so `./`, symlinks, and macOS `/private/var` aliases
-/// don't produce false negatives. Falls back to a lexical comparison only when
-/// *both* sides fail to canonicalise — mixing canonical with lexical produced
-/// platform-dependent wrong answers (e.g. `/private/var/.coop` vs `/var/.coop`).
-fn config_path_is_under_data_dir(config_path: &Path, data_dir: &Path) -> bool {
-    match (config_path.canonicalize(), data_dir.canonicalize()) {
-        (Ok(c), Ok(d)) => c.starts_with(&d),
-        (Err(_), Err(_)) => config_path.starts_with(data_dir),
-        // Exactly one side resolved — canonicalisation diverged from lexical
-        // form, so the comparison would be apples-to-oranges. Treat as
-        // "we can't tell" and skip the informational notice rather than print
-        // a misleading one.
-        _ => true,
-    }
-}
-
-/// Resolved path is under `cargo` build output — almost certainly a dev build
-/// being run via `cargo run -- uninstall`. Nuking the target artifact is
-/// rarely what the developer intended.
-///
-/// Matches consecutive components `target/<debug|release>` so unrelated
-/// directories named "target" or "release" do not trigger the guard
-/// (e.g. `/opt/release/target/bin/coop` or `~/target-foo/release/coop`).
-fn is_dev_target_path(path: &Path) -> bool {
-    let components: Vec<_> = path.components().collect();
-    components.windows(2).any(|w| {
-        w[0].as_os_str() == "target"
-            && matches!(w[1].as_os_str().to_str(), Some("debug" | "release"))
-    })
-}
-
-fn remove_self_binary(binary_path: &Path) -> Result<()> {
-    if is_dev_target_path(binary_path) {
-        tracing::warn!(
-            "Refusing to remove {} — looks like a cargo build artifact. \
-             Run `cargo clean` if you really want to delete it.",
-            binary_path.display()
-        );
-        return Ok(());
-    }
-    std::fs::remove_file(binary_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            anyhow::anyhow!(
-                "Cannot remove {}: {e}. Try `sudo coop uninstall`.",
-                binary_path.display()
-            )
-        } else {
-            anyhow::Error::from(e).context(format!(
-                "Failed to remove binary at {}",
-                binary_path.display()
-            ))
-        }
-    })
-}
-
 pub(crate) fn cmd_status(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -2676,224 +1637,97 @@ fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> R
         .with_context(|| format!("Disk at {} is smaller than 1 GiB", path.display()))
 }
 
-pub(crate) fn cmd_profiles(cfg: &config::CoopConfig, action: &ProfilesAction) -> Result<()> {
-    let out = &mut std::io::stdout();
-    let write_result = match action {
-        ProfilesAction::List => write_profiles_list(out, cfg),
-        ProfilesAction::Show { name } => {
-            let def = guest::lookup_profile(name, &cfg.profiles)?;
-            write_profile_show(out, cfg, name, &def)
-        }
-    };
-    write_result.context("failed to write profile output")
-}
-
-fn write_profiles_list(
-    out: &mut impl std::io::Write,
-    cfg: &config::CoopConfig,
-) -> std::io::Result<()> {
-    let mut custom_names: Vec<&str> = cfg.profiles.keys().map(String::as_str).collect();
-    custom_names.sort_unstable();
-
-    let width = guest::BUILTIN_PROFILES
-        .iter()
-        .map(|bp| bp.name.len())
-        .chain(custom_names.iter().map(|n| n.len()))
-        .max()
-        .unwrap_or(0);
-
-    writeln!(out, "Builtin:")?;
-    for bp in guest::BUILTIN_PROFILES {
-        let summary = builtin_summary(bp);
-        writeln!(out, "  {:<width$} {summary}", bp.name)?;
-    }
-
-    if !custom_names.is_empty() {
-        writeln!(out)?;
-        writeln!(out, "Custom:")?;
-        for name in custom_names {
-            let cp = &cfg.profiles[name];
-            let detail = format_custom_summary(cp);
-            writeln!(out, "  {name:<width$} {detail}")?;
-        }
-    }
-    Ok(())
-}
-
-fn builtin_summary(bp: &guest::BuiltinProfile) -> String {
-    let mut parts = Vec::new();
-    if !bp.apt_packages.is_empty() {
-        parts.push(bp.apt_packages.join(", "));
-    }
-    if bp.pre_install.is_some() {
-        parts.push("pre-install script".to_owned());
-    }
-    if bp.post_install.is_some() {
-        parts.push("post-install script".to_owned());
-    }
-    if !bp.plugins.is_empty() {
-        parts.push(format!("plugins: {}", bp.plugins.join(", ")));
-    }
-    if parts.is_empty() {
-        "(empty)".to_owned()
-    } else {
-        parts.join("; ")
-    }
-}
-
-fn write_profile_show(
-    out: &mut impl std::io::Write,
-    cfg: &config::CoopConfig,
-    name: &str,
-    def: &guest::ProfileDef,
-) -> std::io::Result<()> {
-    let origin = if cfg.profiles.contains_key(name) {
-        "custom"
-    } else {
-        "builtin"
-    };
-    writeln!(out, "Profile: {name} ({origin})")?;
-    writeln!(
-        out,
-        "  apt_packages: {}",
-        if def.apt_packages.is_empty() {
-            "(none)".to_string()
-        } else {
-            def.apt_packages.join(", ")
-        }
-    )?;
-    writeln!(
-        out,
-        "  pre_install:  {}",
-        script_summary(def.pre_install.as_deref())
-    )?;
-    writeln!(
-        out,
-        "  post_install: {}",
-        script_summary(def.post_install.as_deref())
-    )?;
-    writeln!(
-        out,
-        "  marketplaces: {}",
-        if def.marketplaces.is_empty() {
-            "(none)".to_string()
-        } else {
-            def.marketplaces.join(", ")
-        }
-    )?;
-    writeln!(
-        out,
-        "  plugins:      {}",
-        if def.plugins.is_empty() {
-            "(none)".to_string()
-        } else {
-            def.plugins.join(", ")
-        }
-    )?;
-    Ok(())
-}
-
-fn format_custom_summary(cp: &config::CustomProfile) -> String {
-    let mut parts = Vec::new();
-    if !cp.apt_packages.is_empty() {
-        parts.push(format!("{} apt packages", cp.apt_packages.len()));
-    }
-    if cp.pre_install.is_some() {
-        parts.push("pre-install script".to_string());
-    }
-    if cp.post_install.is_some() {
-        parts.push("post-install script".to_string());
-    }
-    if !cp.marketplaces.is_empty() {
-        parts.push(format!("{} marketplaces", cp.marketplaces.len()));
-    }
-    if !cp.plugins.is_empty() {
-        parts.push(format!("{} plugins", cp.plugins.len()));
-    }
-    if parts.is_empty() {
-        "(empty)".to_string()
-    } else {
-        format!("({})", parts.join(", "))
-    }
-}
-
-fn script_summary(script: Option<&str>) -> String {
-    match script {
-        None | Some("") => "(none)".to_string(),
-        Some(s) => {
-            let lines = s.lines().count();
-            let first = s.lines().next().unwrap_or("");
-            if lines <= 1 {
-                first.to_string()
-            } else {
-                format!("{first} ... ({lines} lines)")
-            }
-        }
-    }
-}
-
-pub(crate) fn cmd_images(
-    be: &backend::PlatformBackend,
-    cfg: &config::CoopConfig,
-    delete: Option<&config::ImageName>,
-) -> Result<()> {
-    if let Some(name) = delete {
-        return be.destroy_image(cfg, name);
-    }
-
-    let images = cfg.list_images()?;
-    if images.is_empty() {
-        writeln!(
-            std::io::stdout(),
-            "No images found. Run `coop setup` to build one."
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to write: {e}"))?;
-        return Ok(());
-    }
-
-    for img in &images {
-        let profiles = match &img.config {
-            Some(c) if !c.profiles.is_empty() => c.profiles.join(", "),
-            Some(_) => "none".to_string(),
-            None => "unknown".to_string(),
-        };
-        let created = img
-            .config
-            .as_ref()
-            .map_or("unknown", |c| c.created.as_str());
-        let size = dir_size_display(&img.dir);
-        writeln!(
-            std::io::stdout(),
-            "{:<20} profiles: {:<30} created: {:<24} size: {}",
-            img.name,
-            profiles,
-            created,
-            size,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to write: {e}"))?;
-    }
-    Ok(())
-}
-
-fn dir_size_display(dir: &std::path::Path) -> String {
-    let mut total: u64 = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    #[expect(clippy::cast_precision_loss, reason = "file sizes fit in f64")]
-    let gib = total as f64 / (1024.0 * 1024.0 * 1024.0);
-    format!("{gib:.1} GiB")
-}
-
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
-    use proptest::prelude::*;
+
+    fn cfg_with_data_dir(dir: std::path::PathBuf) -> super::config::CoopConfig {
+        super::config::CoopConfig {
+            data_dir: dir,
+            ..super::config::CoopConfig::default()
+        }
+    }
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        // Clear inherited env and restore only what `git` needs. This
+        // protects against parent contexts that export GIT_DIR /
+        // GIT_WORK_TREE / GIT_INDEX_FILE (e.g. a pre-commit hook
+        // running `cargo test`), which would otherwise hijack the
+        // tempdir-scoped operations below.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("git command runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn start_opts(
+        mounts: Vec<super::config::Mount>,
+        config_path: &std::path::Path,
+    ) -> super::StartOpts<'_> {
+        super::StartOpts {
+            name: None,
+            workspace_dir: None,
+            git_repo: None,
+            no_agents: false,
+            no_prompt: true,
+            disk: None,
+            mounts,
+            exclude_git: false,
+            forward_ports: Vec::new(),
+            config_path,
+            post_start_override: None,
+            persisted_guest_env: std::collections::BTreeMap::new(),
+            devcontainer_path: None,
+            applied_devcontainer: None,
+        }
+    }
+
+    fn up_opts_for_tests(dir: Option<&str>) -> super::UpOpts<'_> {
+        super::UpOpts {
+            dir,
+            name: None,
+            transport: super::ProjectTransport::Copy,
+            extra_mount: Vec::new(),
+            git_repo: None,
+            vcpus: None,
+            mem: None,
+            disk: None,
+            image: None,
+            profile_target: None,
+            runtime: super::UpRuntimeOpts {
+                no_agents: false,
+                exclude_git: false,
+                no_prompt: true,
+                forward_ports: Vec::new(),
+                post_start: None,
+                guest_env: Vec::new(),
+            },
+            devcontainer: super::UpDevcontainerOpts {
+                input: super::DevcontainerInput::Disabled,
+                dry_run: false,
+            },
+        }
+    }
+
+    fn write_workspace_state(inst: &super::config::Instance, host_path: &std::path::Path) {
+        let state = super::workspace::WorkspaceState {
+            guest_path: super::workspace::default_workspace_path(),
+            source: super::workspace::WorkspaceSource::Workspace {
+                host_path: host_path.to_path_buf(),
+            },
+        };
+        state.save(inst).expect("save workspace state");
+    }
 
     #[test]
     fn prepend_binary_prefixes_command() {
@@ -2976,150 +1810,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_runtime_guest_env_applies_three_tier_precedence() {
-        use super::guest_env_state::EnvVarName;
-
-        let env = |s: &str| EnvVarName::new(s).expect("valid env var");
-
-        let mut cfg = super::config::CoopConfig::default();
-        cfg.guest_env.insert(env("ONLY_CFG"), "cfg".to_string());
-        cfg.guest_env.insert(env("SHARED"), "cfg".to_string());
-
-        let mut dc = std::collections::BTreeMap::new();
-        dc.insert(env("ONLY_DC"), "dc".to_string());
-        dc.insert(env("SHARED"), "dc".to_string());
-
-        let cli = vec![
-            (env("ONLY_CLI"), "cli".to_string()),
-            (env("SHARED"), "cli".to_string()),
-        ];
-
-        let merged = super::merge_runtime_guest_env(&mut cfg, &cli, Some(&dc));
-
-        // CLI wins over devcontainer wins over config.toml on conflict.
-        assert_eq!(merged.get(&env("SHARED")).map(String::as_str), Some("cli"));
-        assert_eq!(
-            cfg.guest_env.get(&env("SHARED")).map(String::as_str),
-            Some("cli")
-        );
-
-        // The merged map carries dc + cli entries; config-only entries are not
-        // re-added to it but remain in cfg.guest_env.
-        assert_eq!(merged.get(&env("ONLY_DC")).map(String::as_str), Some("dc"));
-        assert_eq!(
-            merged.get(&env("ONLY_CLI")).map(String::as_str),
-            Some("cli")
-        );
-        assert!(!merged.contains_key(&env("ONLY_CFG")));
-
-        // The side effect folds dc + cli into cfg.guest_env without dropping
-        // the pre-existing config.toml-only entry.
-        assert_eq!(
-            cfg.guest_env.get(&env("ONLY_CFG")).map(String::as_str),
-            Some("cfg")
-        );
-        assert_eq!(
-            cfg.guest_env.get(&env("ONLY_DC")).map(String::as_str),
-            Some("dc")
-        );
-        assert_eq!(
-            cfg.guest_env.get(&env("ONLY_CLI")).map(String::as_str),
-            Some("cli")
-        );
-    }
-
-    #[test]
-    fn merge_runtime_guest_env_without_devcontainer_uses_cli_only() {
-        use super::guest_env_state::EnvVarName;
-
-        let env = |s: &str| EnvVarName::new(s).expect("valid env var");
-
-        let mut cfg = super::config::CoopConfig::default();
-        cfg.guest_env.insert(env("ONLY_CFG"), "cfg".to_string());
-
-        let cli = vec![(env("FROM_CLI"), "cli".to_string())];
-        let merged = super::merge_runtime_guest_env(&mut cfg, &cli, None);
-
-        assert_eq!(merged, cli.into_iter().collect());
-        assert_eq!(
-            cfg.guest_env.get(&env("FROM_CLI")).map(String::as_str),
-            Some("cli")
-        );
-        assert_eq!(
-            cfg.guest_env.get(&env("ONLY_CFG")).map(String::as_str),
-            Some("cfg")
-        );
-    }
-
-    /// Guest-env maps keyed in a deliberately small space so the three tiers
-    /// overlap often, exercising the precedence path rather than only disjoint
-    /// unions.
-    fn small_env_map()
-    -> impl Strategy<Value = std::collections::BTreeMap<super::guest_env_state::EnvVarName, String>>
-    {
-        prop::collection::btree_map(
-            "[A-E]".prop_map(|s| {
-                super::guest_env_state::EnvVarName::new(&s)
-                    .expect("single uppercase letter is valid")
-            }),
-            any::<String>(),
-            0..6,
-        )
-    }
-
-    proptest! {
-        /// `merge_runtime_guest_env` resolves all three tiers with
-        /// CLI > devcontainer.json > config.toml precedence. The returned map
-        /// carries exactly the devcontainer ∪ CLI entries (config-only keys
-        /// stay in `cfg.guest_env` but are never re-added to the persisted
-        /// map), and `cfg.guest_env` reflects the full three-tier merge.
-        #[test]
-        fn merge_runtime_guest_env_precedence_holds(
-            cfg_env in small_env_map(),
-            dc in small_env_map(),
-            cli_map in small_env_map(),
-        ) {
-            use super::guest_env_state::EnvVarName;
-
-            let mut cfg = super::config::CoopConfig::default();
-            for (k, v) in &cfg_env {
-                cfg.guest_env.insert(k.clone(), v.clone());
-            }
-            let cli: Vec<(EnvVarName, String)> =
-                cli_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-
-            let merged = super::merge_runtime_guest_env(&mut cfg, &cli, Some(&dc));
-
-            // Returned map = devcontainer ∪ CLI (CLI wins); no config-only keys.
-            let persisted_union: std::collections::BTreeSet<_> =
-                dc.keys().chain(cli_map.keys()).cloned().collect();
-            let got: std::collections::BTreeSet<_> = merged.keys().cloned().collect();
-            prop_assert_eq!(got, persisted_union);
-            for (k, v) in &merged {
-                let expected = cli_map.get(k).or_else(|| dc.get(k)).expect("key from a tier");
-                prop_assert_eq!(v, expected);
-            }
-
-            // cfg.guest_env now reflects the full three-tier precedence over
-            // every key seen in any tier.
-            let all_keys: std::collections::BTreeSet<_> = cfg_env
-                .keys()
-                .chain(dc.keys())
-                .chain(cli_map.keys())
-                .cloned()
-                .collect();
-            for k in &all_keys {
-                let expected = cli_map
-                    .get(k)
-                    .or_else(|| dc.get(k))
-                    .or_else(|| cfg_env.get(k))
-                    .expect("key from a tier");
-                prop_assert_eq!(cfg.guest_env.get(k).expect("merged key present"), expected);
-            }
-        }
-    }
-
-    #[test]
     fn prepare_session_skips_overlay_without_instance() {
         use std::num::NonZeroU16;
 
@@ -3139,166 +1829,6 @@ mod tests {
             !session.env.contains("FROM_CLI"),
             "without an instance, no persisted overlay should be applied",
         );
-    }
-
-    #[test]
-    fn dev_target_path_requires_consecutive_components() {
-        use std::path::Path;
-        // True: target immediately followed by debug/release
-        assert!(super::is_dev_target_path(Path::new(
-            "/home/u/repo/target/debug/coop"
-        )));
-        assert!(super::is_dev_target_path(Path::new(
-            "/home/u/repo/target/release/coop"
-        )));
-        // False: real install paths
-        assert!(!super::is_dev_target_path(Path::new(
-            "/home/u/.local/bin/coop"
-        )));
-        assert!(!super::is_dev_target_path(Path::new("/usr/local/bin/coop")));
-        // False: `target` and `release`/`debug` present but not adjacent
-        assert!(!super::is_dev_target_path(Path::new(
-            "/opt/release/target/bin/coop"
-        )));
-        assert!(!super::is_dev_target_path(Path::new(
-            "/home/u/target-foo/release/coop"
-        )));
-        assert!(!super::is_dev_target_path(Path::new(
-            "/srv/debug/lib/target/coop"
-        )));
-    }
-
-    fn opts(yes: bool, keep_data: bool, purge: bool) -> super::UninstallOpts {
-        super::UninstallOpts {
-            yes,
-            keep_data,
-            purge,
-        }
-    }
-
-    fn cfg_with_data_dir(dir: std::path::PathBuf) -> super::config::CoopConfig {
-        super::config::CoopConfig {
-            data_dir: dir,
-            ..super::config::CoopConfig::default()
-        }
-    }
-
-    #[test]
-    fn decide_remove_data_keeps_data_when_keep_data_set() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
-        assert!(!super::decide_remove_data(&cfg, &opts(true, true, false)).unwrap());
-        assert!(!super::decide_remove_data(&cfg, &opts(false, true, false)).unwrap());
-    }
-
-    #[test]
-    fn decide_remove_data_removes_when_yes_set() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
-        assert!(super::decide_remove_data(&cfg, &opts(true, false, false)).unwrap());
-    }
-
-    #[test]
-    fn decide_remove_data_removes_when_purge_set() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
-        assert!(super::decide_remove_data(&cfg, &opts(false, false, true)).unwrap());
-        assert!(super::decide_remove_data(&cfg, &opts(true, false, true)).unwrap());
-    }
-
-    #[test]
-    fn decide_remove_data_interactive_returns_false_without_tty() {
-        // In `cargo test` stdin is not a TTY, so `prompt::confirm` returns
-        // `Ok(false)` — exercising the interactive branch deterministically.
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
-        assert!(!super::decide_remove_data(&cfg, &opts(false, false, false)).unwrap());
-    }
-
-    #[test]
-    fn config_path_under_data_dir_recognises_nested() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path();
-        let config = data.join("config.toml");
-        std::fs::write(&config, "").unwrap();
-        assert!(super::config_path_is_under_data_dir(&config, data));
-    }
-
-    #[test]
-    fn config_path_under_data_dir_rejects_sibling() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let other = tmp.path().join("elsewhere");
-        std::fs::create_dir(&data).unwrap();
-        std::fs::create_dir(&other).unwrap();
-        let config = other.join("config.toml");
-        std::fs::write(&config, "").unwrap();
-        assert!(!super::config_path_is_under_data_dir(&config, &data));
-    }
-
-    #[test]
-    fn config_path_under_data_dir_falls_back_lexically_when_both_missing() {
-        // Neither side exists — function falls back to lexical starts_with.
-        let config = std::path::Path::new("/nonexistent/data/config.toml");
-        let data = std::path::Path::new("/nonexistent/data");
-        assert!(super::config_path_is_under_data_dir(config, data));
-
-        let other = std::path::Path::new("/nonexistent/other/config.toml");
-        assert!(!super::config_path_is_under_data_dir(other, data));
-    }
-
-    #[test]
-    fn config_path_under_data_dir_skips_notice_on_half_canonical() {
-        // Data dir exists, config doesn't — historically this returned a wrong
-        // answer by mixing canonical/lexical forms. The function now treats it
-        // as "can't tell" and returns true to suppress the (potentially wrong)
-        // informational notice.
-        let tmp = tempfile::tempdir().unwrap();
-        let config = std::path::Path::new("/nonexistent/path/config.toml");
-        assert!(super::config_path_is_under_data_dir(config, tmp.path()));
-    }
-
-    fn run_git(repo: &std::path::Path, args: &[&str]) {
-        // Clear inherited env and restore only what `git` needs. This
-        // protects against parent contexts that export GIT_DIR /
-        // GIT_WORK_TREE / GIT_INDEX_FILE (e.g. a pre-commit hook
-        // running `cargo test`), which would otherwise hijack the
-        // tempdir-scoped operations below.
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .env_clear()
-            .env("PATH", path)
-            .env("HOME", repo)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .status()
-            .expect("git command runs");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    fn start_opts(
-        mounts: Vec<super::config::Mount>,
-        config_path: &std::path::Path,
-    ) -> super::StartOpts<'_> {
-        super::StartOpts {
-            name: None,
-            workspace_dir: None,
-            git_repo: None,
-            no_agents: false,
-            no_prompt: true,
-            disk: None,
-            mounts,
-            exclude_git: false,
-            forward_ports: Vec::new(),
-            config_path,
-            post_start_override: None,
-            persisted_guest_env: std::collections::BTreeMap::new(),
-            devcontainer_path: None,
-            applied_devcontainer: None,
-        }
     }
 
     #[test]
@@ -3386,61 +1916,6 @@ mod tests {
     }
 
     #[test]
-    fn git_repo_default_instance_name_uses_repo_basename() {
-        let name = super::git_repo_default_instance_name("https://github.com/trailofbits/coop.git")
-            .expect("name");
-        assert_eq!(name.as_str(), "coop");
-
-        let name =
-            super::git_repo_default_instance_name("git@example.com:org/my.repo.git").expect("name");
-        assert_eq!(name.as_str(), "my-repo");
-    }
-
-    #[test]
-    fn git_repo_default_instance_name_handles_url_edges() {
-        // Trailing slash, no `.git` suffix.
-        let name =
-            super::git_repo_default_instance_name("https://example.com/org/widget/").expect("name");
-        assert_eq!(name.as_str(), "widget");
-
-        // scp-style without a `.git` suffix.
-        let name =
-            super::git_repo_default_instance_name("git@example.com:org/tools").expect("name");
-        assert_eq!(name.as_str(), "tools");
-
-        // Bare path with no host.
-        let name = super::git_repo_default_instance_name("/srv/git/repo.git").expect("name");
-        assert_eq!(name.as_str(), "repo");
-    }
-
-    #[test]
-    fn git_repo_default_instance_name_rejects_unusable_basenames() {
-        // A basename that sanitizes to nothing has no usable instance name.
-        assert!(super::git_repo_default_instance_name("https://example.com/org/.git").is_none());
-        assert!(super::git_repo_default_instance_name("https://example.com/org/---").is_none());
-    }
-
-    #[test]
-    fn git_repo_default_instance_name_caps_long_basenames() {
-        let long = format!("https://example.com/org/{}.git", "a".repeat(200));
-        let name = super::git_repo_default_instance_name(&long).expect("name");
-        assert_eq!(name.as_str().len(), 60);
-        assert!(name.as_str().chars().all(|c| c == 'a'));
-    }
-
-    #[test]
-    fn git_repo_rejects_extra_mount_at_workspace() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let data = tmp.path().join("data");
-        std::fs::create_dir(&data).expect("data");
-        let mounts = vec![super::config::Mount::parse(data.to_str().unwrap()).expect("mount")];
-
-        let err = super::validate_git_repo_workspace_mounts(&mounts)
-            .expect_err("expected /workspace collision");
-        assert!(format!("{err}").contains("/workspace"));
-    }
-
-    #[test]
     fn find_git_repo_instance_returns_none_when_unmatched() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
@@ -3487,21 +1962,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_unique_guest_paths_rejects_duplicates() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let a = tmp.path().join("a");
-        let b = tmp.path().join("b");
-        std::fs::create_dir(&a).expect("create a");
-        std::fs::create_dir(&b).expect("create b");
-        let mounts = vec![
-            super::config::Mount::parse(&format!("{}:/data", a.display())).expect("mount a"),
-            super::config::Mount::parse(&format!("{}:/data", b.display())).expect("mount b"),
-        ];
-        let err = super::validate_unique_guest_paths(&mounts).expect_err("expected duplicate");
-        assert!(format!("{err}").contains("/data"));
-    }
-
-    #[test]
     fn up_copy_rejects_extra_mount_at_workspace() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let data = tmp.path().join("data");
@@ -3511,55 +1971,6 @@ mod tests {
         let err = super::validate_copy_workspace_mounts(super::ProjectTransport::Copy, &mounts)
             .expect_err("expected /workspace collision");
         assert!(format!("{err}").contains("/workspace"));
-    }
-
-    fn up_opts_for_tests(dir: Option<&str>) -> super::UpOpts<'_> {
-        super::UpOpts {
-            dir,
-            name: None,
-            transport: super::ProjectTransport::Copy,
-            extra_mount: Vec::new(),
-            git_repo: None,
-            vcpus: None,
-            mem: None,
-            disk: None,
-            image: None,
-            profile_target: None,
-            runtime: super::UpRuntimeOpts {
-                no_agents: false,
-                exclude_git: false,
-                no_prompt: true,
-                forward_ports: Vec::new(),
-                post_start: None,
-                guest_env: Vec::new(),
-            },
-            devcontainer: super::UpDevcontainerOpts {
-                input: super::DevcontainerInput::Disabled,
-                dry_run: false,
-            },
-        }
-    }
-
-    #[test]
-    fn devcontainer_input_from_flags_precedence() {
-        let path = std::path::PathBuf::from("/tmp/devcontainer.json");
-        assert!(matches!(
-            super::DevcontainerInput::from_flags(Some(path.clone()), false),
-            super::DevcontainerInput::Explicit(p) if p == path
-        ));
-        assert!(matches!(
-            super::DevcontainerInput::from_flags(None, false),
-            super::DevcontainerInput::Discover
-        ));
-        assert!(matches!(
-            super::DevcontainerInput::from_flags(None, true),
-            super::DevcontainerInput::Disabled
-        ));
-        // --no-devcontainer wins even if a path is also present.
-        assert!(matches!(
-            super::DevcontainerInput::from_flags(Some(path), true),
-            super::DevcontainerInput::Disabled
-        ));
     }
 
     #[test]
@@ -3700,77 +2111,6 @@ mod tests {
         let mut opts = start_opts(Vec::new(), &cfg_path);
         opts.devcontainer_path = Some(std::path::Path::new("/tmp/devcontainer.json"));
         assert!(super::restart_has_ignored_creation_flags(&opts));
-    }
-
-    #[test]
-    fn devcontainer_check_both_stage_reuses_setup_guest_user() {
-        let translation = super::devcontainer::Translation {
-            guest_user: Some(super::guest::GuestUser::new("vscode").unwrap()),
-            ..super::devcontainer::Translation::default()
-        };
-        assert_eq!(
-            super::devcontainer_check_assumed_guest_user(Some(&translation)).to_string(),
-            "vscode"
-        );
-    }
-
-    #[test]
-    fn devcontainer_check_both_stage_defaults_without_setup_guest_user() {
-        assert_eq!(
-            super::devcontainer_check_assumed_guest_user(None).to_string(),
-            "ubuntu"
-        );
-    }
-
-    #[test]
-    fn is_sensitive_workspace_detects_root() {
-        let home = std::path::Path::new("/home/alice");
-        assert!(super::is_sensitive_workspace(
-            std::path::Path::new("/"),
-            Some(home),
-        ));
-    }
-
-    #[test]
-    fn is_sensitive_workspace_detects_home() {
-        let home = std::path::Path::new("/home/alice");
-        assert!(super::is_sensitive_workspace(home, Some(home)));
-    }
-
-    #[test]
-    fn is_sensitive_workspace_passes_through_project_dir() {
-        let home = std::path::Path::new("/home/alice");
-        let project = std::path::Path::new("/home/alice/projects/coop");
-        assert!(!super::is_sensitive_workspace(project, Some(home)));
-    }
-
-    #[test]
-    fn is_sensitive_workspace_handles_missing_home() {
-        // When HOME is unset, only `/` should be flagged.
-        let project = std::path::Path::new("/tmp/work");
-        assert!(!super::is_sensitive_workspace(project, None));
-        assert!(super::is_sensitive_workspace(
-            std::path::Path::new("/"),
-            None,
-        ));
-    }
-
-    #[test]
-    fn resolve_quickstart_workspace_returns_none_when_opted_out() {
-        // --no-workspace takes precedence over everything; doesn't even
-        // touch the filesystem.
-        let result = super::resolve_quickstart_workspace(true).expect("ok");
-        assert_eq!(result, None);
-    }
-
-    fn write_workspace_state(inst: &super::config::Instance, host_path: &std::path::Path) {
-        let state = super::workspace::WorkspaceState {
-            guest_path: super::workspace::default_workspace_path(),
-            source: super::workspace::WorkspaceSource::Workspace {
-                host_path: host_path.to_path_buf(),
-            },
-        };
-        state.save(inst).expect("save workspace state");
     }
 
     #[test]
