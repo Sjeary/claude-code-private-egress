@@ -790,6 +790,54 @@ test_claude_bin_path() {
     fi
 }
 
+test_claude_settings_merge() {
+    echo ""
+    echo "=== Phase: claude settings merge across restart ==="
+
+    # Seed settings.json with a sentinel enabledPlugins key plus a non-managed
+    # permissions value. The bug this guards: write_managed_claude_settings used
+    # to overwrite the whole file on every boot, wiping the plugin/marketplace
+    # state Claude Code keeps here (it only installs on first boot, so nothing
+    # re-adds it on restart). The fix merges instead, so arbitrary keys must
+    # survive a real stop/start while managed permissions are still reapplied.
+    # ~ is inside the single-quoted sh -c so the guest expands it, not the host.
+    local seed='mkdir -p ~/.claude && printf "%s" '
+    seed+='"{\"enabledPlugins\":{\"sentinel@m\":true},\"permissions\":{\"defaultMode\":\"default\"}}" '
+    seed+='> ~/.claude/settings.json'
+    if moat_exec sh -c "$seed"; then
+        pass "seed settings.json with sentinel plugin"
+    else
+        fail "seed settings.json with sentinel plugin" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    coop stop "$INSTANCE" || true
+    if coop start "$INSTANCE" --no-agents; then
+        pass "restart for settings merge exits 0"
+    else
+        fail "restart for settings merge exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    local merged
+    if ! merged=$(moat_exec sh -c 'cat ~/.claude/settings.json'); then
+        fail "read merged settings.json after restart" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    if echo "$merged" | grep -q 'sentinel@m'; then
+        pass "enabledPlugins survives restart"
+    else
+        fail "enabledPlugins survives restart" "$merged"
+    fi
+
+    if echo "$merged" | grep -q 'bypassPermissions'; then
+        pass "managed permissions reapplied after restart"
+    else
+        fail "managed permissions reapplied after restart" "$merged"
+    fi
+}
+
 test_codex_bin_path() {
     echo ""
     echo "=== Phase: codex binary path ==="
@@ -4345,6 +4393,7 @@ main() {
     test_ssh_config
     test_exec
     test_claude_bin_path
+    test_claude_settings_merge
     test_codex_bin_path
     test_codex_sandbox_bypass
     test_github_token_forwarding

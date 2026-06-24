@@ -1805,6 +1805,12 @@ fn write_managed_claude_settings(
                 "Could not merge existing ~/.claude/settings.json ({err:#}); \
                  replacing it with managed defaults"
             );
+            // Fallback is NOT preservation-safe: replacing the file with managed
+            // defaults discards enabledPlugins/extraKnownMarketplaces — the very
+            // keys this function exists to keep. Acceptable only because reaching
+            // here means the existing file isn't a usable settings object (invalid
+            // JSON, or a non-object `permissions`), which coop never writes; a
+            // corrupt file is reset rather than merged into.
             managed_claude_settings_json(local_env)
         }
     };
@@ -2696,6 +2702,24 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
                 .pointer("/permissions/skipDangerousModePermissionPrompt")
                 .and_then(serde_json::Value::as_bool),
             Some(true),
+        );
+    }
+
+    #[test]
+    fn merge_managed_claude_settings_preserves_key_order() {
+        // With serde_json's `preserve_order` feature the merge only touches
+        // `permissions` and leaves every other key where the user had it,
+        // instead of alphabetizing the whole file on every boot. Guards against
+        // the feature being dropped from Cargo.toml.
+        let existing = r#"{"zeta":1,"permissions":{"defaultMode":"default"},"alpha":2}"#;
+
+        let merged = merge_managed_claude_settings(existing, &BTreeMap::new()).unwrap();
+
+        let zeta = merged.find("\"zeta\"").unwrap();
+        let alpha = merged.find("\"alpha\"").unwrap();
+        assert!(
+            zeta < alpha,
+            "original key order must be preserved, not alphabetized: {merged}",
         );
     }
 
