@@ -116,8 +116,8 @@ fn set_local(
     }
 
     state.save(inst)?;
-    tracing::info!("Switched '{}' to local model mode", inst.name);
-    apply_to_running(be, cfg, inst)
+    let applied = apply_to_running(be, cfg, inst)?;
+    report_switch(inst, ModelMode::Local, applied)
 }
 
 fn set_remote(
@@ -130,24 +130,46 @@ fn set_remote(
     // the mode flips, which drops the materialized guest config.
     state.mode = ModelMode::Remote;
     state.save(inst)?;
-    tracing::info!("Switched '{}' to remote (cloud) model mode", inst.name);
-    apply_to_running(be, cfg, inst)
+    let applied = apply_to_running(be, cfg, inst)?;
+    report_switch(inst, ModelMode::Remote, applied)
 }
 
-/// Re-materialize guest config for the current model state on the running
-/// VM. When the VM is stopped, the persisted state is applied on its next
-/// start, so this is a no-op with an informational log.
+/// Tell the user what changed and what (if anything) they need to do.
+///
+/// Switching never requires a VM restart — the guest config is rewritten
+/// live over SSH. An agent that is *already running* won't change
+/// mid-session (it reads the config at launch), so the only follow-up is
+/// to relaunch `claude`/`codex`.
+fn report_switch(inst: &config::Instance, mode: ModelMode, applied: bool) -> Result<()> {
+    let target = match mode {
+        ModelMode::Local => "a local model",
+        ModelMode::Remote => "cloud models",
+    };
+    let out = &mut std::io::stdout();
+    if applied {
+        writeln!(out, "'{}' now uses {target}.", inst.name)?;
+        writeln!(
+            out,
+            "Applied to the running VM — no restart needed; relaunch claude/codex \
+             (e.g. `coop claude {}`) to pick it up.",
+            inst.name
+        )?;
+    } else {
+        writeln!(out, "'{}' will use {target} on next start.", inst.name)?;
+    }
+    Ok(())
+}
+
+/// Re-materialize guest config for the current model state. Returns `true`
+/// when the VM was running and the change was applied live, `false` when
+/// the VM is stopped and the persisted state will apply on next start.
 fn apply_to_running(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(running) = be.as_running(cfg, inst.clone())? else {
-        tracing::info!(
-            "'{}' is not running — the model setting applies on next start",
-            inst.name
-        );
-        return Ok(());
+        return Ok(false);
     };
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
@@ -159,7 +181,8 @@ fn apply_to_running(
         &inst,
         backend::BootMode::Restart,
         &guest_host,
-    )
+    )?;
+    Ok(true)
 }
 
 /// Interactively collect a local endpoint for `tool`. Returns `None` when
