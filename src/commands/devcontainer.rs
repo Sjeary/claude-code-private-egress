@@ -274,6 +274,11 @@ fn resolve_oci_feature_requests(translation: &mut devcontainer::Translation) {
     clippy::print_stderr,
     reason = "devcontainer check report is intentional user-facing CLI output"
 )]
+// Dispatch handler: builds DevcontainerOpts/TranslatorInputs and calls the
+// excluded resolve_devcontainer. exclude_re cannot suppress its
+// `delete field … from struct devcontainer::TranslatorInputs` mutants
+// (see the note in .cargo/mutants.toml), so skip the whole body here.
+#[mutants::skip]
 pub(crate) fn cmd_devcontainer_check(command: &DevcontainerCommands) -> Result<()> {
     match command {
         DevcontainerCommands::Check { path, stage } => {
@@ -454,5 +459,45 @@ mod tests {
             super::devcontainer_check_assumed_guest_user(None).to_string(),
             "ubuntu"
         );
+    }
+
+    #[test]
+    fn discovered_local_devcontainer_only_for_discovered_local_path() {
+        fn opts(input: &super::DevcontainerInput) -> super::DevcontainerOpts<'_> {
+            super::DevcontainerOpts {
+                input,
+                dry_run: false,
+                workspace: None,
+                mounts: &[],
+                git_repo: None,
+                github_auth: None,
+                preference_path: None,
+            }
+        }
+
+        let path = std::path::PathBuf::from("/tmp/devcontainer.json");
+        let discover = super::DevcontainerInput::Discover;
+        let explicit = super::DevcontainerInput::Explicit(path.clone());
+        let local = super::DevcontainerSource::Path(path.clone());
+        let remote = super::DevcontainerSource::Contents {
+            display_path: path,
+            contents: String::new(),
+        };
+
+        // Discovered (not flagged) + a local file on disk → true.
+        assert!(super::discovered_local_devcontainer(
+            &opts(&discover),
+            &local
+        ));
+        // An explicit `--devcontainer PATH` is not "discovered".
+        assert!(!super::discovered_local_devcontainer(
+            &opts(&explicit),
+            &local
+        ));
+        // Discovered but resolved to remote git-repo contents → not local.
+        assert!(!super::discovered_local_devcontainer(
+            &opts(&discover),
+            &remote
+        ));
     }
 }

@@ -1714,10 +1714,17 @@ fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> R
     let bytes = std::fs::metadata(&path)
         .with_context(|| format!("Failed to stat {}", path.display()))?
         .len();
-    #[expect(clippy::cast_possible_truncation, reason = "disk GiB fits in u32")]
-    let gib = (bytes / (1024 * 1024 * 1024)) as u32;
-    config::GiB::new(gib)
+    config::GiB::new(bytes_to_gib(bytes))
         .with_context(|| format!("Disk at {} is smaller than 1 GiB", path.display()))
+}
+
+/// Whole gibibytes in `bytes`, rounding down (1 GiB = 1024³ bytes).
+///
+/// The truncating `as u32` is safe for any disk size coop creates: the
+/// template caps well under 4 TiB (`u32::MAX` GiB), so the quotient fits.
+#[expect(clippy::cast_possible_truncation, reason = "disk GiB fits in u32")]
+fn bytes_to_gib(bytes: u64) -> u32 {
+    (bytes / (1024 * 1024 * 1024)) as u32
 }
 
 #[cfg(test)]
@@ -2275,5 +2282,277 @@ mod tests {
 
         let found = super::find_workspace_instance(&cfg, &ws_b).expect("ok");
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn up_translator_inputs_maps_opts_to_translator_fields() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A temp data_dir with no template_config.json makes
+        // backend::persisted_guest_user fall back to the default user, so the
+        // builder is deterministic.
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let mount_dir = tmp.path().join("mnt");
+        std::fs::create_dir(&mount_dir).expect("mnt");
+
+        let mut opts = up_opts_for_tests(None);
+        opts.vcpus = Some(7);
+        opts.mem = super::config::MiB::new(2048);
+        opts.disk = super::config::GiB::new(50);
+        opts.extra_mount =
+            vec![super::config::Mount::parse(mount_dir.to_str().unwrap()).expect("mount")];
+        opts.profile_target = Some(
+            super::ProfileImageTarget::new(&["python".to_string(), "node".to_string()])
+                .expect("profile target"),
+        );
+        opts.runtime.post_start = Some("echo hi".to_string());
+        opts.runtime.forward_ports = vec![super::config::PortForward::parse("3000").expect("port")];
+        opts.runtime.guest_env = vec![(
+            super::guest_env_state::EnvVarName::new("FOO").expect("env"),
+            "bar".to_string(),
+        )];
+
+        let inputs = super::up_translator_inputs(&cfg, &opts);
+
+        assert_eq!(inputs.cli_vcpus, Some(7));
+        assert_eq!(inputs.cli_mem_mib, super::config::MiB::new(2048));
+        assert_eq!(inputs.cli_disk_gib, super::config::GiB::new(50));
+        assert_eq!(inputs.cli_post_start.as_deref(), Some("echo hi"));
+        assert_eq!(
+            inputs.cli_guest_env_keys,
+            vec![super::guest_env_state::EnvVarName::new("FOO").unwrap()]
+        );
+        assert_eq!(inputs.cli_forward_ports.len(), 1);
+        assert_eq!(inputs.cli_mounts.len(), 1);
+        // ProfileImageTarget::new sorts and dedups, so order is canonical.
+        assert_eq!(inputs.cli_profiles, vec!["node", "python"]);
+        assert!(inputs.persisted_guest_user.is_some());
+        assert!(inputs.cli_workspace_or_git_repo);
+    }
+
+    #[test]
+    fn bytes_to_gib_truncates_to_whole_gibibytes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(super::bytes_to_gib(0), 0);
+        assert_eq!(super::bytes_to_gib(GIB), 1);
+        assert_eq!(
+            super::bytes_to_gib(GIB - 1),
+            0,
+            "just under 1 GiB rounds down"
+        );
+        assert_eq!(
+            super::bytes_to_gib(2 * GIB + 512 * 1024 * 1024),
+            2,
+            "2.5 GiB truncates toward zero"
+        );
+    }
+
+    #[test]
+    fn project_dir_to_str_returns_the_path_string() {
+        let s = super::project_dir_to_str(std::path::Path::new("/home/alice/project"))
+            .expect("utf8 path");
+        assert_eq!(s, "/home/alice/project");
+    }
+
+    fn instance_named(name: &str, dir: &std::path::Path) -> super::config::Instance {
+        super::config::Instance {
+            name: super::config::InstanceName::new(name).expect("valid name"),
+            index: super::config::InstanceIndex::new(0).expect("0 in range"),
+            dir: dir.to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
+                .expect("DEFAULT_IMAGE is valid"),
+        }
+    }
+
+    #[test]
+    fn creation_options_rejected_message_names_instance_and_recovery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inst = instance_named("demo", tmp.path());
+        let msg = super::creation_options_rejected_message(&inst);
+        assert!(msg.contains("demo"), "{msg}");
+        assert!(msg.contains("coop destroy demo"), "{msg}");
+        assert!(msg.contains("already exists"), "{msg}");
+    }
+
+    /// `ensure_up_existing_inputs_are_compatible` must accept an `--image`
+    /// that matches the existing instance's image (the guard only rejects a
+    /// *different* image). Pins the `!=` comparison at the image check.
+    #[test]
+    fn up_existing_accepts_matching_image() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        let inst = cfg
+            .allocate_instance(None, &img, Some(&project))
+            .expect("inst");
+
+        let mut opts = up_opts_for_tests(project.to_str());
+        opts.image = Some(inst.image.clone());
+
+        // No workspace state is written, so the transport check short-circuits
+        // to Ok after the (passing) image/creation checks.
+        super::ensure_up_existing_inputs_are_compatible(
+            &inst,
+            super::ProjectTransport::Copy,
+            &opts,
+        )
+        .expect("matching image is compatible");
+    }
+
+    /// Each creation-only flag, set *alone*, must independently trigger the
+    /// rejection. This pins every `||` in the creation-flag chain (a `&&` flip
+    /// on any one term would let that flag slip through) plus the `!` on the
+    /// `extra_mount` emptiness test.
+    #[test]
+    fn up_existing_rejects_each_creation_flag_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        let inst = cfg
+            .allocate_instance(None, &img, Some(&project))
+            .expect("inst");
+        let mount_dir = tmp.path().join("mnt");
+        std::fs::create_dir(&mount_dir).expect("mnt");
+        let dc = tmp.path().join("devcontainer.json");
+
+        let reject = |opts: &super::UpOpts<'_>| {
+            super::ensure_up_existing_inputs_are_compatible(
+                &inst,
+                super::ProjectTransport::Copy,
+                opts,
+            )
+        };
+
+        let mut opts = up_opts_for_tests(project.to_str());
+        opts.mem = super::config::MiB::new(2048);
+        reject(&opts).expect_err("--mem must be rejected");
+
+        let mut opts = up_opts_for_tests(project.to_str());
+        opts.vcpus = Some(4);
+        reject(&opts).expect_err("--vcpus must be rejected");
+
+        let mut opts = up_opts_for_tests(project.to_str());
+        opts.runtime.exclude_git = true;
+        reject(&opts).expect_err("--exclude-git must be rejected");
+
+        let mut opts = up_opts_for_tests(project.to_str());
+        opts.extra_mount =
+            vec![super::config::Mount::parse(mount_dir.to_str().unwrap()).expect("mount")];
+        reject(&opts).expect_err("--extra-mount must be rejected");
+
+        let mut opts = up_opts_for_tests(project.to_str());
+        opts.devcontainer.input = super::DevcontainerInput::Explicit(dc);
+        reject(&opts).expect_err("--devcontainer must be rejected");
+    }
+
+    /// When the stored transport matches the requested one, the check passes.
+    /// Pins the `existing != transport` comparison (an `==` flip would reject
+    /// a matching transport).
+    #[test]
+    fn up_existing_accepts_matching_transport() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        let canonical = project.canonicalize().expect("canonicalize");
+        let inst = cfg
+            .allocate_instance(None, &img, Some(&canonical))
+            .expect("inst");
+        write_workspace_state(&inst, &canonical);
+
+        let opts = up_opts_for_tests(project.to_str());
+        super::ensure_up_existing_inputs_are_compatible(
+            &inst,
+            super::ProjectTransport::Copy,
+            &opts,
+        )
+        .expect("matching copy transport is compatible");
+    }
+
+    #[test]
+    fn up_existing_git_repo_accepts_matching_image_and_profile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+
+        // Matching --image is compatible.
+        let inst = cfg
+            .allocate_instance(None, &super::config::default_image_name(), None)
+            .expect("inst");
+        let mut opts = up_opts_for_tests(None);
+        opts.image = Some(inst.image.clone());
+        super::ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, &opts)
+            .expect("matching image is compatible");
+
+        // A profile target whose derived image matches is compatible too.
+        let target = super::ProfileImageTarget::new(&["node".to_string()]).expect("target");
+        let profile_inst = cfg
+            .allocate_instance(
+                Some(&super::config::InstanceName::new("withprofile").unwrap()),
+                &target.image,
+                None,
+            )
+            .expect("inst");
+        let mut opts = up_opts_for_tests(None);
+        opts.profile_target = Some(target);
+        super::ensure_up_existing_inputs_are_compatible_for_git_repo(&profile_inst, &opts)
+            .expect("matching profile image is compatible");
+    }
+
+    #[test]
+    fn up_existing_git_repo_rejects_each_creation_flag_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let inst = cfg
+            .allocate_instance(None, &super::config::default_image_name(), None)
+            .expect("inst");
+        let mount_dir = tmp.path().join("mnt");
+        std::fs::create_dir(&mount_dir).expect("mnt");
+        let dc = tmp.path().join("devcontainer.json");
+
+        let mut opts = up_opts_for_tests(None);
+        opts.mem = super::config::MiB::new(2048);
+        super::ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, &opts)
+            .expect_err("--mem must be rejected");
+
+        let mut opts = up_opts_for_tests(None);
+        opts.extra_mount =
+            vec![super::config::Mount::parse(mount_dir.to_str().unwrap()).expect("mount")];
+        super::ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, &opts)
+            .expect_err("--extra-mount must be rejected");
+
+        let mut opts = up_opts_for_tests(None);
+        opts.devcontainer.input = super::DevcontainerInput::Explicit(dc);
+        super::ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, &opts)
+            .expect_err("--devcontainer must be rejected");
+    }
+
+    #[test]
+    fn up_has_restart_only_inputs_detects_each_flag() {
+        // None set → false (pins the whole-body `true` mutant).
+        let none = up_opts_for_tests(None);
+        assert!(!super::up_has_restart_only_inputs(&none));
+
+        let mut no_agents = up_opts_for_tests(None);
+        no_agents.runtime.no_agents = true;
+        assert!(super::up_has_restart_only_inputs(&no_agents));
+
+        let mut ports = up_opts_for_tests(None);
+        ports.runtime.forward_ports = vec![super::config::PortForward::parse("3000").unwrap()];
+        assert!(super::up_has_restart_only_inputs(&ports));
+
+        let mut post = up_opts_for_tests(None);
+        post.runtime.post_start = Some("echo hi".to_string());
+        assert!(super::up_has_restart_only_inputs(&post));
+
+        let mut env = up_opts_for_tests(None);
+        env.runtime.guest_env = vec![(
+            super::guest_env_state::EnvVarName::new("K").unwrap(),
+            "v".to_string(),
+        )];
+        assert!(super::up_has_restart_only_inputs(&env));
     }
 }

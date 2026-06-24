@@ -731,6 +731,11 @@ where
 /// failures, backend/VM operations, SSH, network, and filesystem errors all
 /// bubble up here for `main` to report.
 #[expect(clippy::too_many_lines, reason = "CLI dispatch — flat match arms")]
+// Scoped out of mutation testing: pure arg dispatch to the cmd_* handlers,
+// unobservable from a `--lib` test. exclude_re cannot suppress its
+// `delete field … from struct devcontainer::TranslatorInputs` mutants
+// (see the note in .cargo/mutants.toml), so skip the whole body here.
+#[mutants::skip]
 pub fn run() -> Result<()> {
     // Dynamic shell completion: when invoked with COMPLETE=<shell>, compute
     // candidates and exit before doing anything else (no tracing init, no

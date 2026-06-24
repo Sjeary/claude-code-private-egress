@@ -147,6 +147,96 @@ mod tests {
         assert_eq!(v["j"], "/* not a comment */");
     }
 
+    #[test]
+    fn jsonc_escaped_quote_does_not_close_the_string() {
+        // The escape branch exists so a `\"` does not close the string. Its
+        // effect is only observable through later string-state tracking, so
+        // this case puts a trailing comma right after the escaped-quote
+        // string: the comma must be seen as outside the string (and dropped
+        // before `}`), which only holds if the `\"` was correctly skipped.
+        // Pins the `i + 1 < len` guard and the `bytes[i + 1]` lookahead — a
+        // flip there mis-tracks the string and leaves serde an invalid
+        // trailing comma or a bad `\v` escape.
+        let src = r#"{ "k": "v\"", }"#;
+        let json = jsonc_to_json(src);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["k"], "v\"");
+    }
+
+    #[test]
+    fn jsonc_trailing_lone_slash_is_not_a_comment() {
+        // A `/` as the final byte (no following `/` or `*`) must be emitted
+        // verbatim, not treated as a comment opener. Pins the `i + 1 < len`
+        // guard on both comment arms: an `&&`→`||` or `<`→`<=` flip there
+        // reads `bytes[i + 1]` out of bounds at EOF.
+        let src = "{ }/";
+        let json = jsonc_to_json(src);
+        assert_eq!(json, "{ }/");
+    }
+
+    #[test]
+    fn jsonc_unterminated_block_comment_is_consumed_to_eof() {
+        // A `/*` with no closing `*/` must drive the scanner to EOF without
+        // panicking. The scan loop stops at `i + 1 == len`, and because the
+        // terminate-skip guard (`if i + 1 < len`) is then false, the single
+        // final byte (`d`) is re-read by the outer loop and emitted. Pinning
+        // that exact output guards the `i + 1` boundary in the scan/skip
+        // guards: a `<`→`<=`, `&&`→`||`, or `+`→`-` flip there either reads
+        // out of bounds (panic) or drops/keeps a different number of bytes.
+        let src = "{ \"k\": 1 /* dangling comment never closed";
+        let json = jsonc_to_json(src);
+        assert_eq!(json, "{ \"k\": 1 d");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&json).is_err(),
+            "unterminated input must surface as a serde error, got: {json}"
+        );
+    }
+
+    #[test]
+    fn jsonc_block_comment_strips_exactly_the_comment_span() {
+        // Content on both sides of a block comment must survive verbatim and
+        // the comment span must be dropped exactly. The `/*` sits at index 1,
+        // so this pins the scan's index arithmetic precisely: the `i += 2`
+        // entry step (a `-=` flip underflows here), and the `&&` in the scan
+        // loop's continue condition (an `||` flip runs the scan past the
+        // closing `*/` and swallows the trailing `b`).
+        assert_eq!(jsonc_to_json("a/* c */b"), "ab");
+    }
+
+    #[test]
+    fn jsonc_block_comment_with_inner_star_terminates_only_at_slash() {
+        // A `*` inside the comment body (here the jsdoc-style `/** … **/`)
+        // must NOT end the comment — only the `*` immediately followed by `/`
+        // does. Pins the inner `&&` of the terminator test: an `||` flip would
+        // stop at the first `*`, leaking the rest of the comment into output.
+        assert_eq!(jsonc_to_json("a/** b **/c"), "ac");
+    }
+
+    #[test]
+    fn jsonc_block_comment_closed_at_eof_terminates() {
+        // The closing `*/` is the final two bytes — exercises the
+        // `i + 1 < len` terminate guard at the very end of input.
+        let src = r#"{ "k": 1 }/**/"#;
+        let json = jsonc_to_json(src);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["k"], 1);
+    }
+
+    #[test]
+    fn jsonc_trailing_backslash_in_string_at_eof_does_not_panic() {
+        // A string whose final byte is a lone `\` (escape with no following
+        // byte) must not index past the end. The string is left unterminated,
+        // which serde then rejects.
+        let src = "{ \"k\": \"oops\\";
+        let json = jsonc_to_json(src);
+        // The lone backslash is emitted verbatim; no out-of-bounds read.
+        assert_eq!(json, "{ \"k\": \"oops\\");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&json).is_err(),
+            "unterminated escaped string must surface as a serde error, got: {json}"
+        );
+    }
+
     proptest! {
         /// The scanner must never panic on arbitrary input — `devcontainer.json`
         /// is hand-edited and untrusted. This mirrors the standing fuzz target
