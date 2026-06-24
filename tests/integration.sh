@@ -826,6 +826,31 @@ test_codex_bin_path() {
     fi
 }
 
+test_codex_sandbox_bypass() {
+    echo ""
+    echo "=== Phase: codex sandbox bypass (issue #353) ==="
+
+    # `coop codex` runs Codex unrestricted by prepending the global flag
+    # `--dangerously-bypass-approvals-and-sandbox` (as `codex <flag> <args>`),
+    # for parity with `coop claude`'s bypassPermissions. The VM is the isolation
+    # boundary and Codex's own Linux sandbox does not work in the guest, so every
+    # shell command Codex would otherwise run fails on sandbox setup.
+    #
+    # A full agentic run that actually spawns a sandboxed shell command needs model
+    # credentials the CI guest doesn't have (Codex only reaches sandbox setup after
+    # a model turn), so we can't drive a live tool call here. Instead we pin the
+    # coop<->Codex contract: the installed Codex must accept that exact flag in the
+    # global position coop uses. If a Codex release renames or moves it, this fails
+    # loudly rather than silently re-enabling the broken sandbox.
+    if moat_exec /usr/local/bin/codex --dangerously-bypass-approvals-and-sandbox \
+        exec --help >/dev/null; then
+        pass "codex accepts global --dangerously-bypass-approvals-and-sandbox flag"
+    else
+        fail "codex accepts global --dangerously-bypass-approvals-and-sandbox flag" \
+            "stderr: $(guest_stderr)"
+    fi
+}
+
 test_github_token_forwarding() {
     echo ""
     echo "=== Phase: github token forwarding ==="
@@ -4172,6 +4197,7 @@ main() {
     test_exec
     test_claude_bin_path
     test_codex_bin_path
+    test_codex_sandbox_bypass
     test_github_token_forwarding
     test_term_handling
     test_guest_environment

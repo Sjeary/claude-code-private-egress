@@ -1430,6 +1430,22 @@ pub(crate) fn prepend_binary(binary: &str, args: Vec<String>) -> Vec<String> {
     command
 }
 
+/// Codex's flag for running fully unrestricted (no sandbox, no approvals).
+const CODEX_BYPASS_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
+
+/// Prepend Codex's sandbox-bypass flag unless the user opted into approvals.
+///
+/// The VM is the isolation boundary, so Codex's own sandbox is redundant — and
+/// broken in the guest, which lacks a working bubblewrap. Bypassing by default
+/// gives `coop codex` parity with `coop claude`'s `bypassPermissions`. `ask`
+/// (from `--ask`) keeps Codex's sandbox and approval prompts.
+pub(crate) fn codex_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> {
+    if !ask {
+        args.insert(0, CODEX_BYPASS_FLAG.to_string());
+    }
+    args
+}
+
 pub(crate) fn cmd_exec(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -1829,6 +1845,31 @@ mod tests {
     fn prepend_binary_with_no_args() {
         let cmd = super::prepend_binary("/usr/bin/codex", Vec::new());
         assert_eq!(cmd, vec!["/usr/bin/codex"]);
+    }
+
+    #[test]
+    fn codex_launch_args_bypasses_sandbox_by_default() {
+        let args = super::codex_launch_args(false, vec!["--model".into(), "gpt-5".into()]);
+        assert_eq!(
+            args,
+            vec![
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "gpt-5"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_launch_args_with_ask_keeps_sandbox() {
+        let args = super::codex_launch_args(true, vec!["--model".into(), "gpt-5".into()]);
+        assert_eq!(args, vec!["--model", "gpt-5"]);
+    }
+
+    #[test]
+    fn codex_launch_args_bypass_flag_leads_empty_args() {
+        let args = super::codex_launch_args(false, Vec::new());
+        assert_eq!(args, vec!["--dangerously-bypass-approvals-and-sandbox"]);
     }
 
     #[test]
