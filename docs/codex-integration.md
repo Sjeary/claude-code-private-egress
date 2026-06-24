@@ -8,7 +8,15 @@ coop installs Codex into every guest image and gives you a dedicated `coop codex
 coop codex [instance-name] [-- extra-args...]
 ```
 
-This SSHes into the guest and runs the `codex` CLI.
+This SSHes into the guest and runs the `codex` CLI. By default coop passes `--dangerously-bypass-approvals-and-sandbox`, so Codex runs without its sandbox or approval prompts — parity with how `coop claude` runs unrestricted. The VM is the isolation boundary, so Codex's own sandbox is redundant; it also does not work in the guest, which lacks a functioning bubblewrap, so leaving it enabled makes every shell command Codex runs fail.
+
+To keep Codex's sandbox and approval prompts for a single session, pass `--ask`. coop then launches `codex` with no bypass flag, so Codex applies its normal defaults:
+
+```bash
+coop codex --ask
+```
+
+Use `--ask` too if you want to supply your own sandbox or approval flags (`--sandbox`, `-a`) as trailing arguments — otherwise coop's bypass flag takes precedence.
 
 Trailing arguments go straight through to the `codex` CLI:
 

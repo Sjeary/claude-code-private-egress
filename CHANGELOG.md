@@ -4,6 +4,13 @@
 
 ### New features
 
+- **`coop codex` bypasses Codex's sandbox by default** (#353) — `coop codex`
+  now launches Codex with `--dangerously-bypass-approvals-and-sandbox`, so it
+  runs unrestricted like `coop claude`. The VM is the isolation boundary, and
+  Codex's Linux sandbox does not work in the guest (no functioning bubblewrap),
+  which previously made every shell command Codex ran fail on sandbox setup.
+  Pass `coop codex --ask` to keep Codex's sandbox and approval prompts.
+
 - **`coop commit` + `coop restore` — checkpoint and roll back an instance** (#289) —
   `coop commit <name> --image <image>` saves a stopped instance's
   filesystem as a reusable image, a `docker container commit`-style

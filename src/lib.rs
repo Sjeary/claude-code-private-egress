@@ -69,8 +69,8 @@ use commands::{
     apply_vm_overrides, cmd_commit, cmd_destroy, cmd_devcontainer, cmd_devcontainer_check,
     cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_profiles, cmd_quickstart, cmd_resize,
     cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
-    open_ssh_session, preflight_start_target, prepend_binary, resolve_devcontainer,
-    resolve_running,
+    codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
+    resolve_devcontainer, resolve_running,
 };
 
 #[derive(Parser)]
@@ -350,7 +350,7 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Launch Codex inside the VM
+    /// Launch Codex inside the VM (bypasses the sandbox and approvals by default)
     Codex {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -358,6 +358,9 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
+        /// Keep Codex's sandbox and approval prompts instead of bypassing them
+        #[arg(long)]
+        ask: bool,
         /// Extra arguments passed to `codex`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -1066,8 +1069,9 @@ pub fn run() -> Result<()> {
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
-        Commands::Codex { name, args } => {
+        Commands::Codex { name, ask, args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let args = codex_launch_args(ask, args);
             ssh::run_interactive(&sess, &prepend_binary(guest::codex_bin().as_ref(), args))
         }
         Commands::Stop { name } => {
@@ -1382,13 +1386,24 @@ mod tests {
     #[test]
     fn codex_name_and_trailing_args_parse() {
         let cli = parse(&["codex", "myvm", "--", "--model", "gpt-5"]);
-        let super::Commands::Codex { name, args, .. } = cli.command else {
+        let super::Commands::Codex { name, ask, args } = cli.command else {
             panic!("expected Codex variant");
         };
         assert_eq!(
             name.as_ref().map(super::config::InstanceName::as_str),
             Some("myvm")
         );
+        assert!(!ask, "ask defaults to false (sandbox bypassed)");
+        assert_eq!(args, vec!["--model", "gpt-5"]);
+    }
+
+    #[test]
+    fn codex_ask_flag_parses() {
+        let cli = parse(&["codex", "myvm", "--ask", "--", "--model", "gpt-5"]);
+        let super::Commands::Codex { ask, args, .. } = cli.command else {
+            panic!("expected Codex variant");
+        };
+        assert!(ask, "--ask keeps Codex's sandbox and approvals");
         assert_eq!(args, vec!["--model", "gpt-5"]);
     }
 
