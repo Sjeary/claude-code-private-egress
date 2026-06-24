@@ -134,13 +134,7 @@ pub fn create_instance(
     }
 
     tracing::info!("Creating instance '{}' from template", inst.name);
-    Cmd::new("cp")
-        .arg("--reflink=auto")
-        .arg(&template)
-        .arg(&rootfs)
-        .sudo()
-        .run()
-        .context("Failed to copy template to instance")?;
+    reflink_copy(&template, &rootfs).context("Failed to copy template to instance")?;
 
     // Resize if requested and larger than template
     if let Some(requested) = disk_gib {
@@ -208,6 +202,69 @@ pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()
     Cmd::new("e2fsck").arg("-fy").arg(&rootfs).sudo().run()?;
     Cmd::new("resize2fs").arg(&rootfs).sudo().run()?;
     tracing::info!("Resize complete");
+    Ok(())
+}
+
+/// Reflink-friendly copy of a rootfs image (`CoW` where the filesystem
+/// supports it, full copy otherwise). Runs as root because instance and
+/// template rootfs files are root-owned on Firecracker.
+fn reflink_copy(src: &Path, dst: &Path) -> Result<()> {
+    Cmd::new("cp")
+        .arg("--reflink=auto")
+        .arg(src)
+        .arg(dst)
+        .sudo()
+        .run()
+        .with_context(|| format!("Failed to copy {} -> {}", src.display(), dst.display()))
+}
+
+/// Save a stopped instance's rootfs as image `image`'s template.
+///
+/// The inverse of [`create_instance`]: reflink-copies the instance
+/// `rootfs.ext4` to the image's `rootfs-template.ext4`. The caller has
+/// already gated on the instance being stopped (filesystem consistency)
+/// and decided whether overwriting an existing image is allowed.
+pub fn commit_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
+    let rootfs = inst.rootfs_path();
+    if !rootfs.exists() {
+        bail!("Instance rootfs not found at {}", rootfs.display());
+    }
+
+    let image_dir = cfg.image_dir(image);
+    fs::create_dir_all(&image_dir)
+        .with_context(|| format!("Failed to create image dir {}", image_dir.display()))?;
+
+    let template = cfg.template_path_for(image);
+    // Remove an existing (root-owned) template so the copy is a clean
+    // overwrite rather than appending to or failing on the old file.
+    if template.exists() {
+        Cmd::new("rm").arg("-f").arg(&template).sudo().run()?;
+    }
+
+    tracing::info!("Committing instance '{}' to image '{image}'", inst.name);
+    reflink_copy(&rootfs, &template)
+}
+
+/// Replace a stopped instance's rootfs with image `image`'s template.
+///
+/// Mirrors [`create_instance`]'s copy + network-patch, but sources the
+/// rootfs from an arbitrary image rather than the instance's origin
+/// image. The network config is re-patched for this instance's IP,
+/// overwriting whatever address the template baked in at commit time.
+pub fn restore_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
+    let template = cfg.template_path_for(image);
+    if !template.exists() {
+        bail!("No image '{image}' found at {}.", template.display(),);
+    }
+
+    let rootfs = inst.rootfs_path();
+    if rootfs.exists() {
+        Cmd::new("rm").arg("-f").arg(&rootfs).sudo().run()?;
+    }
+
+    tracing::info!("Restoring instance '{}' from image '{image}'", inst.name);
+    reflink_copy(&template, &rootfs)?;
+    patch_guest_network(inst)?;
     Ok(())
 }
 

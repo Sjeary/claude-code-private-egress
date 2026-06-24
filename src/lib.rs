@@ -66,9 +66,9 @@ use backend::VmBackend as _;
 use commands::{
     DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
     StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts, apply_runtime_guest_env,
-    apply_vm_overrides, cmd_destroy, cmd_devcontainer, cmd_devcontainer_check, cmd_exec,
-    cmd_github, cmd_images, cmd_init, cmd_list, cmd_profiles, cmd_quickstart, cmd_resize,
-    cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
+    apply_vm_overrides, cmd_commit, cmd_destroy, cmd_devcontainer, cmd_devcontainer_check,
+    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_profiles, cmd_quickstart, cmd_resize,
+    cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
     open_ssh_session, preflight_start_target, prepend_binary, resolve_devcontainer,
     resolve_running,
 };
@@ -510,6 +510,38 @@ enum Commands {
         /// New size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
         #[arg(long, required = true, value_parser = config::DiskSize::parse)]
         size: config::DiskSize,
+    },
+    /// Save a stopped instance's filesystem as a reusable image
+    Commit {
+        /// Instance name (required if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Name of the image to create
+        #[arg(long, required = true, value_parser = config::ImageName::new)]
+        image: config::ImageName,
+        /// Overwrite an existing image with the same name
+        #[arg(long)]
+        force: bool,
+    },
+    /// Roll a stopped instance back to an image's filesystem in place
+    Restore {
+        /// Instance name (required if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Name of the image to restore from
+        #[arg(
+            long,
+            required = true,
+            value_parser = config::ImageName::new,
+            add = ArgValueCandidates::new(completions::image_candidates),
+        )]
+        image: config::ImageName,
     },
     /// List or inspect available profiles
     Profiles {
@@ -1098,6 +1130,10 @@ pub fn run() -> Result<()> {
         }
         Commands::Images { delete } => cmd_images(&be, &cfg, delete.as_ref()),
         Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_ref(), size),
+        Commands::Commit { name, image, force } => {
+            cmd_commit(&be, &cfg, name.as_ref(), &image, force)
+        }
+        Commands::Restore { name, image } => cmd_restore(&be, &cfg, name.as_ref(), &image),
         Commands::Profiles { action } => {
             cmd_profiles(&cfg, &action.unwrap_or(ProfilesAction::List))
         }
@@ -1251,6 +1287,53 @@ mod tests {
             parse(&["ssh-config"]).command,
             super::Commands::SshConfig { .. }
         ));
+    }
+
+    #[test]
+    fn commit_parses_name_image_and_force() {
+        let cli = parse(&["commit", "myvm", "--image", "safe-point", "--force"]);
+        let super::Commands::Commit { name, image, force } = cli.command else {
+            panic!("expected Commit variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
+        assert_eq!(image.as_str(), "safe-point");
+        assert!(force);
+    }
+
+    #[test]
+    fn commit_force_defaults_off_and_image_required() {
+        let cli = parse(&["commit", "--image", "snap"]);
+        let super::Commands::Commit { name, force, .. } = cli.command else {
+            panic!("expected Commit variant");
+        };
+        assert!(name.is_none());
+        assert!(!force);
+        // `--image` is mandatory.
+        assert!(
+            parse_err(&["commit", "myvm"]).kind()
+                == clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn restore_parses_name_and_image() {
+        let cli = parse(&["restore", "myvm", "--image", "safe-point"]);
+        let super::Commands::Restore { name, image } = cli.command else {
+            panic!("expected Restore variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
+        assert_eq!(image.as_str(), "safe-point");
+        // `--image` is mandatory; `restore` has no `--force`.
+        assert!(
+            parse_err(&["restore", "myvm"]).kind()
+                == clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

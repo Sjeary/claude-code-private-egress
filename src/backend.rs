@@ -768,6 +768,27 @@ pub trait VmBackend: std::fmt::Display {
         stopped: &StoppedInstance,
         new_size: crate::config::GiB,
     ) -> Result<()>;
+    /// Save a stopped instance's filesystem as image `image` (the
+    /// backend-specific disk artifacts only — the caller carries over
+    /// the shared `template-config.json`). Takes a [`StoppedInstance`]
+    /// proof so the "must be stopped" precondition (filesystem
+    /// consistency) is enforced by the type system. Overwriting an
+    /// existing image is the caller's decision, gated before this call.
+    fn commit_disk(
+        &self,
+        cfg: &CoopConfig,
+        stopped: &StoppedInstance,
+        image: &ImageName,
+    ) -> Result<()>;
+    /// Replace a stopped instance's disk with image `image`'s template,
+    /// leaving the instance otherwise intact. The dual of
+    /// [`Self::commit_disk`]; like it, gated on a [`StoppedInstance`].
+    fn restore_disk(
+        &self,
+        cfg: &CoopConfig,
+        stopped: &StoppedInstance,
+        image: &ImageName,
+    ) -> Result<()>;
     fn is_running(&self, inst: &Instance) -> bool;
     /// Probe the live state of `inst`, returning a `RunningInstance`
     /// when it is up. This is the single chokepoint for "is this VM
@@ -937,6 +958,24 @@ impl VmBackend for FirecrackerBackend {
         crate::setup::resize_rootfs(stopped.instance(), new_size)
     }
 
+    fn commit_disk(
+        &self,
+        cfg: &CoopConfig,
+        stopped: &StoppedInstance,
+        image: &ImageName,
+    ) -> Result<()> {
+        crate::setup::commit_instance_rootfs(cfg, stopped.instance(), image)
+    }
+
+    fn restore_disk(
+        &self,
+        cfg: &CoopConfig,
+        stopped: &StoppedInstance,
+        image: &ImageName,
+    ) -> Result<()> {
+        crate::setup::restore_instance_rootfs(cfg, stopped.instance(), image)
+    }
+
     fn is_running(&self, inst: &Instance) -> bool {
         inst.is_running()
     }
@@ -1083,6 +1122,24 @@ impl VmBackend for LimaBackend {
         new_size: crate::config::GiB,
     ) -> Result<()> {
         crate::lima::resize_disk(cfg, stopped.instance(), new_size)
+    }
+
+    fn commit_disk(
+        &self,
+        cfg: &CoopConfig,
+        stopped: &StoppedInstance,
+        image: &ImageName,
+    ) -> Result<()> {
+        crate::lima::commit_disk(cfg, stopped.instance(), image)
+    }
+
+    fn restore_disk(
+        &self,
+        cfg: &CoopConfig,
+        stopped: &StoppedInstance,
+        image: &ImageName,
+    ) -> Result<()> {
+        crate::lima::restore_disk(cfg, stopped.instance(), image)
     }
 
     fn is_running(&self, inst: &Instance) -> bool {

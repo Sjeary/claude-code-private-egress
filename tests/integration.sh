@@ -1519,6 +1519,125 @@ test_resize_status() {
     fi
 }
 
+test_commit_restore() {
+    echo ""
+    echo "=== Phase: commit + restore ==="
+
+    # The instance is stopped from earlier phases. commit/restore both
+    # require a stopped instance for filesystem consistency.
+    local snap="snap-$$"
+
+    # Commit the stopped instance's filesystem as a new image.
+    if coop commit "$INSTANCE" --image "$snap"; then
+        pass "commit exits 0"
+    else
+        fail "commit exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        return
+    fi
+
+    # The committed image is an ordinary image — `coop images` lists it.
+    if coop images && echo "$HARNESS_OUT" | grep -q "$snap"; then
+        pass "images lists committed image '$snap'"
+    else
+        fail "images lists committed image '$snap'" "output: $HARNESS_OUT"
+    fi
+
+    # Committing onto an existing name without --force is refused.
+    if moat_fails commit "$INSTANCE" --image "$snap"; then
+        pass "commit without --force refuses to overwrite"
+        if echo "$HARNESS_ERR" | grep -qi "already exists\|--force"; then
+            pass "overwrite error suggests --force"
+        else
+            fail "overwrite error suggests --force" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "commit without --force refuses to overwrite" "should have failed"
+    fi
+
+    # --force overwrites the existing image.
+    if coop commit "$INSTANCE" --image "$snap" --force; then
+        pass "commit --force overwrites existing image"
+    else
+        fail "commit --force overwrites existing image" "exit code: $?; stderr: $HARNESS_ERR"
+    fi
+
+    # Restore rolls the instance back to the committed image in place.
+    if coop restore "$INSTANCE" --image "$snap"; then
+        pass "restore exits 0"
+    else
+        fail "restore exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+    fi
+
+    # Status lineage now tracks the restored image.
+    if coop status "$INSTANCE" 2>/dev/null && echo "$HARNESS_OUT" | grep -q "$snap"; then
+        pass "status shows restored image '$snap'"
+    else
+        fail "status shows restored image '$snap'" "output: $HARNESS_OUT"
+    fi
+
+    # Restoring a non-existent image fails with a clear message.
+    if moat_fails restore "$INSTANCE" --image "no-such-image-$$"; then
+        pass "restore rejects unknown image"
+    else
+        fail "restore rejects unknown image" "should have failed"
+    fi
+
+    # The central claim: a committed image is a usable image. Boot the
+    # instance from the just-restored committed disk and confirm the guest
+    # is reachable — this exercises the re-patched guest network and proves
+    # the committed rootfs actually boots, not merely that it's listed.
+    if coop start "$INSTANCE" --no-agents >/dev/null 2>&1; then
+        if coop status "$INSTANCE" && echo "$HARNESS_OUT" | grep -qi "running"; then
+            pass "instance boots from restored committed image"
+        else
+            fail "instance boots from restored committed image" "status: $HARNESS_OUT"
+        fi
+
+        GUEST_INSTANCE="$INSTANCE"
+        local snap_hostname
+        snap_hostname=$(guest_exec hostname) || snap_hostname=""
+        unset GUEST_INSTANCE
+        if [[ -n "$snap_hostname" ]]; then
+            pass "guest reachable after restore from committed image"
+        else
+            fail "guest reachable after restore from committed image" "no response"
+        fi
+
+        # commit/restore on a running instance must be refused.
+        if moat_fails commit "$INSTANCE" --image "$snap-live"; then
+            pass "commit refuses a running instance"
+            if echo "$HARNESS_ERR" | grep -qi "running\|stop"; then
+                pass "commit error tells the user to stop first"
+            else
+                fail "commit error tells the user to stop first" "stderr: $HARNESS_ERR"
+            fi
+        else
+            fail "commit refuses a running instance" "should have failed"
+            coop images --delete "$snap-live" 2>/dev/null || true
+        fi
+
+        coop stop "$INSTANCE" >/dev/null 2>&1 || true
+    else
+        skip "instance boots from restored committed image" "could not start instance"
+    fi
+
+    # Roll lineage back to the default image before deleting the snapshot,
+    # so the instance isn't left pointing at a deleted image for the
+    # restart/destroy phases that follow.
+    if coop restore "$INSTANCE" --image default; then
+        pass "restore back to default image exits 0"
+    else
+        fail "restore back to default image exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+    fi
+
+    # Clean up the committed image.
+    if coop images --delete "$snap"; then
+        pass "delete committed image exits 0"
+    else
+        fail "delete committed image exits 0" "exit code: $?"
+    fi
+}
+
 test_restart_stopped() {
     echo ""
     echo "=== Phase: restart stopped instance ==="
@@ -4070,6 +4189,7 @@ main() {
     test_status_stopped
     test_list_stopped
     test_resize_status
+    test_commit_restore
     test_restart_stopped
     test_restart_rejects_ignored_flags
     test_destroy
