@@ -61,6 +61,15 @@ if [[ -z "$BINARY" ]]; then
     exit 1
 fi
 
+# Detach from the controlling terminal's stdin. coop gates interactive prompts
+# (e.g. the discovered-devcontainer confirmation) on stdin being a TTY, falling
+# back to a non-TTY error that the suite asserts on. Under CI stdin is already
+# not a TTY, but when the suite runs from an interactive shell (the release
+# preflight) those prompts would read real keystrokes and block. Redirecting the
+# whole script makes every coop subprocess see a non-TTY stdin regardless of how
+# the suite is invoked. The script itself never reads stdin.
+exec </dev/null
+
 # ── Output helpers ────────────────────────────────────────────
 
 pass_count=0

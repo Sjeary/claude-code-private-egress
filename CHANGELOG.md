@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.5.1
+
 ### New features
 
 - **`coop ssh-config` — install a `coop-<name>` SSH alias** (#294) —
@@ -11,6 +13,11 @@
   survives `coop stop` and is refreshed on `coop start` (the Lima SSH
   port changes per boot), so it stays valid across restarts;
   `coop destroy` and `--clean` remove it.
+
+- **`coop setup --builder-timeout <duration>`** (#315) — bounds how long
+  setup waits for image-build commands before timing out. Accepts bare
+  seconds or an `s`/`m`/`h` suffix (e.g. `60m`, `2h`). Applies across
+  both backends.
 
 ### Removed
 

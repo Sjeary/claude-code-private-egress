@@ -19,6 +19,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Detach from the controlling terminal's stdin. coop gates interactive prompts
+# (here, `uninstall`'s confirmation) on stdin being a TTY. The --yes calls skip
+# it and Test 3 pins its own stdin to /dev/null, so nothing blocks today, but a
+# future prompt-bearing case run from an interactive shell (the release
+# preflight) would read real keystrokes and block — under CI stdin is already
+# not a TTY, so it would never be caught there. Redirecting the whole script
+# makes every coop subprocess see a non-TTY stdin regardless of how the suite is
+# invoked. The script itself never reads stdin.
+exec </dev/null
+
 # ── Temp workspace ───────────────────────────────────────────────────────────
 
 TMPDIR="$(mktemp -d)"
