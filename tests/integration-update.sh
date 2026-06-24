@@ -14,6 +14,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Detach from the controlling terminal's stdin. coop gates interactive prompts
+# (here, `update`'s confirmation) on stdin being a TTY. Every call below passes
+# --yes or --check so no prompt fires today, but a future prompt-bearing case
+# run from an interactive shell (the release preflight) would read real
+# keystrokes and block — under CI stdin is already not a TTY, so it would never
+# be caught there. Redirecting the whole script makes every coop subprocess see
+# a non-TTY stdin regardless of how the suite is invoked. The script itself
+# never reads stdin.
+exec </dev/null
+
 # ── Platform detection (matches install.sh / update::target_triple) ──────────
 
 detect_triple() {
