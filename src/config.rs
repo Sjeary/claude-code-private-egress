@@ -1609,6 +1609,28 @@ fn unique_instance_name(base: &str, instances: &[Instance]) -> Result<InstanceNa
 #[must_use]
 pub struct Validated(());
 
+/// Expand a leading `~` in a [`ConfigDir::Custom`] path; leave the
+/// built-in default variant untouched.
+fn expand_config_dir(dir: &mut ConfigDir) {
+    if let ConfigDir::Custom(path) = dir {
+        *path = crate::shell::expand_tilde(path);
+    }
+}
+
+/// Expand a leading `~` in each marketplace entry that is a path.
+///
+/// Marketplace entries can be a URL, a GitHub repo slug, or a host
+/// path, so only entries beginning with `~` are treated as paths.
+fn expand_marketplaces(entries: &mut [String]) {
+    for entry in entries {
+        if entry.starts_with('~') {
+            *entry = crate::shell::expand_tilde(Path::new(entry.as_str()))
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+}
+
 impl CoopConfig {
     /// Default config path: `~/.coop/config.toml`.
     pub fn default_path() -> PathBuf {
@@ -1627,31 +1649,29 @@ impl CoopConfig {
             tracing::debug!("No config file found at {}, using defaults", path.display());
             Self::default()
         };
-        if let ConfigDir::Custom(ref path) = cfg.claude.config_dir
-            && path.starts_with("~")
-        {
-            cfg.claude.config_dir = ConfigDir::Custom(crate::shell::expand_tilde(path));
-        }
-        if let ConfigDir::Custom(ref path) = cfg.codex.config_dir
-            && path.starts_with("~")
-        {
-            cfg.codex.config_dir = ConfigDir::Custom(crate::shell::expand_tilde(path));
-        }
-        cfg.claude.marketplaces = cfg
-            .claude
-            .marketplaces
-            .into_iter()
-            .map(|s| {
-                if s.starts_with('~') {
-                    crate::shell::expand_tilde(Path::new(&s))
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    s
-                }
-            })
-            .collect();
+        cfg.expand_user_paths();
         Ok(cfg)
+    }
+
+    /// Expand a leading `~` in every host path read from the config file.
+    ///
+    /// A shell expands `~` before a program sees its command-line
+    /// arguments, but values read from `config.toml` reach us verbatim —
+    /// the shell never touches them. So each host path field must be
+    /// expanded here, or a literal `~` directory (relative to the current
+    /// working directory) is used instead of the home directory. Doing it
+    /// in one place means a newly added path field is covered by adding a
+    /// single line here rather than being silently left literal.
+    fn expand_user_paths(&mut self) {
+        self.data_dir = crate::shell::expand_tilde(&self.data_dir);
+        self.firecracker_bin = crate::shell::expand_tilde(&self.firecracker_bin);
+        self.vm.kernel_path = crate::shell::expand_tilde(&self.vm.kernel_path);
+        expand_config_dir(&mut self.claude.config_dir);
+        expand_config_dir(&mut self.codex.config_dir);
+        expand_marketplaces(&mut self.claude.marketplaces);
+        for profile in self.profiles.values_mut() {
+            expand_marketplaces(&mut profile.marketplaces);
+        }
     }
 
     /// Run `validate` and surface warnings via `tracing::warn`, returning
@@ -4924,6 +4944,81 @@ skip = ["not-a-slug"]
             p.to_string_lossy().contains("/foo"),
             "should preserve path suffix, got: {}",
             p.display()
+        );
+    }
+
+    #[test]
+    fn load_expands_tilde_in_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "data_dir = \"~/coop-data\"\n").unwrap();
+
+        let cfg = CoopConfig::load(&path).unwrap();
+        assert!(
+            !cfg.data_dir.starts_with("~"),
+            "tilde should be expanded, got: {}",
+            cfg.data_dir.display()
+        );
+        assert_eq!(
+            cfg.data_dir,
+            dirs::home_dir().unwrap().join("coop-data"),
+            "should resolve to home directory"
+        );
+    }
+
+    #[test]
+    fn load_expands_tilde_in_firecracker_bin() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "firecracker_bin = \"~/bin/firecracker\"\n").unwrap();
+
+        let cfg = CoopConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.firecracker_bin,
+            dirs::home_dir().unwrap().join("bin/firecracker"),
+            "should resolve to home directory"
+        );
+    }
+
+    #[test]
+    fn load_expands_tilde_in_kernel_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[vm]\nkernel_path = \"~/kernels/vmlinux\"\n").unwrap();
+
+        let cfg = CoopConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.vm.kernel_path,
+            dirs::home_dir().unwrap().join("kernels/vmlinux"),
+            "should resolve to home directory"
+        );
+    }
+
+    #[test]
+    fn load_expands_tilde_in_profile_marketplaces() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[profiles.custom]\nmarketplaces = [\"~/my-skills\", \"owner/repo\"]\n",
+        )
+        .unwrap();
+
+        let cfg = CoopConfig::load(&path).unwrap();
+        let mps = &cfg.profiles["custom"].marketplaces;
+        assert!(
+            !mps[0].starts_with('~'),
+            "tilde should be expanded, got: {}",
+            mps[0]
+        );
+        assert!(
+            mps[0].contains("/my-skills"),
+            "should preserve path suffix, got: {}",
+            mps[0]
+        );
+        assert_eq!(
+            mps[1], "owner/repo",
+            "non-path marketplace entries should be left untouched"
         );
     }
 
