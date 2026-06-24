@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
 use std::fs;
 use std::num::NonZeroU16;
@@ -11,8 +12,10 @@ use toml::Value as TomlValue;
 
 use crate::cmd::Cmd;
 use crate::config::{
-    ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, McpServerDef, Validated,
+    ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel, McpServerDef,
+    NetworkConfig, Validated,
 };
+use crate::model_state::ModelState;
 use crate::paths::{GuestPath, HostPath};
 use crate::remote_command::RemoteCommand;
 use crate::setup::SetupOptions;
@@ -823,6 +826,12 @@ pub trait VmBackend: std::fmt::Display {
     -> Result<()>;
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget>;
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf>;
+    /// The address the guest uses to reach a server running on the host,
+    /// for rewriting local-model endpoints (see
+    /// [`crate::network::rewrite_host_url`]). Firecracker guests route
+    /// through the TAP gateway (`network.host_ip`); Lima injects
+    /// `host.lima.internal`.
+    fn guest_host_address(&self, network: &NetworkConfig) -> String;
     /// Whether mounts use live filesystem sharing (Lima/virtiofs)
     /// vs one-time sync (Firecracker/rsync).
     fn mounts_are_live(&self) -> bool;
@@ -1029,6 +1038,11 @@ impl VmBackend for FirecrackerBackend {
         Ok(inst.rootfs_path())
     }
 
+    fn guest_host_address(&self, network: &NetworkConfig) -> String {
+        // The guest's default gateway is the bridge's host IP.
+        network.host_ip.to_string()
+    }
+
     fn mounts_are_live(&self) -> bool {
         false
     }
@@ -1187,6 +1201,11 @@ impl VmBackend for LimaBackend {
         crate::lima::disk_path(inst)
     }
 
+    fn guest_host_address(&self, _network: &NetworkConfig) -> String {
+        // Lima injects this hostname into the guest, resolving to the host.
+        crate::lima::HOST_GATEWAY.to_string()
+    }
+
     fn mounts_are_live(&self) -> bool {
         true
     }
@@ -1323,11 +1342,16 @@ pub fn run_post_start(session: &SshSession, command: &str) {
 }
 
 /// Bootstrap configured guest agents in the guest declaratively.
+///
+/// `guest_host` is the backend's guest-visible host address (from
+/// [`VmBackend::guest_host_address`]), used to rewrite any local-model
+/// endpoint so the guest can reach a server running on the host.
 pub fn bootstrap_agents(
     session: &SshSession,
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     mode: BootMode,
+    guest_host: &str,
 ) -> Result<()> {
     // GitHub auth is guest-global state. Refresh it once before either
     // agent bootstrap if a token is available.
@@ -1336,8 +1360,8 @@ pub fn bootstrap_agents(
         setup_github_auth(session)?;
     }
 
-    bootstrap_claude(session, cfg, inst, mode)?;
-    bootstrap_codex(session, cfg, mode)?;
+    bootstrap_claude(session, cfg, inst, mode, guest_host)?;
+    bootstrap_codex(session, cfg, inst, mode, guest_host)?;
 
     Ok(())
 }
@@ -1360,6 +1384,7 @@ fn bootstrap_claude(
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     mode: BootMode,
+    guest_host: &str,
 ) -> Result<()> {
     let claude = &cfg.claude;
     let claude_bin = persisted_guest_user(cfg, &inst.image).claude_bin();
@@ -1388,7 +1413,12 @@ fn bootstrap_claude(
 
     // Managed permissions: pre-accept bypass mode so `coop ca` and
     // `coop claude` skip prompts without an interactive acceptance step.
-    write_managed_claude_settings(&session.target)?;
+    // The same file carries the local-model `env` block when this VM is
+    // in local mode, so the routing is refreshed on every boot and
+    // survives stop/start.
+    let model_state = ModelState::load_or_default(inst)?;
+    let local_env = claude_local_env(&model_state, cfg, guest_host)?;
+    write_managed_claude_settings(&session.target, &local_env)?;
 
     // Marketplaces, plugins, MCP servers — persisted on guest disk,
     // only install on first boot
@@ -1419,10 +1449,27 @@ fn bootstrap_claude(
 /// Codex uses `~/.codex/config.toml` for MCP registration and related
 /// settings, so bootstrap writes allowlisted user config files and a
 /// managed MCP section there when configured.
-fn bootstrap_codex(session: &SshSession, cfg: &CoopConfig, mode: BootMode) -> Result<()> {
+fn bootstrap_codex(
+    session: &SshSession,
+    cfg: &CoopConfig,
+    inst: &crate::config::Instance,
+    mode: BootMode,
+    guest_host: &str,
+) -> Result<()> {
     let codex = &cfg.codex;
     let source_dir = resolve_config_source_dir(&codex.config_dir, ".codex", "codex.config_dir");
-    let needs_codex = codex_bootstrap_needed(source_dir.as_deref(), &codex.mcp_servers);
+    let model_state = ModelState::load_or_default(inst)?;
+    let local = codex_local_table(&model_state, cfg, guest_host)?;
+    // Once coop has materialized a Codex local block (endpoint resolves,
+    // or it was materialized on a prior `local` switch), coop owns the
+    // model/provider keys in config.toml regardless of mode: it writes the
+    // provider block in local mode and rewrites a clean file in remote
+    // mode, so switching back to cloud reliably drops the block — even if
+    // the configured endpoint has since been removed.
+    let manages_local =
+        model_state.resolved_codex(codex).is_some() || model_state.codex_materialized;
+    let needs_codex =
+        codex_bootstrap_needed(source_dir.as_deref(), &codex.mcp_servers) || manages_local;
 
     if !needs_codex {
         return Ok(());
@@ -1436,7 +1483,13 @@ fn bootstrap_codex(session: &SshSession, cfg: &CoopConfig, mode: BootMode) -> Re
         bail!("{}", codex_missing_guest_cli_message());
     }
 
-    copy_codex_config(&session.target, source_dir.as_deref(), codex)?;
+    copy_codex_config(
+        &session.target,
+        source_dir.as_deref(),
+        codex,
+        local.as_ref(),
+        manages_local,
+    )?;
 
     match mode {
         BootMode::Restart => tracing::info!("Codex bootstrap refreshed"),
@@ -1648,14 +1701,24 @@ fn copy_staged_to_guest(
 /// The setting must live in user scope (`~/.claude/settings.json`) — Claude
 /// Code ignores `skipDangerousModePermissionPrompt` from project settings
 /// to prevent untrusted repositories from auto-bypassing the prompt.
-fn managed_claude_settings_json() -> String {
-    serde_json::json!({
+///
+/// When `local_env` is non-empty (the VM is in local-model mode), its
+/// entries are written into the `env` block so Claude Code routes at the
+/// local endpoint. Writing them here — rather than via SSH `SendEnv` —
+/// makes the routing launch-independent: it applies to `claude` however
+/// it is started in the guest, including a shell the user opened
+/// themselves.
+fn managed_claude_settings_json(local_env: &BTreeMap<String, String>) -> String {
+    let mut settings = serde_json::json!({
         "permissions": {
             "defaultMode": "bypassPermissions",
             "skipDangerousModePermissionPrompt": true,
         }
-    })
-    .to_string()
+    });
+    if !local_env.is_empty() {
+        settings["env"] = serde_json::json!(local_env);
+    }
+    settings.to_string()
 }
 
 /// Write coop's managed `~/.claude/settings.json` to the guest.
@@ -1663,24 +1726,79 @@ fn managed_claude_settings_json() -> String {
 /// Runs every VM startup, overwriting any in-guest edits. The file
 /// is small and owned by coop; users wanting per-VM customization should
 /// extend coop's config rather than editing the guest file in place.
-fn write_managed_claude_settings(target: &SshTarget) -> Result<()> {
+fn write_managed_claude_settings(
+    target: &SshTarget,
+    local_env: &BTreeMap<String, String>,
+) -> Result<()> {
     target.exec(RemoteCommand::new().literal("mkdir -p ~/.claude"))?;
     target
         .exec_with_stdin(
             RemoteCommand::new().literal("cat > ~/.claude/settings.json"),
-            managed_claude_settings_json().into_bytes(),
+            managed_claude_settings_json(local_env).into_bytes(),
         )
         .context("Failed to write managed ~/.claude/settings.json in guest")?;
     tracing::debug!("Wrote managed ~/.claude/settings.json to guest");
     Ok(())
 }
 
+/// The `env` block for a Claude local endpoint, with its host URL
+/// rewritten to be reachable from inside the guest. Empty when the VM is
+/// not in local mode or no Claude endpoint resolves.
+fn claude_local_env(
+    state: &ModelState,
+    cfg: &CoopConfig,
+    guest_host: &str,
+) -> Result<BTreeMap<String, String>> {
+    let Some(ep) = local_endpoint(state, state.resolved_claude(&cfg.claude)) else {
+        return Ok(BTreeMap::new());
+    };
+    let base_url = crate::network::rewrite_host_url(ep.host_url(), guest_host)?;
+    Ok(crate::model_state::claude_env_block(
+        base_url.as_str(),
+        ep.model(),
+        &ep.auth_token_or_default(),
+    ))
+}
+
+/// The Codex `config.toml` local-provider keys, with the endpoint's host
+/// URL rewritten for the guest. `None` when not in local mode or no Codex
+/// endpoint resolves.
+fn codex_local_table(
+    state: &ModelState,
+    cfg: &CoopConfig,
+    guest_host: &str,
+) -> Result<Option<toml::Table>> {
+    let Some(ep) = local_endpoint(state, state.resolved_codex(&cfg.codex)) else {
+        return Ok(None);
+    };
+    let base_url = crate::network::rewrite_host_url(ep.host_url(), guest_host)?;
+    Ok(Some(crate::model_state::codex_local_config(
+        base_url.as_str(),
+        ep.model(),
+    )))
+}
+
+/// Gate an already-resolved endpoint on the VM being in local mode. In
+/// remote mode the materialization is intentionally empty so cloud
+/// defaults apply.
+fn local_endpoint<'a>(
+    state: &ModelState,
+    resolved: Option<&'a LocalModel>,
+) -> Option<&'a LocalModel> {
+    match state.mode {
+        crate::model_state::ModelMode::Local => resolved,
+        crate::model_state::ModelMode::Remote => None,
+    }
+}
+
 fn copy_codex_config(
     target: &SshTarget,
     source_dir: Option<&Path>,
     codex: &crate::config::CodexConfig,
+    local: Option<&toml::Table>,
+    manages_local: bool,
 ) -> Result<()> {
-    let staged = stage_codex_files(source_dir, &codex.mcp_servers)
+    let staged = stage_codex_files(source_dir, &codex.mcp_servers, local, manages_local)
         .context("Failed to stage Codex config files")?;
     copy_staged_to_guest(target, &staged, ".codex", "Codex")
 }
@@ -1776,6 +1894,8 @@ const CODEX_CONFIG_FILE: &str = "config.toml";
 fn stage_codex_files(
     source_dir: Option<&Path>,
     mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+    local: Option<&toml::Table>,
+    manages_local: bool,
 ) -> Result<tempfile::TempDir> {
     let staging = tempfile::TempDir::new().context("Failed to create staging directory")?;
 
@@ -1819,8 +1939,24 @@ fn stage_codex_files(
         );
     }
 
+    if let Some(local) = local {
+        let TomlValue::Table(root) = &mut config else {
+            bail!("Codex {CODEX_CONFIG_FILE} must deserialize to a TOML table");
+        };
+        // Local-model routing overrides any model/provider the user's own
+        // config.toml set; switching back to remote drops these keys
+        // because the file is rebuilt from source each time.
+        for (key, value) in local {
+            root.insert(key.clone(), value.clone());
+        }
+    }
+
+    // `manages_local` forces a rewrite even with no other content so that
+    // switching back to remote drops a previously-written provider block.
     let should_write_config = source_dir.is_some_and(|path| path.join(CODEX_CONFIG_FILE).is_file())
-        || !mcp_servers.is_empty();
+        || !mcp_servers.is_empty()
+        || local.is_some()
+        || manages_local;
 
     if should_write_config {
         std::fs::write(
@@ -2394,7 +2530,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn managed_claude_settings_json_has_required_keys() {
-        let body = managed_claude_settings_json();
+        let body = managed_claude_settings_json(&BTreeMap::new());
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         let perms = parsed.get("permissions").unwrap();
         assert_eq!(
@@ -2407,6 +2543,42 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
                 .and_then(serde_json::Value::as_bool),
             Some(true),
         );
+    }
+
+    #[test]
+    fn managed_claude_settings_json_omits_env_block_when_remote() {
+        let body = managed_claude_settings_json(&BTreeMap::new());
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            parsed.get("env").is_none(),
+            "no env block expected in remote mode"
+        );
+    }
+
+    #[test]
+    fn managed_claude_settings_json_includes_local_env_block() {
+        let env = crate::model_state::claude_env_block(
+            "http://172.16.0.1:11434",
+            "qwen2.5-coder",
+            "coop-local",
+        );
+        let body = managed_claude_settings_json(&env);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let env_block = parsed.get("env").unwrap();
+        assert_eq!(
+            env_block
+                .get("ANTHROPIC_BASE_URL")
+                .and_then(serde_json::Value::as_str),
+            Some("http://172.16.0.1:11434"),
+        );
+        assert_eq!(
+            env_block
+                .get("ANTHROPIC_MODEL")
+                .and_then(serde_json::Value::as_str),
+            Some("qwen2.5-coder"),
+        );
+        // Permissions survive alongside the injected env.
+        assert!(parsed.get("permissions").is_some());
     }
 
     #[test]
@@ -2424,7 +2596,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             },
         );
 
-        let staging = stage_codex_files(Some(src.path()), &servers).unwrap();
+        let staging = stage_codex_files(Some(src.path()), &servers, None, false).unwrap();
         assert!(staging.path().join("AGENTS.md").is_file());
 
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
@@ -2454,7 +2626,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             },
         );
 
-        let staging = stage_codex_files(Some(src.path()), &servers).unwrap();
+        let staging = stage_codex_files(Some(src.path()), &servers, None, false).unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
 
         assert!(config.contains("model = \"gpt-5\""));
@@ -2470,11 +2642,66 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let src = tempfile::TempDir::new().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
 
-        let staging =
-            stage_codex_files(Some(src.path()), &std::collections::HashMap::new()).unwrap();
+        let staging = stage_codex_files(
+            Some(src.path()),
+            &std::collections::HashMap::new(),
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(staging.path().join("auth.json")).unwrap(),
             "{\"access_token\":\"test\"}"
+        );
+    }
+
+    #[test]
+    fn stage_codex_files_writes_local_provider_block() {
+        // No source dir, no MCP servers: the local provider block alone
+        // must still produce a config.toml.
+        let local = crate::model_state::codex_local_config(
+            "http://host.lima.internal:11434/v1/",
+            "gpt-oss:120b",
+        );
+        let staging =
+            stage_codex_files(None, &std::collections::HashMap::new(), Some(&local), true).unwrap();
+        let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
+        assert!(config.contains("model_provider = \"coop_local\""));
+        assert!(config.contains("wire_api = \"responses\""));
+        assert!(config.contains("http://host.lima.internal:11434/v1/"));
+    }
+
+    #[test]
+    fn stage_codex_files_local_overrides_source_model() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
+        let local =
+            crate::model_state::codex_local_config("http://172.16.0.1:11434/v1/", "qwen-local");
+        let staging = stage_codex_files(
+            Some(src.path()),
+            &std::collections::HashMap::new(),
+            Some(&local),
+            true,
+        )
+        .unwrap();
+        let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
+        assert!(config.contains("model = \"qwen-local\""));
+        assert!(
+            !config.contains("gpt-5"),
+            "local model must override source"
+        );
+    }
+
+    #[test]
+    fn stage_codex_files_remote_revert_drops_provider() {
+        // Switching back to remote: no local table, but `manages_local`
+        // forces a clean rewrite that omits the provider block.
+        let staging =
+            stage_codex_files(None, &std::collections::HashMap::new(), None, true).unwrap();
+        let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
+        assert!(
+            !config.contains("coop_local"),
+            "remote revert must drop the local provider; got: {config}"
         );
     }
 

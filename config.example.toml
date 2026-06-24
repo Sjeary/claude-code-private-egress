@@ -66,6 +66,18 @@
 # # Header values also accept the "cmd:" prefix:
 # # headers = { Authorization = "cmd:op read op://Private/Sentry/token" }
 
+# [claude.local_model]              # Route Claude Code at a host-side model.
+#                                   # Enable per VM with `coop model <vm> local`
+#                                   # (disable with `coop model <vm> remote`).
+#                                   # host_url is as seen on the *host*; a
+#                                   # localhost host is rewritten to the guest's
+#                                   # view of the host automatically.
+# host_url = "http://localhost:11434"  # Must serve the Anthropic Messages API
+#                                      # (vLLM / LM Studio native; Ollama needs a
+#                                      # proxy). Prompt caching is lost locally.
+# model = "qwen2.5-coder:32b"
+# auth_token = "sk-..."             # Optional; permissive servers ignore it.
+
 # [codex]
 # config_dir = "~/.codex"  # path to copy AGENTS.md, prompts/, config.toml, auth.json from (false to disable)
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
@@ -78,6 +90,15 @@
 # command = "npx"
 # args = ["-y", "@openai/some-mcp-server"]
 # env = { API_KEY = "MY_HOST_ENV_VAR" }
+
+# [codex.local_model]               # Route Codex at a host-side model.
+#                                   # Toggled per VM with `coop model <vm>
+#                                   # local|remote`, same as claude.local_model.
+# host_url = "http://localhost:11434/v1/"  # Must serve the Responses API
+#                                          # (Ollama / vLLM / LM Studio; ~64K
+#                                          # context floor).
+# model = "gpt-oss:120b"
+# auth_token = "sk-..."             # Optional; permissive servers ignore it.
 
 # [profiles.my-tools]
 # apt_packages = ["ripgrep", "fd-find", "jq"]

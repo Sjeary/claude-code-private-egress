@@ -1337,6 +1337,12 @@ pub struct ClaudeConfig {
     /// Source directory for Claude config files (CLAUDE.md, rules/, commands/)
     #[serde(default)]
     pub config_dir: ConfigDir,
+
+    /// Local-model endpoint to route Claude Code at when this VM is
+    /// switched to local mode (see `coop model`). Takes precedence over
+    /// any endpoint prompted interactively and saved in instance state.
+    #[serde(default)]
+    pub local_model: Option<LocalModel>,
 }
 
 /// `[setup]` section: controls one-time UX behaviour at VM startup.
@@ -1378,7 +1384,97 @@ pub struct CodexConfig {
     /// Source directory for Codex config files (config.toml, AGENTS.md, prompts/)
     #[serde(default)]
     pub config_dir: ConfigDir,
+
+    /// Local-model endpoint to route Codex at when this VM is switched to
+    /// local mode (see `coop model`). Takes precedence over any endpoint
+    /// prompted interactively and saved in instance state.
+    #[serde(default)]
+    pub local_model: Option<LocalModel>,
 }
+
+/// A local (host-side) model endpoint that `coop model <vm> local`
+/// materializes into guest agent config.
+///
+/// `host_url` is the endpoint as seen **on the host** (where the model
+/// server runs — Ollama / LM Studio / vLLM / llama.cpp). A local model
+/// cannot run inside the headless guest, so coop rewrites a
+/// `localhost`/`127.0.0.1` host to the backend's guest-visible host
+/// address (Firecracker: the TAP gateway; Lima: `host.lima.internal`)
+/// and passes any other host through verbatim, so a LAN endpoint also
+/// works. See [`crate::network::rewrite_host_url`].
+///
+/// The fields are private and the only constructor ([`LocalModel::new`],
+/// which the validating [`Deserialize`] impl also routes through)
+/// enforces the invariants — an `http`/`https` URL with a host and a
+/// non-empty model — so every `LocalModel` in the program is valid by
+/// construction and no later validation pass is needed.
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalModel {
+    host_url: url::Url,
+    model: String,
+    auth_token: Option<Secret<String>>,
+}
+
+impl LocalModel {
+    /// Construct an endpoint, enforcing the invariants. The single place
+    /// a `LocalModel` is validated; deserialization and the interactive
+    /// `coop model` prompt both route through here.
+    pub fn new(
+        host_url: url::Url,
+        model: String,
+        auth_token: Option<Secret<String>>,
+    ) -> Result<Self> {
+        if model.trim().is_empty() {
+            bail!("local model 'model' must not be empty");
+        }
+        if !matches!(host_url.scheme(), "http" | "https") {
+            bail!("local model host_url '{host_url}' must use http or https");
+        }
+        if host_url.host_str().is_none() {
+            bail!("local model host_url '{host_url}' has no host");
+        }
+        Ok(Self {
+            host_url,
+            model,
+            auth_token,
+        })
+    }
+
+    pub fn host_url(&self) -> &url::Url {
+        &self.host_url
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The configured auth token, or the shared dummy fallback used for
+    /// permissive local servers that accept any value.
+    pub fn auth_token_or_default(&self) -> String {
+        self.auth_token.as_ref().map_or_else(
+            || LOCAL_MODEL_AUTH_FALLBACK.to_string(),
+            |s| s.expose().clone(),
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalModel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            host_url: url::Url,
+            model: String,
+            #[serde(default)]
+            auth_token: Option<Secret<String>>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        LocalModel::new(raw.host_url, raw.model, raw.auth_token).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Dummy auth token written for local endpoints with no configured token.
+/// Permissive local servers (Ollama, LM Studio, vLLM) ignore the value.
+pub const LOCAL_MODEL_AUTH_FALLBACK: &str = "coop-local";
 
 const MAX_INSTANCE_NAME_LEN: usize = 64;
 
@@ -1771,6 +1867,11 @@ impl CoopConfig {
             }
         }
 
+        // `[claude.local_model]` / `[codex.local_model]` invariants
+        // (http(s) scheme, present host, non-empty model) are enforced by
+        // `LocalModel`'s deserializer, so an invalid endpoint fails at
+        // config-load time and never reaches here.
+
         // `[github.pat]` keys and `github.skip` entries are typed as
         // `RepoSlug`; invalid values are rejected at config load time, so
         // no per-key check is needed here.
@@ -2088,6 +2189,7 @@ impl Default for ClaudeConfig {
             plugins: Vec::new(),
             mcp_servers: HashMap::new(),
             config_dir: ConfigDir::Default,
+            local_model: None,
         }
     }
 }
@@ -2099,6 +2201,7 @@ impl Default for CodexConfig {
             env_forward: Vec::new(),
             mcp_servers: HashMap::new(),
             config_dir: ConfigDir::Default,
+            local_model: None,
         }
     }
 }
@@ -2173,6 +2276,10 @@ impl Instance {
 
     pub fn guest_env_state_path(&self) -> PathBuf {
         self.dir.join("guest_env.json")
+    }
+
+    pub fn model_state_path(&self) -> PathBuf {
+        self.dir.join("model.json")
     }
 
     #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
@@ -3151,6 +3258,66 @@ mod tests {
         assert!(cfg.env_forward.is_empty());
         assert!(cfg.mcp_servers.is_empty());
         assert_eq!(cfg.config_dir, ConfigDir::Default);
+        assert!(cfg.local_model.is_none());
+    }
+
+    // ── LocalModel ───────────────────────────────────────────
+
+    #[test]
+    fn local_model_deserializes_full_form() {
+        let toml_str = r#"
+host_url = "http://localhost:11434"
+model = "qwen2.5-coder:32b"
+auth_token = "secret-token"
+"#;
+        let lm: LocalModel = toml::from_str(toml_str).unwrap();
+        assert_eq!(lm.host_url().as_str(), "http://localhost:11434/");
+        assert_eq!(lm.model(), "qwen2.5-coder:32b");
+        assert_eq!(lm.auth_token_or_default(), "secret-token");
+    }
+
+    #[test]
+    fn local_model_auth_token_defaults_when_absent() {
+        let lm: LocalModel =
+            toml::from_str("host_url = \"http://localhost:1234\"\nmodel = \"m\"\n").unwrap();
+        assert_eq!(lm.auth_token_or_default(), LOCAL_MODEL_AUTH_FALLBACK);
+    }
+
+    #[test]
+    fn local_model_rejects_empty_model() {
+        let err = toml::from_str::<LocalModel>("host_url = \"http://localhost\"\nmodel = \"\"\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn local_model_rejects_non_http_scheme() {
+        let err = toml::from_str::<LocalModel>("host_url = \"ftp://localhost\"\nmodel = \"m\"\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("http or https"), "{err}");
+    }
+
+    #[test]
+    fn local_model_embeds_in_claude_config() {
+        let toml_str = r#"
+[local_model]
+host_url = "http://localhost:11434"
+model = "qwen"
+"#;
+        let cfg: ClaudeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.local_model.unwrap().model(), "qwen");
+    }
+
+    #[test]
+    fn local_model_invalid_endpoint_fails_config_load() {
+        // The invariant is enforced at deserialization, so a bad endpoint
+        // never produces a `CoopConfig` to validate later.
+        let toml_str = r#"
+[codex.local_model]
+host_url = "http://localhost:1234"
+model = ""
+"#;
+        assert!(toml::from_str::<CoopConfig>(toml_str).is_err());
     }
 
     #[test]
