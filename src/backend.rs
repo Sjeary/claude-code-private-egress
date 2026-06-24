@@ -1723,9 +1723,15 @@ fn managed_claude_settings_json(local_env: &BTreeMap<String, String>) -> String 
 
 /// Write coop's managed `~/.claude/settings.json` to the guest.
 ///
-/// Runs every VM startup, overwriting any in-guest edits. The file
-/// is small and owned by coop; users wanting per-VM customization should
-/// extend coop's config rather than editing the guest file in place.
+/// Runs every VM startup and on `coop model` switches, overwriting any
+/// in-guest edits. The file is small and owned by coop; users wanting
+/// per-VM customization should extend coop's config rather than editing
+/// the guest file in place.
+///
+/// The write is staged to a temp file and renamed into place so a
+/// `claude`/`coop ca` session reading the file concurrently (during a
+/// live `coop model` switch) never observes a truncated file. The rename
+/// is atomic because the temp file is in the same directory.
 fn write_managed_claude_settings(
     target: &SshTarget,
     local_env: &BTreeMap<String, String>,
@@ -1733,7 +1739,10 @@ fn write_managed_claude_settings(
     target.exec(RemoteCommand::new().literal("mkdir -p ~/.claude"))?;
     target
         .exec_with_stdin(
-            RemoteCommand::new().literal("cat > ~/.claude/settings.json"),
+            RemoteCommand::new().literal(
+                "t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
+                 cat > \"$t\" && mv \"$t\" ~/.claude/settings.json",
+            ),
             managed_claude_settings_json(local_env).into_bytes(),
         )
         .context("Failed to write managed ~/.claude/settings.json in guest")?;
