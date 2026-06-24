@@ -2200,6 +2200,16 @@ impl Instance {
         Ok(())
     }
 
+    /// Update the recorded origin image and persist `instance.json`.
+    ///
+    /// Used by `coop restore`: after the disk is replaced with image
+    /// `image`'s template, the instance's lineage (and the guest-user
+    /// lookup that keys off it) must track the restored image.
+    pub(crate) fn set_image(&mut self, image: ImageName) -> Result<()> {
+        self.image = image;
+        self.save()
+    }
+
     fn load(dir: &Path) -> Result<Self> {
         let meta_path = dir.join("instance.json");
         let content = fs::read_to_string(&meta_path)
@@ -2580,6 +2590,24 @@ mod tests {
         assert_eq!(loaded.index.as_u16(), 42);
         assert_eq!(loaded.dir, dir);
         assert_eq!(loaded.image.as_str(), DEFAULT_IMAGE);
+    }
+
+    #[test]
+    fn set_image_updates_field_and_persists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("myinst");
+        let mut inst = test_inst("myinst", idx(7), dir.clone());
+        inst.save().unwrap();
+
+        let restored = ImageName::new("safe-point").unwrap();
+        inst.set_image(restored.clone()).unwrap();
+
+        // The in-memory instance reflects the new image …
+        assert_eq!(inst.image, restored);
+        // … and so does the persisted instance.json (so the guest-user
+        // lookup and `coop status` lineage survive a reload).
+        let loaded = Instance::load(&dir).unwrap();
+        assert_eq!(loaded.image.as_str(), "safe-point");
     }
 
     // ── Instance::is_running / is_firecracker_process ────────

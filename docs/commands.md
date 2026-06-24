@@ -585,6 +585,53 @@ coop resize my-project --size 150G
 coop resize --size +20
 ```
 
+### `commit`
+
+Save a stopped instance's filesystem as a reusable image, like `docker container commit`. The committed image is an ordinary coop image: `coop images` lists it and `coop up --image <name>` launches new instances from it. The instance must be stopped first so the filesystem is consistent.
+
+```
+coop commit [NAME] --image <name> [FLAGS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--image <name>` | Name of the image to create (required) |
+| `--force` | Overwrite an existing image with the same name |
+
+```
+coop stop my-project
+coop commit my-project --image my-project-baseline
+coop up . --image my-project-baseline --name fork
+```
+
+### `restore`
+
+Roll a stopped instance back to an image's filesystem in place. The instance keeps its name, index, IP, and workspace association — only the disk is replaced and its recorded image is updated. Run `coop start` afterwards to bring it back up.
+
+This pairs with `commit` for a known-good checkpoint before a risky run:
+
+```
+coop stop my-project
+coop commit my-project --image safe-point   # checkpoint
+coop start my-project
+# ... a bypass-permissions agent run trashes the environment ...
+coop stop my-project
+coop restore my-project --image safe-point   # back to the checkpoint, same VM
+coop start my-project
+```
+
+```
+coop restore [NAME] --image <name>
+```
+
+| Flag | Description |
+|------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--image <name>` | Name of the image to restore from (required) |
+
+Unlike `destroy` + `up --image`, `restore` keeps the same instance identity (name, index, IP) instead of allocating a new one. The disk is reset to the image's size, so restoring an image built before a `coop resize` returns the instance to the smaller size.
+
 ### `profiles`
 
 List or inspect available profiles. With no subcommand, lists every profile (builtin and custom).

@@ -19,9 +19,9 @@ pub(crate) use devcontainer::{
 pub(crate) use github::cmd_github;
 pub(crate) use lifecycle::{
     ProfileImageTarget, ProjectTransport, StartOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts,
-    apply_runtime_guest_env, apply_vm_overrides, cmd_destroy, cmd_exec, cmd_list, cmd_resize,
-    cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_up, open_ssh_session, preflight_start_target,
-    prepend_binary, resolve_running,
+    apply_runtime_guest_env, apply_vm_overrides, cmd_commit, cmd_destroy, cmd_exec, cmd_list,
+    cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_up, open_ssh_session,
+    preflight_start_target, prepend_binary, resolve_running,
 };
 pub(crate) use profiles::{cmd_images, cmd_profiles};
 pub(crate) use quickstart::{QuickstartOpts, cmd_quickstart};

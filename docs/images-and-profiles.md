@@ -154,6 +154,29 @@ Delete a named image:
 coop images --delete polyglot
 ```
 
+## Committing an instance to an image
+
+`coop commit` captures a stopped instance's filesystem as a new image, the inverse of the template-to-instance copy `coop up` performs. Like `docker container commit`, it saves files — not live memory.
+
+```bash
+coop stop my-project
+coop commit my-project --image my-project-baseline
+```
+
+The committed image is an ordinary coop image stored under `~/.coop/images/<name>/`: it carries over the source image's `template-config.json` (profiles, guest user, hashes) with a fresh creation timestamp, so `coop images` lists it and `coop up --image <name>` launches new instances from it. The instance must be stopped first for filesystem consistency. Committing onto an existing image name requires `--force`.
+
+`coop restore` rolls a stopped instance back to an image's filesystem in place:
+
+```bash
+coop commit my-project --image safe-point   # checkpoint
+# ... a risky run trashes the environment ...
+coop stop my-project
+coop restore my-project --image safe-point   # back to the checkpoint
+coop start my-project
+```
+
+Restore keeps the instance's name, index, IP, and workspace association — only the disk is replaced and the instance's recorded image is updated. That makes it the ergonomic choice over `destroy` + `up --image` for the destructive-undo loop, which would allocate a different instance.
+
 ## Template versioning and staleness
 
 coop records what went into each template in a `template-config.json` file alongside the image. This config contains:

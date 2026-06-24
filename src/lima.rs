@@ -322,6 +322,58 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
     Ok(())
 }
 
+/// Save a stopped instance's disk as image `image`'s base image.
+///
+/// The inverse of instance creation: copies the Lima instance disk to
+/// the image's `lima-base.img` and regenerates the fast-start template
+/// so it points at the new base. The caller has gated on the instance
+/// being stopped and decided whether overwriting is allowed.
+pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
+    let src = disk_path(inst)?;
+    if !src.exists() {
+        bail!(
+            "Lima disk not found at {}.\n\
+             Is instance '{}' created?",
+            src.display(),
+            inst.name,
+        );
+    }
+
+    let image_dir = cfg.image_dir(image);
+    fs::create_dir_all(&image_dir)
+        .with_context(|| format!("Failed to create image dir {}", image_dir.display()))?;
+
+    let base_img = cfg.lima_base_path(image);
+    tracing::info!("Committing instance '{}' to image '{image}'", inst.name);
+    fs::copy(&src, &base_img)
+        .with_context(|| format!("Failed to copy {} -> {}", src.display(), base_img.display()))?;
+
+    generate_start_template(cfg, image)
+}
+
+/// Replace a stopped instance's disk with image `image`'s base image.
+pub fn restore_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
+    let base_img = cfg.lima_base_path(image);
+    if !base_img.exists() {
+        bail!("No image '{image}' found at {}.", base_img.display());
+    }
+
+    let dst = disk_path(inst)?;
+    if !dst.exists() {
+        bail!(
+            "Lima disk not found at {}.\n\
+             Is instance '{}' created?",
+            dst.display(),
+            inst.name,
+        );
+    }
+
+    tracing::info!("Restoring instance '{}' from image '{image}'", inst.name);
+    fs::copy(&base_img, &dst)
+        .with_context(|| format!("Failed to copy {} -> {}", base_img.display(), dst.display()))?;
+    Ok(())
+}
+
 /// Path to the VM disk for a Lima instance.
 ///
 /// Lima v2.1.0 renamed `diffdisk` to `disk`. We try `disk` first

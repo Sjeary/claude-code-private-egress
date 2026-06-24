@@ -1626,6 +1626,89 @@ pub(crate) fn cmd_resize(
     be.resize_disk(cfg, &stopped, new_size)
 }
 
+/// Save a stopped instance's filesystem as a reusable image.
+///
+/// The inverse of `coop up --image`: the committed image is an ordinary
+/// coop image (`coop images` lists it, `coop up --image` relaunches it).
+/// The instance must be stopped for filesystem consistency; overwriting
+/// an existing image name requires `force`.
+pub(crate) fn cmd_commit(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    name: Option<&config::InstanceName>,
+    image: &config::ImageName,
+    force: bool,
+) -> Result<()> {
+    let inst = cfg.resolve_instance(name)?;
+    let source_image = inst.image.clone();
+
+    // Refuse to clobber an existing image unless asked. Checked before
+    // gating on stopped state so a typo'd or already-taken name fails fast.
+    if be.image_is_built(cfg, image) && !force {
+        bail!("Image '{image}' already exists. Pass --force to overwrite it.");
+    }
+
+    let stopped = be.as_stopped(inst)?;
+
+    // Carry the source image's template config over to the new image with a
+    // fresh creation timestamp. This is the backend-agnostic half of the
+    // image (guest_user, profiles, hashes) that `coop up` reads back. Load it
+    // *before* writing any disk artifact so a missing or unreadable source
+    // config fails fast, leaving no half-written image behind.
+    let mut template_config =
+        setup::TemplateConfig::load_for(cfg, &source_image).with_context(|| {
+            format!("Failed to load template config for source image '{source_image}'")
+        })?;
+
+    be.commit_disk(cfg, &stopped, image)?;
+
+    template_config.created = setup::utc_timestamp();
+    template_config.save_for(cfg, image)?;
+
+    tracing::info!(
+        "Committed instance '{}' to image '{image}'. \
+         Relaunch with `coop up --image {image}`.",
+        stopped.instance().name,
+    );
+    Ok(())
+}
+
+/// Roll a stopped instance back to image `image`'s filesystem in place.
+///
+/// The instance keeps its name, index, IP, and workspace association —
+/// only the disk is replaced. Its recorded origin image is updated so the
+/// guest-user lookup and status lineage track the restored image. Run
+/// `coop start` afterwards to bring the instance back up.
+pub(crate) fn cmd_restore(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    name: Option<&config::InstanceName>,
+    image: &config::ImageName,
+) -> Result<()> {
+    let inst = cfg.resolve_instance(name)?;
+
+    if !be.image_is_built(cfg, image) {
+        bail!("No image '{image}' found. Run `coop images` to list available images.");
+    }
+
+    let stopped = be.as_stopped(inst)?;
+    be.restore_disk(cfg, &stopped, image)?;
+
+    // Persist the new lineage after the disk swap: if `restore_disk` fails,
+    // the recorded image still matches the (untouched) disk. The only
+    // residual window is a failed `instance.json` write after a successful
+    // swap, which re-running `restore` corrects.
+    let mut restored = stopped.instance().clone();
+    restored.set_image(image.clone())?;
+
+    tracing::info!(
+        "Restored instance '{name}' from image '{image}'. \
+         Run `coop start {name}` to bring it back up.",
+        name = restored.name,
+    );
+    Ok(())
+}
+
 fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<config::GiB> {
     let path = be.disk_path(inst)?;
     let bytes = std::fs::metadata(&path)

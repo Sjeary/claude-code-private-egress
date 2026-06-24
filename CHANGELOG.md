@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### New features
+
+- **`coop commit` + `coop restore` — checkpoint and roll back an instance** (#289) —
+  `coop commit <name> --image <image>` saves a stopped instance's
+  filesystem as a reusable image, a `docker container commit`-style
+  backup (files, not live memory). The committed image is an ordinary
+  coop image: `coop images` lists it and `coop up --image` launches new
+  instances from it. `coop restore <name> --image <image>` rolls a
+  stopped instance back to an image's filesystem in place, keeping the
+  instance's name, index, IP, and workspace association. Both require a
+  stopped instance; `commit --force` overwrites an existing image name.
+
 ## v0.5.1
 
 ### New features
