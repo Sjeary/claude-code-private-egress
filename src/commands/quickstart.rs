@@ -119,6 +119,10 @@ pub(crate) fn cmd_quickstart(
 ///
 /// This allocates directly rather than going through `cmd_start`; quickstart
 /// creates project environments while `start` only restarts stopped instances.
+// Shell-out orchestration (devcontainer resolve + allocate_and_start). exclude_re
+// cannot suppress its `delete field … from struct devcontainer::TranslatorInputs`
+// mutant (see the note in .cargo/mutants.toml), so skip the whole body here.
+#[mutants::skip]
 fn quickstart_fresh_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,

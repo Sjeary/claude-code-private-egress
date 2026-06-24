@@ -215,7 +215,98 @@ fn dir_size_display(dir: &std::path::Path) -> String {
             }
         }
     }
+    format_dir_size(total)
+}
+
+/// Render a byte count as one-decimal gibibytes (1 GiB = 1024³ bytes).
+fn format_dir_size(total_bytes: u64) -> String {
     #[expect(clippy::cast_precision_loss, reason = "file sizes fit in f64")]
-    let gib = total as f64 / (1024.0 * 1024.0 * 1024.0);
+    let gib = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     format!("{gib:.1} GiB")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{builtin_summary, format_custom_summary, format_dir_size, script_summary};
+    use crate::config::CustomProfile;
+    use crate::guest::BuiltinProfile;
+
+    #[test]
+    fn builtin_summary_lists_packages_scripts_and_plugins() {
+        let bp = BuiltinProfile {
+            name: "demo",
+            apt_packages: &["git", "curl"],
+            pre_install: Some("echo pre"),
+            post_install: Some("echo post"),
+            marketplaces: &[],
+            plugins: &["p1"],
+        };
+        let s = builtin_summary(&bp);
+        assert!(s.contains("git, curl"), "{s}");
+        assert!(s.contains("pre-install script"), "{s}");
+        assert!(s.contains("post-install script"), "{s}");
+        assert!(s.contains("plugins: p1"), "{s}");
+    }
+
+    #[test]
+    fn builtin_summary_reports_empty_profile() {
+        let bp = BuiltinProfile {
+            name: "empty",
+            apt_packages: &[],
+            pre_install: None,
+            post_install: None,
+            marketplaces: &[],
+            plugins: &[],
+        };
+        assert_eq!(builtin_summary(&bp), "(empty)");
+    }
+
+    #[test]
+    fn format_custom_summary_counts_each_section() {
+        let cp = CustomProfile {
+            apt_packages: vec!["a".to_string(), "b".to_string()],
+            pre_install: Some("x".to_string()),
+            post_install: Some("y".to_string()),
+            marketplaces: vec!["m".to_string()],
+            plugins: vec!["p".to_string(), "q".to_string()],
+        };
+        let s = format_custom_summary(&cp);
+        assert!(s.contains("2 apt packages"), "{s}");
+        assert!(s.contains("pre-install script"), "{s}");
+        assert!(s.contains("post-install script"), "{s}");
+        assert!(s.contains("1 marketplaces"), "{s}");
+        assert!(s.contains("2 plugins"), "{s}");
+    }
+
+    #[test]
+    fn format_custom_summary_reports_empty_profile() {
+        let cp = CustomProfile {
+            apt_packages: Vec::new(),
+            pre_install: None,
+            post_install: None,
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+        };
+        assert_eq!(format_custom_summary(&cp), "(empty)");
+    }
+
+    #[test]
+    fn script_summary_handles_none_empty_single_and_multiline() {
+        assert_eq!(script_summary(None), "(none)");
+        assert_eq!(script_summary(Some("")), "(none)");
+        assert_eq!(script_summary(Some("only line")), "only line");
+        // Two-plus lines collapse to the first line plus a line count; this
+        // pins the `lines <= 1` boundary (a `>` flip would mislabel a single
+        // line as multi-line).
+        let s = script_summary(Some("first\nsecond\nthird"));
+        assert_eq!(s, "first ... (3 lines)");
+    }
+
+    #[test]
+    fn format_dir_size_renders_one_decimal_gib() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(format_dir_size(0), "0.0 GiB");
+        assert_eq!(format_dir_size(GIB), "1.0 GiB");
+        assert_eq!(format_dir_size(3 * GIB / 2), "1.5 GiB");
+    }
 }
