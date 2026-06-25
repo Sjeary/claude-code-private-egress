@@ -9,8 +9,8 @@ use super::{DevcontainerInput, DevcontainerOpts, resolve_devcontainer};
 use super::{merge_runtime_guest_env, purge_all_data};
 use crate::backend::VmBackend as _;
 use crate::{
-    backend, config, devcontainer, github_repo, guest, guest_env_state, pat_prompt, port_forward,
-    setup, signal, ssh, workspace,
+    backend, config, devcontainer, github_repo, guest, guest_env_state, model_state, pat_prompt,
+    port_forward, setup, signal, ssh, workspace,
 };
 
 pub(crate) struct UpOpts<'a> {
@@ -1115,20 +1115,15 @@ fn restart_instance(
     }
     .save(inst)?;
 
-    let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
-    if opts.no_agents && post_start.is_none() {
-        tracing::info!("Skipping guest agent bootstrap (--no-agents)");
-    } else {
-        let session = prepare_session_from_target(cfg, None, target.clone(), repo.as_ref())?;
-        if opts.no_agents {
-            tracing::info!("Skipping guest agent bootstrap (--no-agents)");
-        } else {
-            backend::bootstrap_agents(&session, cfg, inst, backend::BootMode::Restart)?;
-        }
-        if let Some(cmd) = post_start {
-            backend::run_post_start(&session, cmd);
-        }
-    }
+    bootstrap_and_post_start(
+        be,
+        cfg,
+        inst,
+        &target,
+        repo.as_ref(),
+        opts,
+        backend::BootMode::Restart,
+    )?;
 
     tracing::info!(
         "Instance '{}' restarted — SSH: {}:{}",
@@ -1222,20 +1217,15 @@ fn start_instance(
         .save(inst)?;
     }
 
-    let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
-    if opts.no_agents && post_start.is_none() {
-        tracing::info!("Skipping guest agent bootstrap (--no-agents)");
-    } else {
-        let session = prepare_session_from_target(cfg, None, target.clone(), repo.as_ref())?;
-        if opts.no_agents {
-            tracing::info!("Skipping guest agent bootstrap (--no-agents)");
-        } else {
-            backend::bootstrap_agents(&session, cfg, inst, backend::BootMode::FirstBoot)?;
-        }
-        if let Some(cmd) = post_start {
-            backend::run_post_start(&session, cmd);
-        }
-    }
+    bootstrap_and_post_start(
+        be,
+        cfg,
+        inst,
+        &target,
+        repo.as_ref(),
+        opts,
+        backend::BootMode::FirstBoot,
+    )?;
 
     signal::check_shutdown()?;
 
@@ -1487,18 +1477,57 @@ pub(crate) fn open_ssh_session(
 /// is already authoritative for that one process; restart and every
 /// post-start command pass `Some` because the on-disk snapshot is
 /// the only place the original `--env` set still lives.
-fn prepare_session_from_target(
+/// Open a session and run the post-boot agent bootstrap plus any
+/// `postStartCommand`, honoring `--no-agents`. Shared by fresh start and
+/// restart, which differ only in the [`backend::BootMode`].
+fn bootstrap_and_post_start(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    target: &backend::SshTarget,
+    repo: Option<&github_repo::RepoSlug>,
+    opts: &StartOpts<'_>,
+    mode: backend::BootMode,
+) -> Result<()> {
+    let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
+    if opts.no_agents && post_start.is_none() {
+        tracing::info!("Skipping guest agent bootstrap (--no-agents)");
+        return Ok(());
+    }
+    let session = prepare_session_from_target(cfg, None, target.clone(), repo)?;
+    if opts.no_agents {
+        tracing::info!("Skipping guest agent bootstrap (--no-agents)");
+    } else {
+        let guest_host = be.guest_host_address(&cfg.network);
+        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
+    }
+    if let Some(cmd) = post_start {
+        backend::run_post_start(&session, cmd);
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_session_from_target(
     cfg: &config::CoopConfig,
     inst: Option<&config::Instance>,
     target: backend::SshTarget,
     repo: Option<&github_repo::RepoSlug>,
 ) -> Result<backend::SshSession> {
     let mut env = backend::prepare_env_forwarding(cfg, repo)?;
-    if let Some(inst) = inst
-        && let Some(state) = guest_env_state::GuestEnvState::try_load(inst)?
-    {
-        for (name, value) in &state.entries {
-            env.set(name.as_str(), value.as_str());
+    if let Some(inst) = inst {
+        if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
+            for (name, value) in &state.entries {
+                env.set(name.as_str(), value.as_str());
+            }
+        }
+        // In local-model mode, Codex reads its API key from the env var
+        // named by the provider's `env_key`. Claude's token rides in
+        // settings.json instead, so it needs no forwarding here.
+        let model = model_state::ModelState::load_or_default(inst)?;
+        if model.mode == model_state::ModelMode::Local
+            && let Some(ep) = model.resolved_codex(&cfg.codex)
+        {
+            env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default());
         }
     }
     Ok(backend::SshSession { target, env })

@@ -20,6 +20,7 @@ mod github_submodules;
 mod guest;
 mod guest_env_state;
 pub mod jsonc;
+mod model_state;
 mod naming;
 mod pat_prompt;
 mod paths;
@@ -67,9 +68,9 @@ use commands::{
     DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
     StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts, apply_runtime_guest_env,
     apply_vm_overrides, cmd_commit, cmd_destroy, cmd_devcontainer, cmd_devcontainer_check,
-    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_profiles, cmd_quickstart, cmd_resize,
-    cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
-    codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
+    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_quickstart,
+    cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up,
+    cmd_validate, codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
     resolve_devcontainer, resolve_running,
 };
 
@@ -398,6 +399,19 @@ enum Commands {
         )]
         name: Option<config::InstanceName>,
     },
+    /// Show or switch a VM's model backend (cloud vs. local)
+    Model {
+        /// Instance name (required if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// `local` to route at a host-side model, `remote` for cloud
+        /// defaults; omit to show the current selection
+        #[command(subcommand)]
+        action: Option<ModelAction>,
+    },
     /// Stream VM serial console logs
     Logs {
         /// Instance name (required if multiple instances exist)
@@ -620,6 +634,23 @@ extra line in your shell rc:
   zsh:   source <(COMPLETE=zsh coop)
   fish:  source (COMPLETE=fish coop | psub)
 ";
+
+#[derive(Subcommand, Clone, Copy)]
+enum ModelAction {
+    /// Route this VM's agents at a host-side local model server
+    Local,
+    /// Restore cloud defaults (Anthropic / `OpenAI`)
+    Remote,
+}
+
+impl From<ModelAction> for model_state::ModelMode {
+    fn from(action: ModelAction) -> Self {
+        match action {
+            ModelAction::Local => model_state::ModelMode::Local,
+            ModelAction::Remote => model_state::ModelMode::Remote,
+        }
+    }
+}
 
 #[derive(Subcommand)]
 enum ProfilesAction {
@@ -1084,6 +1115,9 @@ pub fn run() -> Result<()> {
         }
         Commands::List => cmd_list(&be, &cfg),
         Commands::Status { name } => cmd_status(&be, &cfg, name.as_ref()),
+        Commands::Model { name, action } => {
+            cmd_model(&be, &cfg, name.as_ref(), action.map(Into::into))
+        }
         Commands::Logs { name, follow } => {
             let running = resolve_running(&be, &cfg, name.as_ref())?;
             let mode = if follow {

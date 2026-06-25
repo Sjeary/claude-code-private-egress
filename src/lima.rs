@@ -20,6 +20,11 @@ use crate::sha256_hash::Sha256Hash;
 const LIMA_PREFIX: &str = "coop-";
 const BUILDER_NAME: &str = "coop-builder";
 
+/// Hostname Lima injects into the guest that resolves to the host machine.
+/// Used to rewrite local-model endpoints so the guest can reach a server
+/// running on the host.
+pub const HOST_GATEWAY: &str = "host.lima.internal";
+
 // ── Public API ────────────────────────────────────────────────
 
 /// Run first-time setup for Lima backend.

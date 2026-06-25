@@ -3383,6 +3383,155 @@ CFGEOF
     rm -r "$ge_dir"
 }
 
+# ── coop model local/remote end-to-end (--full only) ──────────
+
+# Exercises `coop model <vm> local|remote`: the local-model wiring must
+# land in the guest's Claude settings.json (env block) and Codex
+# config.toml (provider block) with the host URL rewritten to the
+# backend's guest-visible address, and `remote` must drop both. No real
+# model server is needed — only the materialized config is asserted.
+test_local_model() {
+    echo ""
+    echo "=== Phase: coop model local/remote (--full) ==="
+
+    local inst_name="${INSTANCE}-model"
+    local lm_dir
+    lm_dir=$(mktemp -d)
+    local cfg_file="$lm_dir/config.toml"
+    local claude_model="coop-test-claude-model"
+    local codex_model="coop-test-codex-model"
+
+    cat > "$cfg_file" <<CFGEOF
+[claude]
+github = "off"
+
+[claude.local_model]
+host_url = "http://localhost:11434"
+model = "$claude_model"
+
+[codex.local_model]
+host_url = "http://localhost:11434/v1/"
+model = "$codex_model"
+CFGEOF
+
+    lm() {
+        local rc=0
+        HARNESS_OUT=$(env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY -u OPENAI_API_KEY \
+            "$BINARY" --config "$cfg_file" "$@" 2>"$tmpdir/stderr") || rc=$?
+        HARNESS_ERR=$(cat "$tmpdir/stderr")
+        return $rc
+    }
+    lm_exec() {
+        RUST_LOG=off env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY -u OPENAI_API_KEY \
+            "$BINARY" --config "$cfg_file" exec "$inst_name" -- "$@" \
+            2>"$tmpdir/guest_stderr"
+    }
+
+    local lm_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$lm_ws"
+    if lm up "$lm_ws" --name "$inst_name" --no-agents --no-devcontainer; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "up for model test exits 0"
+    else
+        fail "up for model test exits 0" "exit: $? stderr: $HARNESS_ERR"
+        rm -r "$lm_dir"
+        return
+    fi
+
+    # Default (no model.json) must report remote.
+    if lm model "$inst_name" && echo "$HARNESS_OUT" | grep -qi "Mode:.*remote"; then
+        pass "model status defaults to remote"
+    else
+        fail "model status defaults to remote" "out: $HARNESS_OUT stderr: $HARNESS_ERR"
+    fi
+
+    # Switch to local — materializes guest config against the running VM.
+    if lm model "$inst_name" local; then
+        pass "model local exits 0"
+    else
+        fail "model local exits 0" "exit: $? stderr: $HARNESS_ERR"
+    fi
+
+    # Claude settings.json carries the env block with a rewritten host.
+    local settings
+    if settings=$(lm_exec cat ./.claude/settings.json); then
+        if echo "$settings" | grep -q "$claude_model" \
+            && echo "$settings" | grep -q "ANTHROPIC_BASE_URL" \
+            && ! echo "$settings" | grep -q "localhost"; then
+            pass "claude settings.json has rewritten local env block"
+        else
+            fail "claude settings.json has rewritten local env block" "got: $settings"
+        fi
+    else
+        fail "claude settings.json has rewritten local env block" \
+            "cat failed; stderr: $(guest_stderr)"
+    fi
+
+    # Codex config.toml carries the provider block with a rewritten host.
+    local codex_cfg
+    if codex_cfg=$(lm_exec cat ./.codex/config.toml); then
+        if echo "$codex_cfg" | grep -q "coop_local" \
+            && echo "$codex_cfg" | grep -q "responses" \
+            && echo "$codex_cfg" | grep -q "$codex_model" \
+            && ! echo "$codex_cfg" | grep -q "localhost"; then
+            pass "codex config.toml has rewritten local provider block"
+        else
+            fail "codex config.toml has rewritten local provider block" "got: $codex_cfg"
+        fi
+    else
+        fail "codex config.toml has rewritten local provider block" \
+            "cat failed; stderr: $(guest_stderr)"
+    fi
+
+    # Status now reports local with the model.
+    if lm model "$inst_name" && echo "$HARNESS_OUT" | grep -qi "Mode:.*local" \
+        && echo "$HARNESS_OUT" | grep -q "$claude_model"; then
+        pass "model status reports local with endpoint"
+    else
+        fail "model status reports local with endpoint" "out: $HARNESS_OUT"
+    fi
+
+    # The selection must survive a stop/start: boot-time bootstrap re-applies
+    # the persisted local mode.
+    lm stop "$inst_name" >/dev/null 2>&1 || true
+    if lm start "$inst_name" >/dev/null 2>&1; then
+        if settings=$(lm_exec cat ./.claude/settings.json) \
+            && echo "$settings" | grep -q "ANTHROPIC_BASE_URL"; then
+            pass "local mode persists across stop/start"
+        else
+            fail "local mode persists across stop/start" "got: $settings"
+        fi
+    else
+        fail "local mode persists across stop/start" "restart failed: $HARNESS_ERR"
+    fi
+
+    # Switch back to remote — both materializations must be dropped.
+    if lm model "$inst_name" remote; then
+        pass "model remote exits 0"
+    else
+        fail "model remote exits 0" "exit: $? stderr: $HARNESS_ERR"
+    fi
+
+    if settings=$(lm_exec cat ./.claude/settings.json) \
+        && ! echo "$settings" | grep -q "ANTHROPIC_BASE_URL"; then
+        pass "remote drops claude env block"
+    else
+        fail "remote drops claude env block" "got: $settings"
+    fi
+
+    if codex_cfg=$(lm_exec cat ./.codex/config.toml 2>/dev/null) \
+        && echo "$codex_cfg" | grep -q "coop_local"; then
+        fail "remote drops codex provider block" "stale provider: $codex_cfg"
+    else
+        pass "remote drops codex provider block"
+    fi
+
+    lm stop "$inst_name" 2>/dev/null || true
+    lm destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+    rm -r "$lm_dir"
+}
+
 # ── Interrupted setup test (--full only) ──────────────────────
 
 test_interrupted_setup() {
@@ -4254,6 +4403,9 @@ main() {
 
         # [guest_env] config block + literal-over-forwarded precedence
         test_guest_env_config
+
+        # coop model local/remote: local-model wiring lands and reverts
+        test_local_model
 
         # Interrupted setup: SIGKILL mid-build, verify clean recovery
         test_interrupted_setup

@@ -7,6 +7,41 @@ use crate::config::{HostInterface, Instance, NetworkConfig};
 
 const BRIDGE_NAME: &str = "br0";
 
+/// Rewrite a host-visible endpoint URL into one reachable from inside the
+/// guest.
+///
+/// A local model server runs on the host; the guest reaches it through a
+/// backend-specific gateway address (`guest_host`): the TAP gateway on
+/// Firecracker, `host.lima.internal` on Lima. A `localhost`/loopback host
+/// in `url` is replaced with `guest_host`; any other host (a LAN IP or
+/// DNS name) is passed through verbatim so a non-loopback endpoint keeps
+/// working as-is.
+///
+/// Only the host is changed — scheme, port, path, query, and userinfo are
+/// preserved.
+pub fn rewrite_host_url(url: &url::Url, guest_host: &str) -> Result<url::Url> {
+    if !host_is_loopback(url.host().as_ref()) {
+        return Ok(url.clone());
+    }
+    let mut rewritten = url.clone();
+    rewritten
+        .set_host(Some(guest_host))
+        .with_context(|| format!("Invalid guest host address '{guest_host}'"))?;
+    Ok(rewritten)
+}
+
+/// Whether a URL host refers to the local machine: the literal
+/// `localhost`, or any IPv4/IPv6 loopback address. Uses url's typed host
+/// so bracketed IPv6 literals classify correctly.
+fn host_is_loopback(host: Option<&url::Host<&str>>) -> bool {
+    match host {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 /// Ensure the bridge exists with the host IP, then create and attach the
 /// instance's tap device. Sets up NAT rules if this is the first instance.
 pub fn setup_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
@@ -287,4 +322,81 @@ fn tap_exists(name: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use super::*;
+
+    fn rewrite(url: &str, host: &str) -> String {
+        rewrite_host_url(&url::Url::parse(url).unwrap(), host)
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn rewrites_localhost_to_guest_host() {
+        assert_eq!(
+            rewrite("http://localhost:11434", "172.16.0.1"),
+            "http://172.16.0.1:11434/"
+        );
+    }
+
+    #[test]
+    fn rewrites_loopback_ipv4_to_guest_host() {
+        assert_eq!(
+            rewrite("http://127.0.0.1:11434/v1/", "host.lima.internal"),
+            "http://host.lima.internal:11434/v1/"
+        );
+    }
+
+    #[test]
+    fn rewrites_loopback_ipv6_to_guest_host() {
+        assert_eq!(
+            rewrite("http://[::1]:8080/", "172.16.0.1"),
+            "http://172.16.0.1:8080/"
+        );
+    }
+
+    #[test]
+    fn passes_lan_host_through_unchanged() {
+        // A non-loopback endpoint already reaches the host network; leave it.
+        assert_eq!(
+            rewrite("http://192.168.1.50:11434/", "172.16.0.1"),
+            "http://192.168.1.50:11434/"
+        );
+        assert_eq!(
+            rewrite("http://models.lan:11434/", "172.16.0.1"),
+            "http://models.lan:11434/"
+        );
+    }
+
+    #[test]
+    fn preserves_scheme_port_and_path() {
+        assert_eq!(
+            rewrite("https://localhost:9999/v1/chat?a=b", "10.0.0.1"),
+            "https://10.0.0.1:9999/v1/chat?a=b"
+        );
+    }
+
+    #[test]
+    fn host_is_loopback_classifies_correctly() {
+        let loopback = |h: &str| {
+            host_is_loopback(
+                url::Url::parse(&format!("http://{h}"))
+                    .unwrap()
+                    .host()
+                    .as_ref(),
+            )
+        };
+        assert!(loopback("localhost"));
+        assert!(loopback("LocalHost"));
+        assert!(loopback("127.0.0.1"));
+        assert!(loopback("127.5.5.5"));
+        assert!(loopback("[::1]"));
+        assert!(!loopback("192.168.0.1"));
+        assert!(!loopback("example.com"));
+        assert!(!host_is_loopback(None));
+    }
 }
