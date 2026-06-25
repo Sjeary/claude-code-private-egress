@@ -196,7 +196,7 @@ Claude Code configuration injected into the guest VM at start time. Every field 
 
 ### MCP servers
 
-Each key in `mcp_servers` maps a server name to its definition. Two transport types are supported.
+Each key in `mcp_servers` maps a server name to its definition. Three transport types are supported.
 
 **Stdio server** (spawns a process):
 
@@ -213,6 +213,15 @@ env = { SERVER_API_KEY = "MY_HOST_ENV_VAR" }
 [claude.mcp_servers.remote-server]
 type = "http"
 url = "https://mcp.example.com/v1"
+headers = { Authorization = "Bearer token" }
+```
+
+**SSE server** (connects to a remote endpoint over Server-Sent Events):
+
+```toml
+[claude.mcp_servers.events-server]
+type = "sse"
+url = "https://mcp.example.com/sse"
 headers = { Authorization = "Bearer token" }
 ```
 

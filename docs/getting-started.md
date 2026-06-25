@@ -287,7 +287,7 @@ coop push --dir ~/other-dir
 coop pull --dir ~/other-dir
 ```
 
-### 6. Tear down
+### 7. Tear down
 
 Stop an instance (preserves disk state):
 
