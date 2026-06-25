@@ -59,8 +59,9 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | Command | Description |
 |---------|-------------|
 | `up` | Ensure a project environment exists and is running |
+| `quickstart` | One-shot: ensure default image, start an instance for cwd, launch Claude |
 | `setup` | Install backend runtime, fetch kernel, build template rootfs |
-| `build` | Rebuild rootfs image and fetch kernel |
+| `devcontainer` | Inspect devcontainer.json support without starting setup or a VM |
 | `start` | Restart a stopped VM |
 | `stop` | Stop a running VM (preserves disk) |
 | `destroy` | Stop and remove a VM instance |
@@ -73,13 +74,16 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | `pull` | Sync VM workspace back to the host |
 | `list` (`ls`) | List instances by name and state |
 | `status` | Show instance status and resource usage |
+| `model` | Show or switch a VM's model backend (cloud vs. local) |
 | `logs` | Stream VM serial console output |
 | `vscode` | Open VS Code connected to the guest |
 | `ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc ssh/scp/rsync |
 | `images` | List or delete template images |
+| `profiles` | List or inspect available profiles |
 | `resize` | Grow a stopped instance's disk |
 | `commit` | Save a stopped instance's filesystem as a reusable image |
 | `restore` | Roll a stopped instance back to an image's filesystem in place |
+| `init` | Generate a starter config file at ~/.coop/config.toml |
 | `validate` | Check config and prerequisites |
 | `update` | Self-update coop to the latest GitHub release |
 | `uninstall` | Remove the coop binary and (optionally) its data directories |
