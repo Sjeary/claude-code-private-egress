@@ -1721,12 +1721,71 @@ fn managed_claude_settings_json(local_env: &BTreeMap<String, String>) -> String 
     settings.to_string()
 }
 
-/// Write coop's managed `~/.claude/settings.json` to the guest.
+/// Merge coop's managed permission keys into an existing `settings.json` body.
 ///
-/// Runs every VM startup and on `coop model` switches, overwriting any
-/// in-guest edits. The file is small and owned by coop; users wanting
-/// per-VM customization should extend coop's config rather than editing
-/// the guest file in place.
+/// Only the managed `permissions` keys are forced; every other key Claude
+/// Code writes is preserved (except the coop-managed `env` block — see below)
+/// — notably `enabledPlugins` and `extraKnownMarketplaces`, which record
+/// installed plugins and marketplaces.
+/// Overwriting the whole file (the previous behavior) wiped those on every
+/// boot, so plugins installed on first boot vanished from `/plugins` after a
+/// stop/start cycle, since plugin install only runs on `BootMode::FirstBoot`.
+///
+/// An empty body is treated as an empty object. A body that is valid JSON but
+/// not an object — or not valid JSON at all — is an error; the caller falls
+/// back to writing managed defaults.
+///
+/// The local-model `env` block is coop-managed, not user state: when
+/// `local_env` is non-empty (the VM is in local mode) it is written into the
+/// `env` key, and when it is empty (remote mode) any existing `env` key is
+/// removed, so switching back from a local model clears stale routing. This
+/// mirrors [`managed_claude_settings_json`], which the fallback path uses.
+fn merge_managed_claude_settings(
+    existing: &str,
+    local_env: &BTreeMap<String, String>,
+) -> Result<String> {
+    let mut root: serde_json::Value = if existing.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(existing)
+            .context("existing ~/.claude/settings.json is not valid JSON")?
+    };
+
+    let root_obj = root
+        .as_object_mut()
+        .context("existing ~/.claude/settings.json is not a JSON object")?;
+
+    let permissions = root_obj
+        .entry("permissions")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let permissions_obj = permissions
+        .as_object_mut()
+        .context("`permissions` in ~/.claude/settings.json is not a JSON object")?;
+
+    permissions_obj.insert(
+        "defaultMode".to_string(),
+        serde_json::Value::String("bypassPermissions".to_string()),
+    );
+    permissions_obj.insert(
+        "skipDangerousModePermissionPrompt".to_string(),
+        serde_json::Value::Bool(true),
+    );
+
+    if local_env.is_empty() {
+        root_obj.remove("env");
+    } else {
+        root_obj.insert("env".to_string(), serde_json::json!(local_env));
+    }
+
+    serde_json::to_string(&root).context("Failed to serialize merged ~/.claude/settings.json")
+}
+
+/// Runs every VM startup and on `coop model` switches. Reads any existing
+/// file and merges coop's managed `permissions` keys (and, in local-model
+/// mode, the `env` block) into it via [`merge_managed_claude_settings`], so
+/// plugin/marketplace state Claude Code persists in this file
+/// (`enabledPlugins`, `extraKnownMarketplaces`) survives across reboots. A
+/// file that cannot be parsed is replaced with managed defaults.
 ///
 /// The write is staged to a temp file and renamed into place so a
 /// `claude`/`coop ca` session reading the file concurrently (during a
@@ -1737,13 +1796,43 @@ fn write_managed_claude_settings(
     local_env: &BTreeMap<String, String>,
 ) -> Result<()> {
     target.exec(RemoteCommand::new().literal("mkdir -p ~/.claude"))?;
+
+    // Read and merge as one fallible step so a read failure falls back to
+    // managed defaults rather than aborting boot. `capture` decodes the file as
+    // UTF-8, so a non-UTF-8 settings.json fails here; that is corrupt input,
+    // handled the same as unparseable JSON below. The realistic Err is exactly
+    // that corrupt file, which we want to reset anyway. A transient SSH read
+    // failure (read and write are separate connections) is rare and back-to-
+    // back with the write that follows; if that is ever shown to lose a
+    // readable file in practice, distinguish a non-zero ssh exit from a decode
+    // error and `?`-propagate the former.
+    let merged = match target
+        .capture("cat ~/.claude/settings.json 2>/dev/null || true")
+        .and_then(|existing| merge_managed_claude_settings(&existing, local_env))
+    {
+        Ok(merged) => merged,
+        Err(err) => {
+            tracing::warn!(
+                "Could not read or merge existing ~/.claude/settings.json ({err:#}); \
+                 replacing it with managed defaults"
+            );
+            // Fallback is NOT preservation-safe: replacing the file with managed
+            // defaults discards enabledPlugins/extraKnownMarketplaces — the very
+            // keys this function exists to keep. Acceptable only because reaching
+            // here means the existing file isn't a usable settings object (invalid
+            // or non-UTF-8 bytes, malformed JSON, or a non-object `permissions`),
+            // which coop never writes; a corrupt file is reset rather than merged.
+            managed_claude_settings_json(local_env)
+        }
+    };
+
     target
         .exec_with_stdin(
             RemoteCommand::new().literal(
                 "t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.claude/settings.json",
             ),
-            managed_claude_settings_json(local_env).into_bytes(),
+            merged.into_bytes(),
         )
         .context("Failed to write managed ~/.claude/settings.json in guest")?;
     tracing::debug!("Wrote managed ~/.claude/settings.json to guest");
@@ -2588,6 +2677,160 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         );
         // Permissions survive alongside the injected env.
         assert!(parsed.get("permissions").is_some());
+    }
+
+    #[test]
+    fn merge_managed_claude_settings_preserves_enabled_plugins() {
+        let existing = r#"{
+            "enabledPlugins": {"my-skill@my-market": true},
+            "extraKnownMarketplaces": {"my-market": {"source": "/srv/m"}},
+            "permissions": {"defaultMode": "default"}
+        }"#;
+
+        let merged = merge_managed_claude_settings(existing, &BTreeMap::new()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(
+            parsed
+                .pointer("/enabledPlugins/my-skill@my-market")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "plugin enablement must survive the managed write",
+        );
+        assert!(
+            parsed.get("extraKnownMarketplaces").is_some(),
+            "marketplace registration must survive the managed write",
+        );
+        assert_eq!(
+            parsed
+                .pointer("/permissions/defaultMode")
+                .and_then(serde_json::Value::as_str),
+            Some("bypassPermissions"),
+            "managed permissions must override an existing value",
+        );
+        assert_eq!(
+            parsed
+                .pointer("/permissions/skipDangerousModePermissionPrompt")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn merge_managed_claude_settings_preserves_key_order() {
+        // With serde_json's `preserve_order` feature the merge only touches
+        // `permissions` and leaves every other key where the user had it,
+        // instead of alphabetizing the whole file on every boot. Guards against
+        // the feature being dropped from Cargo.toml.
+        let existing = r#"{"zeta":1,"permissions":{"defaultMode":"default"},"alpha":2}"#;
+
+        let merged = merge_managed_claude_settings(existing, &BTreeMap::new()).unwrap();
+
+        let zeta = merged.find("\"zeta\"").unwrap();
+        let alpha = merged.find("\"alpha\"").unwrap();
+        assert!(
+            zeta < alpha,
+            "original key order must be preserved, not alphabetized: {merged}",
+        );
+    }
+
+    #[test]
+    fn merge_managed_claude_settings_preserves_enabled_plugins_in_local_mode() {
+        // The local-model env block is injected without clobbering the
+        // plugin/marketplace keys the merge exists to preserve.
+        let existing = r#"{"enabledPlugins": {"my-skill@my-market": true}}"#;
+        let env = crate::model_state::claude_env_block(
+            "http://172.16.0.1:11434",
+            "qwen2.5-coder",
+            "coop-local",
+        );
+
+        let merged = merge_managed_claude_settings(existing, &env).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(
+            parsed
+                .pointer("/enabledPlugins/my-skill@my-market")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "plugin enablement must survive the local-model env injection",
+        );
+        assert_eq!(
+            parsed
+                .pointer("/env/ANTHROPIC_MODEL")
+                .and_then(serde_json::Value::as_str),
+            Some("qwen2.5-coder"),
+            "local-model env block must be merged in",
+        );
+    }
+
+    #[test]
+    fn merge_managed_claude_settings_replaces_existing_env_in_local_mode() {
+        // Local mode replaces the whole env block rather than key-merging: coop
+        // owns env (for local-model routing), so a stale/foreign env entry is
+        // dropped, not preserved alongside the managed keys.
+        let existing = r#"{"env": {"STALE": "1", "ANTHROPIC_MODEL": "old"}}"#;
+        let env = crate::model_state::claude_env_block(
+            "http://172.16.0.1:11434",
+            "qwen2.5-coder",
+            "coop-local",
+        );
+
+        let merged = merge_managed_claude_settings(existing, &env).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert!(
+            parsed.pointer("/env/STALE").is_none(),
+            "coop owns the env block; a foreign env entry must not survive: {merged}",
+        );
+        assert_eq!(
+            parsed
+                .pointer("/env/ANTHROPIC_MODEL")
+                .and_then(serde_json::Value::as_str),
+            Some("qwen2.5-coder"),
+            "the managed env block must replace the prior one",
+        );
+    }
+
+    #[test]
+    fn merge_managed_claude_settings_clears_env_in_remote_mode() {
+        // Switching back to a remote model (empty local_env) must drop a
+        // previously written env block so stale routing does not linger.
+        let existing = r#"{"env": {"ANTHROPIC_BASE_URL": "http://172.16.0.1:11434"}}"#;
+
+        let merged = merge_managed_claude_settings(existing, &BTreeMap::new()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert!(
+            parsed.get("env").is_none(),
+            "remote mode must clear a previously injected env block: {merged}",
+        );
+    }
+
+    #[test]
+    fn merge_managed_claude_settings_empty_yields_defaults_only() {
+        for body in ["", "   \n", "{}"] {
+            let merged = merge_managed_claude_settings(body, &BTreeMap::new()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
+            assert_eq!(
+                parsed
+                    .pointer("/permissions/defaultMode")
+                    .and_then(serde_json::Value::as_str),
+                Some("bypassPermissions"),
+                "empty body {body:?} must produce managed defaults",
+            );
+        }
+    }
+
+    #[test]
+    fn merge_managed_claude_settings_rejects_non_object() {
+        let empty = BTreeMap::new();
+        assert!(merge_managed_claude_settings("not json", &empty).is_err());
+        assert!(merge_managed_claude_settings("[1, 2, 3]", &empty).is_err());
+        assert!(
+            merge_managed_claude_settings(r#"{"permissions": "nope"}"#, &empty).is_err(),
+            "a non-object `permissions` value must be rejected, not silently clobbered",
+        );
     }
 
     #[test]
