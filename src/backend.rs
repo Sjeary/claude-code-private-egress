@@ -1420,6 +1420,12 @@ fn bootstrap_claude(
     let local_env = claude_local_env(&model_state, cfg, guest_host)?;
     write_managed_claude_settings(&session.target, &local_env)?;
 
+    // Work around the onboarding wizard ignoring CLAUDE_CODE_OAUTH_TOKEN
+    // (anthropics/claude-code#8938). Runs on every boot so a token added
+    // before a restart still takes effect; a no-op once the flag is present
+    // or when no OAuth token is forwarded.
+    seed_claude_onboarding(session, &claude_bin)?;
+
     // Marketplaces, plugins, MCP servers — persisted on guest disk,
     // only install on first boot
     if let BootMode::FirstBoot = mode {
@@ -1837,6 +1843,133 @@ fn write_managed_claude_settings(
         .context("Failed to write managed ~/.claude/settings.json in guest")?;
     tracing::debug!("Wrote managed ~/.claude/settings.json to guest");
     Ok(())
+}
+
+/// Work around Claude Code's onboarding wizard ignoring a forwarded OAuth
+/// token (anthropics/claude-code#8938).
+///
+/// Claude Code's TUI gates the theme/login wizard on `hasCompletedOnboarding`
+/// in `~/.claude.json` and ignores `CLAUDE_CODE_OAUTH_TOKEN` for that check, so
+/// subscription users land in the wizard even though the token authenticates
+/// fine. coop never stages `~/.claude.json` (it is a sibling of the `.claude/`
+/// dir, not inside it), so a fresh guest always lacks the flag. Seed it.
+///
+/// Only runs when the OAuth token is forwarded into the guest — API-key users
+/// reach a working session without this, and credential-less guests must keep
+/// the interactive login flow. Guarding on the forwarded env (not the host
+/// process env) keys the workaround off wherever the token actually reaches the
+/// guest, so it keeps working if a dedicated `claude.oauth_token` config field
+/// later supersedes `env_forward`.
+///
+/// Idempotent: once the flag is present, the seeding `claude -p` call is
+/// skipped. Delete this whole function when #8938 is fixed upstream.
+fn seed_claude_onboarding(session: &SshSession, claude_bin: &GuestPath) -> Result<()> {
+    if !session.env.contains("CLAUDE_CODE_OAUTH_TOKEN") {
+        return Ok(());
+    }
+    let target = &session.target;
+
+    if read_claude_json(target)
+        .as_deref()
+        .is_some_and(onboarding_marked_complete)
+    {
+        tracing::debug!("Claude onboarding already marked complete; skipping seed");
+        return Ok(());
+    }
+
+    // Let Claude Code create the file itself so it carries whatever first-run
+    // fields the installed version expects, then merge the flag in. Claude
+    // writes ~/.claude.json on startup, before the API call `-p` makes
+    // completes, so a timeout still leaves the file seeded — and the merge
+    // below creates it from scratch if Claude failed to.
+    seed_claude_json(session, claude_bin);
+
+    let current = read_claude_json(target);
+    let merged = claude_json_with_onboarding_complete(current.as_deref())?;
+    write_claude_json(target, &merged)?;
+    tracing::info!("Marked Claude onboarding complete in guest (~/.claude.json)");
+    Ok(())
+}
+
+/// Read `~/.claude.json` from the guest, returning `None` when it is absent,
+/// empty, or unreadable. A present file (even non-JSON) comes back verbatim.
+///
+/// Infallible by design: a read failure (e.g. a non-UTF-8 file, which
+/// [`SshTarget::capture`] rejects) must not fail the boot over a cosmetic
+/// workaround — it is treated as absent so the merge step rewrites a clean
+/// file. A genuine connectivity problem surfaces later at the write.
+fn read_claude_json(target: &SshTarget) -> Option<String> {
+    match target.capture("cat ~/.claude.json 2>/dev/null || true") {
+        Ok(raw) => (!raw.trim().is_empty()).then_some(raw),
+        Err(e) => {
+            tracing::debug!("Could not read ~/.claude.json ({e:#}); treating as absent");
+            None
+        }
+    }
+}
+
+/// Run a throwaway `claude -p` so Claude Code seeds `~/.claude.json`. Best
+/// effort: bounded by `timeout` and never fails the boot — the file may still
+/// be absent afterwards (handled by the caller), and the API call timing out is
+/// the expected case, not an error.
+///
+/// The 30s bound only needs to outlast Claude writing `~/.claude.json` on
+/// startup, which happens well before the `-p` API call returns; it is a
+/// safety net against a hung process, not a deadline for the call to succeed.
+fn seed_claude_json(session: &SshSession, claude_bin: &GuestPath) {
+    tracing::debug!("Seeding ~/.claude.json via `claude -p` to mark onboarding complete");
+    let cmd = RemoteCommand::new()
+        .literal("timeout 30 ")
+        .arg(claude_bin)
+        .literal(" -p ok >/dev/null 2>&1 || true");
+    if let Err(e) = session.exec(cmd) {
+        tracing::debug!("claude -p seed did not complete cleanly (continuing): {e}");
+    }
+}
+
+/// Write `contents` to `~/.claude.json` in the guest, staged through a temp
+/// file and renamed into place so a concurrent reader never sees a truncated
+/// file (mirrors [`write_managed_claude_settings`]).
+fn write_claude_json(target: &SshTarget, contents: &str) -> Result<()> {
+    target
+        .exec_with_stdin(
+            RemoteCommand::new().literal(
+                "t=\"$(mktemp ~/.claude.json.XXXXXX)\" && \
+                 cat > \"$t\" && mv \"$t\" ~/.claude.json",
+            ),
+            contents.as_bytes().to_vec(),
+        )
+        .context("Failed to write ~/.claude.json in guest")
+}
+
+/// `true` when `claude_json` records completed onboarding. Tolerant: absent
+/// flag, `false` flag, a non-object document, or invalid JSON all read as "not
+/// complete" so the caller proceeds to seed.
+fn onboarding_marked_complete(claude_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(claude_json)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("hasCompletedOnboarding"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The contents to write to `~/.claude.json` so the TUI treats the guest as
+/// onboarded. Preserves every existing key when `current` parses to a JSON
+/// object; otherwise starts from an empty object. Always sets
+/// `hasCompletedOnboarding: true`.
+fn claude_json_with_onboarding_complete(current: Option<&str>) -> Result<String> {
+    let mut obj = current
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    obj.insert("hasCompletedOnboarding".to_string(), true.into());
+    let rendered = serde_json::to_string_pretty(&serde_json::Value::Object(obj))
+        .context("Failed to serialize ~/.claude.json")?;
+    Ok(format!("{rendered}\n"))
 }
 
 /// The `env` block for a Claude local endpoint, with its host URL
@@ -2427,6 +2560,76 @@ Buffers:          128000 kB
 Filesystem     1M-blocks  Used Available Use% Mounted on
 /dev/vda1          20480  3200     16000  17% /
 ";
+
+    #[test]
+    fn onboarding_marked_complete_detects_true_flag() {
+        assert!(onboarding_marked_complete(
+            r#"{"hasCompletedOnboarding": true, "theme": "dark"}"#
+        ));
+    }
+
+    #[test]
+    fn onboarding_marked_complete_false_when_flag_missing() {
+        assert!(!onboarding_marked_complete(r#"{"theme": "dark"}"#));
+    }
+
+    #[test]
+    fn onboarding_marked_complete_false_when_flag_false() {
+        assert!(!onboarding_marked_complete(
+            r#"{"hasCompletedOnboarding": false}"#
+        ));
+    }
+
+    #[test]
+    fn onboarding_marked_complete_false_on_invalid_or_non_object_json() {
+        for raw in ["not json", "", "[]", "42", r#""hasCompletedOnboarding""#] {
+            assert!(
+                !onboarding_marked_complete(raw),
+                "should not be complete: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_json_with_onboarding_complete_preserves_existing_keys() {
+        let rendered =
+            claude_json_with_onboarding_complete(Some(r#"{"theme": "dark", "userID": "abc"}"#))
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["hasCompletedOnboarding"], serde_json::json!(true));
+        assert_eq!(parsed["theme"], serde_json::json!("dark"));
+        assert_eq!(parsed["userID"], serde_json::json!("abc"));
+        assert!(rendered.ends_with('\n'));
+    }
+
+    #[test]
+    fn claude_json_with_onboarding_complete_overwrites_false_flag() {
+        let rendered =
+            claude_json_with_onboarding_complete(Some(r#"{"hasCompletedOnboarding": false}"#))
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["hasCompletedOnboarding"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn claude_json_with_onboarding_complete_starts_fresh_when_absent() {
+        let rendered = claude_json_with_onboarding_complete(None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed, serde_json::json!({"hasCompletedOnboarding": true}));
+    }
+
+    #[test]
+    fn claude_json_with_onboarding_complete_replaces_non_object_or_invalid() {
+        for raw in ["[1, 2, 3]", "garbage", "\"a string\""] {
+            let rendered = claude_json_with_onboarding_complete(Some(raw)).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(
+                parsed,
+                serde_json::json!({"hasCompletedOnboarding": true}),
+                "input {raw:?} should yield a fresh object"
+            );
+        }
+    }
 
     #[test]
     fn hostname_accepts_valid_inputs() {
