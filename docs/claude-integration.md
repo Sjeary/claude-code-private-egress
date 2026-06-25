@@ -182,7 +182,7 @@ When `coop up` creates/restarts a project VM or `coop start` restarts a stopped 
 
 1. **GitHub auth**: If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
 2. **User content**: Copy the allowlisted entries (`CLAUDE.md`, `rules/`, `commands/`) from `config_dir` to `~/.claude/` in the guest.
-3. **Managed permissions**: Merge coop's managed permission keys (`permissions.defaultMode: bypassPermissions` and `permissions.skipDangerousModePermissionPrompt: true`) into the guest's `~/.claude/settings.json`, preserving any other keys it holds. The setting must live in user scope — Claude Code ignores `skipDangerousModePermissionPrompt` from project settings. Other keys Claude Code stores in this file (notably `enabledPlugins` and `extraKnownMarketplaces`) are left intact so plugin and marketplace state survives a stop/start cycle. The one exception is the `env` block, which coop owns for local-model routing (see `coop model`): it is set when the VM is in local-model mode and removed in remote mode, so any hand-authored `env` entries in this file are not preserved. A file that cannot be parsed is replaced with managed defaults.
+3. **Managed permissions**: Merge coop's managed permission keys (`permissions.defaultMode: bypassPermissions` and `permissions.skipDangerousModePermissionPrompt: true`) into the guest's `~/.claude/settings.json`, preserving any other keys it holds. The setting must live in user scope — Claude Code ignores `skipDangerousModePermissionPrompt` from project settings. Other keys Claude Code stores in this file (notably `enabledPlugins` and `extraKnownMarketplaces`) are left intact so plugin and marketplace state survives a stop/start cycle. The one exception is the `env` block, which coop owns for local-model routing (see [Local model support](#local-model-support)): it is set when the VM is in local-model mode and removed in remote mode, so any hand-authored `env` entries in this file are not preserved. A file that cannot be parsed is replaced with managed defaults.
 4. **Marketplaces**: Register each marketplace source (local directories are copied to the guest first). On first boot, coop compares the configured marketplaces against those already baked into the golden image (from `coop setup --profile`) and only installs the ones that are missing.
 5. **Plugins**: Install each plugin from the registered marketplaces. Like marketplaces, coop computes the delta against plugins already present in the golden image and skips those that are already installed.
 6. **MCP servers**: Register each MCP server definition.
@@ -199,3 +199,33 @@ coop start --no-agents
 ```
 
 This skips the entire bootstrap sequence. The VM boots normally but gets no API key, no GitHub token, no plugins, and no MCP servers. You can still run `coop claude` afterward, and that session forwards `ANTHROPIC_API_KEY` and any `env_forward` variables via SSH. Plugins and MCP servers won't be available unless you configure them manually inside the guest.
+
+## Local model support
+
+A VM can route Claude Code at a host-side local model server (Ollama / LM Studio
+/ vLLM / llama.cpp) instead of Anthropic's cloud. The endpoint must serve the
+Anthropic Messages API. Switch a VM with [`coop model <vm> local`](commands.md#model)
+and back with `coop model <vm> remote`; configure the endpoint under
+[`[claude.local_model]`](configuration.md#local-model-routing) or interactively
+at the `coop model … local` prompt.
+
+The selection is per VM and independent of Codex — Claude can run on a local
+model while Codex stays on cloud, or the reverse. The endpoint Claude resolves
+is the `[claude.local_model]` config block if present, otherwise an endpoint
+saved interactively for the instance, otherwise none (it stays on cloud).
+Config takes precedence over the saved endpoint.
+
+In local mode coop writes an `env` block into the managed
+`~/.claude/settings.json` (see step 3 of the [bootstrap sequence](#bootstrap-sequence))
+pointing `ANTHROPIC_BASE_URL` at the guest-visible endpoint, pinning every model
+tier to the configured model, and supplying `ANTHROPIC_AUTH_TOKEN`. coop owns
+this `env` block: it is set in local mode and removed in remote mode, so
+hand-authored `env` entries are not preserved. Two cache-stability keys
+(`CLAUDE_CODE_ATTRIBUTION_HEADER=0`, `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`)
+are set in local mode. They stop Claude Code from mutating the system prompt
+per request, which keeps a local inference server's prompt cache warm.
+
+Switching takes effect without a VM restart: coop rewrites `settings.json` live
+over SSH on a running VM (or saves the selection to apply on the next start). A
+running `claude` reads its config at launch, so relaunch it (`coop claude <vm>`)
+to pick up the change.
