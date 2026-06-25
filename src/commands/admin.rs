@@ -286,7 +286,7 @@ mod tests {
 
     fn cfg_with_data_dir(dir: std::path::PathBuf) -> super::config::CoopConfig {
         super::config::CoopConfig {
-            data_dir: dir,
+            data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
     }
