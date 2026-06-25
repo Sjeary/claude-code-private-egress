@@ -1796,21 +1796,27 @@ fn write_managed_claude_settings(
 ) -> Result<()> {
     target.exec(RemoteCommand::new().literal("mkdir -p ~/.claude"))?;
 
-    let existing = target.capture("cat ~/.claude/settings.json 2>/dev/null || true")?;
-
-    let merged = match merge_managed_claude_settings(&existing, local_env) {
+    // Read and merge as one fallible step so a read failure falls back to
+    // managed defaults rather than aborting boot. `capture` decodes the file as
+    // UTF-8, so a non-UTF-8 settings.json fails here; that is corrupt input,
+    // handled the same as unparseable JSON below. A genuine SSH transport
+    // failure would also fail the subsequent write on the same channel.
+    let merged = match target
+        .capture("cat ~/.claude/settings.json 2>/dev/null || true")
+        .and_then(|existing| merge_managed_claude_settings(&existing, local_env))
+    {
         Ok(merged) => merged,
         Err(err) => {
             tracing::warn!(
-                "Could not merge existing ~/.claude/settings.json ({err:#}); \
+                "Could not read or merge existing ~/.claude/settings.json ({err:#}); \
                  replacing it with managed defaults"
             );
             // Fallback is NOT preservation-safe: replacing the file with managed
             // defaults discards enabledPlugins/extraKnownMarketplaces — the very
             // keys this function exists to keep. Acceptable only because reaching
             // here means the existing file isn't a usable settings object (invalid
-            // JSON, or a non-object `permissions`), which coop never writes; a
-            // corrupt file is reset rather than merged into.
+            // or non-UTF-8 bytes, malformed JSON, or a non-object `permissions`),
+            // which coop never writes; a corrupt file is reset rather than merged.
             managed_claude_settings_json(local_env)
         }
     };

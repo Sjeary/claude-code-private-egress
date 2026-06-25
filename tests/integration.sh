@@ -811,8 +811,13 @@ test_claude_settings_merge() {
         return
     fi
 
+    # No --no-agents: the merge runs inside bootstrap_agents, which --no-agents
+    # skips entirely. A restart runs it in BootMode::Restart, which re-merges
+    # settings but does not reinstall plugins/marketplaces (those are gated to
+    # FirstBoot), so this stays cheap and offline while exercising the real
+    # guest round-trip the bug is about.
     coop stop "$INSTANCE" || true
-    if coop start "$INSTANCE" --no-agents; then
+    if coop start "$INSTANCE"; then
         pass "restart for settings merge exits 0"
     else
         fail "restart for settings merge exits 0" "stderr: $HARNESS_ERR"
