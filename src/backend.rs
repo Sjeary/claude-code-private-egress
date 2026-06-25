@@ -1829,7 +1829,7 @@ fn resolve_config_source_dir(
             };
             home.join(default_dir_name)
         }
-        ConfigDir::Custom(path) => path.clone(),
+        ConfigDir::Custom(path) => path.to_path_buf(),
     };
 
     if !path.is_dir() {

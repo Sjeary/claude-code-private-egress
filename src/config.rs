@@ -571,11 +571,68 @@ pub fn merge_forward_ports(
     out
 }
 
+/// A host filesystem path declared in `config.toml`, with a leading `~`
+/// expanded to the home directory at construction time.
+///
+/// A shell expands `~` before a program sees its command-line arguments,
+/// but values read from `config.toml` reach us verbatim — the shell never
+/// touches them. Wrapping every scalar path field in this newtype moves
+/// the expansion into the type system: it happens once, by construction,
+/// on *every* deserialization path (`load`, a bare `toml::from_str`, the
+/// fuzz target), and a newly added path field is expanded automatically
+/// just by using the type. There is no central expansion function to
+/// remember to update — the bug class #349 fixed cannot reappear.
+///
+/// Distinct from `paths::HostPath`, which is a direction marker
+/// (host vs. guest) for scp/rsync call sites and carries no invariant.
+/// This type is about the tilde-expansion invariant on config input, so
+/// it is a separate concept rather than a reuse of that marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigPath(PathBuf);
+
+impl ConfigPath {
+    /// Wrap a path, expanding a leading `~` to the home directory. The
+    /// single place the expansion invariant is established; the
+    /// [`Deserialize`] impl routes through here too.
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self(crate::shell::expand_tilde(path.as_ref()))
+    }
+}
+
+impl std::ops::Deref for ConfigPath {
+    type Target = Path;
+
+    #[mutants::skip] // equivalent: trivial forwarder; the wrapped path is asserted via ConfigPath equality
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for ConfigPath {
+    #[mutants::skip] // equivalent: trivial forwarder to the wrapped path
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for ConfigPath {
+    #[mutants::skip] // equivalent: trivial forwarder to the wrapped path
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::new(PathBuf::deserialize(deserializer)?))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CoopConfig {
     /// Directory for storing VM artifacts (images, sockets, logs)
     #[serde(default = "default_data_dir")]
-    pub data_dir: PathBuf,
+    pub data_dir: ConfigPath,
 
     #[serde(default)]
     pub vm: VmConfig,
@@ -588,7 +645,7 @@ pub struct CoopConfig {
 
     /// Path to firecracker binary
     #[serde(default = "default_firecracker_bin")]
-    pub firecracker_bin: PathBuf,
+    pub firecracker_bin: ConfigPath,
 
     /// GitHub auth strategy for the guest
     #[serde(default)]
@@ -672,7 +729,7 @@ pub struct VmConfig {
 
     /// Path to vmlinux kernel image
     #[serde(default = "default_kernel_path")]
-    pub kernel_path: PathBuf,
+    pub kernel_path: ConfigPath,
 
     /// Kernel boot arguments
     #[serde(default = "default_boot_args")]
@@ -1253,7 +1310,7 @@ fn serialize_remote<S: serde::Serializer>(
 pub enum ConfigDir {
     #[default]
     Default,
-    Custom(PathBuf),
+    Custom(ConfigPath),
     Disabled,
 }
 
@@ -1290,12 +1347,12 @@ impl<'de> serde::Deserialize<'de> for ConfigDir {
             }
 
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(ConfigDir::Custom(PathBuf::from(v)))
+                Ok(ConfigDir::Custom(ConfigPath::new(v)))
             }
 
             #[mutants::skip] // equivalent: serde routes owned strings through visit_str; this path isn't exercised by our deserializer
             fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
-                Ok(ConfigDir::Custom(PathBuf::from(v)))
+                Ok(ConfigDir::Custom(ConfigPath::new(v)))
             }
 
             #[mutants::skip] // equivalent: only called by serde for input shapes we don't accept
@@ -1705,14 +1762,6 @@ fn unique_instance_name(base: &str, instances: &[Instance]) -> Result<InstanceNa
 #[must_use]
 pub struct Validated(());
 
-/// Expand a leading `~` in a [`ConfigDir::Custom`] path; leave the
-/// built-in default variant untouched.
-fn expand_config_dir(dir: &mut ConfigDir) {
-    if let ConfigDir::Custom(path) = dir {
-        *path = crate::shell::expand_tilde(path);
-    }
-}
-
 /// Expand a leading `~` in each marketplace entry that is a path.
 ///
 /// Marketplace entries can be a URL, a GitHub repo slug, or a host
@@ -1749,21 +1798,20 @@ impl CoopConfig {
         Ok(cfg)
     }
 
-    /// Expand a leading `~` in every host path read from the config file.
+    /// Expand a leading `~` in the marketplace entries that are paths.
     ///
-    /// A shell expands `~` before a program sees its command-line
-    /// arguments, but values read from `config.toml` reach us verbatim —
-    /// the shell never touches them. So each host path field must be
-    /// expanded here, or a literal `~` directory (relative to the current
-    /// working directory) is used instead of the home directory. Doing it
-    /// in one place means a newly added path field is covered by adding a
-    /// single line here rather than being silently left literal.
+    /// Scalar path fields (`data_dir`, `firecracker_bin`,
+    /// `vm.kernel_path`) and the `config_dir` enums are [`ConfigPath`]s,
+    /// expanded by construction during deserialization, so they need no
+    /// handling here — and a future host-path field must be typed
+    /// [`ConfigPath`] (never a bare `PathBuf` or `paths::HostPath`) so the
+    /// same holds for it automatically. The expansion invariant
+    /// lives at the source because the consumers are generic filesystem /
+    /// command sinks shared with derived paths (`data_dir.join(..)`), which
+    /// cannot require the type. Marketplace entries stay special-cased:
+    /// each is a mixed URL / GitHub slug / host path, so only the
+    /// path-shaped ones (a leading `~`) can be expanded.
     fn expand_user_paths(&mut self) {
-        self.data_dir = crate::shell::expand_tilde(&self.data_dir);
-        self.firecracker_bin = crate::shell::expand_tilde(&self.firecracker_bin);
-        self.vm.kernel_path = crate::shell::expand_tilde(&self.vm.kernel_path);
-        expand_config_dir(&mut self.claude.config_dir);
-        expand_config_dir(&mut self.codex.config_dir);
         expand_marketplaces(&mut self.claude.marketplaces);
         for profile in self.profiles.values_mut() {
             expand_marketplaces(&mut profile.marketplaces);
@@ -2417,10 +2465,12 @@ fn is_firecracker_process(pid: u32) -> bool {
 
 // ── Defaults ──────────────────────────────────────────────────
 
-fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".coop")
+fn default_data_dir() -> ConfigPath {
+    ConfigPath::new(
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".coop"),
+    )
 }
 
 fn default_vcpus() -> NonZeroU8 {
@@ -2433,8 +2483,8 @@ fn default_mem_mib() -> MiB {
     MiB::new(4096).expect("4096 is non-zero")
 }
 
-fn default_kernel_path() -> PathBuf {
-    default_data_dir().join("vmlinux")
+fn default_kernel_path() -> ConfigPath {
+    ConfigPath::new(default_data_dir().join("vmlinux"))
 }
 
 fn default_template_size_gib() -> GiB {
@@ -2465,8 +2515,8 @@ fn default_ssh_port() -> NonZeroU16 {
     NonZeroU16::new(22).expect("22 is non-zero")
 }
 
-fn default_firecracker_bin() -> PathBuf {
-    default_data_dir().join("firecracker")
+fn default_firecracker_bin() -> ConfigPath {
+    ConfigPath::new(default_data_dir().join("firecracker"))
 }
 
 /// Bounded no-panic proofs (Kani), gated so normal `cargo build`/`test`/
@@ -2549,7 +2599,7 @@ mod tests {
 
     fn test_config(tmp: &TempDir) -> CoopConfig {
         CoopConfig {
-            data_dir: tmp.path().to_path_buf(),
+            data_dir: ConfigPath::new(tmp.path()),
             ..CoopConfig::default()
         }
     }
@@ -4182,7 +4232,7 @@ skip = ["not-a-slug"]
 
         // Config getters join under `data_dir`.
         let cfg = CoopConfig {
-            data_dir: PathBuf::from("/my/data"),
+            data_dir: ConfigPath::new("/my/data"),
             ..CoopConfig::default()
         };
         let python_dev = ImageName::new("python-dev").unwrap();
@@ -4213,8 +4263,11 @@ skip = ["not-a-slug"]
         // Default-value getters compose the same filenames under the
         // default data dir.
         let data = default_data_dir();
-        assert_eq!(default_kernel_path(), data.join("vmlinux"));
-        assert_eq!(default_firecracker_bin(), data.join("firecracker"));
+        assert_eq!(default_kernel_path(), ConfigPath::new(data.join("vmlinux")));
+        assert_eq!(
+            default_firecracker_bin(),
+            ConfigPath::new(data.join("firecracker"))
+        );
     }
 
     #[test]
@@ -4327,7 +4380,7 @@ skip = ["not-a-slug"]
     fn validate_collects_multiple_errors() {
         let mut cfg = CoopConfig::default();
         cfg.vm.mem_size_mib = MiB::new(64).unwrap();
-        cfg.claude.config_dir = ConfigDir::Custom("/nonexistent/claude-config".into());
+        cfg.claude.config_dir = ConfigDir::Custom(ConfigPath::new("/nonexistent/claude-config"));
         let err = cfg.validate().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("mem_size_mib"), "missing mem error: {msg}");
@@ -4347,12 +4400,12 @@ skip = ["not-a-slug"]
     /// `kernel_path` and `firecracker_bin` point at non-existent files.
     fn validate_fixture(data_dir: &Path) -> CoopConfig {
         CoopConfig {
-            data_dir: data_dir.to_path_buf(),
+            data_dir: ConfigPath::new(data_dir),
             vm: VmConfig {
-                kernel_path: data_dir.join("nonexistent-kernel"),
+                kernel_path: ConfigPath::new(data_dir.join("nonexistent-kernel")),
                 ..VmConfig::default()
             },
-            firecracker_bin: data_dir.join("nonexistent-firecracker"),
+            firecracker_bin: ConfigPath::new(data_dir.join("nonexistent-firecracker")),
             ..CoopConfig::default()
         }
     }
@@ -4433,7 +4486,7 @@ skip = ["not-a-slug"]
         fs::write(&kernel, b"").unwrap();
 
         let mut cfg = validate_fixture(&data_dir);
-        cfg.vm.kernel_path = kernel;
+        cfg.vm.kernel_path = ConfigPath::new(kernel);
         let warnings = cfg.validate().unwrap();
         assert!(
             !warnings.iter().any(|w| w.contains("kernel_path")),
@@ -4486,7 +4539,7 @@ skip = ["not-a-slug"]
         fs::write(&firecracker, b"").unwrap();
 
         let mut cfg = validate_fixture(&data_dir);
-        cfg.firecracker_bin = firecracker;
+        cfg.firecracker_bin = ConfigPath::new(firecracker);
         let warnings = cfg.validate().unwrap();
         assert!(
             !warnings.iter().any(|w| w.contains("firecracker_bin")),
@@ -4610,7 +4663,7 @@ skip = ["not-a-slug"]
     #[test]
     fn image_dir_paths() {
         let cfg = CoopConfig {
-            data_dir: PathBuf::from("/data"),
+            data_dir: ConfigPath::new("/data"),
             ..CoopConfig::default()
         };
         let foo = ImageName::new("foo").unwrap();
@@ -4971,7 +5024,7 @@ skip = ["not-a-slug"]
         let cfg: CoopConfig = serde_json::from_str(json).unwrap();
         assert_eq!(
             cfg.claude.config_dir,
-            ConfigDir::Custom(PathBuf::from("/custom/path"))
+            ConfigDir::Custom(ConfigPath::new("/custom/path"))
         );
     }
 
@@ -4981,7 +5034,7 @@ skip = ["not-a-slug"]
         let cfg: CoopConfig = serde_json::from_str(json).unwrap();
         assert_eq!(
             cfg.codex.config_dir,
-            ConfigDir::Custom(PathBuf::from("/custom/path"))
+            ConfigDir::Custom(ConfigPath::new("/custom/path"))
         );
     }
 
@@ -5027,7 +5080,7 @@ skip = ["not-a-slug"]
     fn validate_passes_with_existing_config_dir() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = CoopConfig::default();
-        cfg.claude.config_dir = ConfigDir::Custom(tmp.path().to_path_buf());
+        cfg.claude.config_dir = ConfigDir::Custom(ConfigPath::new(tmp.path()));
         assert!(cfg.validate().is_ok());
     }
 
@@ -5035,14 +5088,14 @@ skip = ["not-a-slug"]
     fn validate_passes_with_existing_codex_config_dir() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = CoopConfig::default();
-        cfg.codex.config_dir = ConfigDir::Custom(tmp.path().to_path_buf());
+        cfg.codex.config_dir = ConfigDir::Custom(ConfigPath::new(tmp.path()));
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn validate_rejects_nonexistent_config_dir() {
         let mut cfg = CoopConfig::default();
-        cfg.claude.config_dir = ConfigDir::Custom(PathBuf::from("/nonexistent/config"));
+        cfg.claude.config_dir = ConfigDir::Custom(ConfigPath::new("/nonexistent/config"));
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("config_dir"),
@@ -5053,7 +5106,7 @@ skip = ["not-a-slug"]
     #[test]
     fn validate_rejects_nonexistent_codex_config_dir() {
         let mut cfg = CoopConfig::default();
-        cfg.codex.config_dir = ConfigDir::Custom(PathBuf::from("/nonexistent/config"));
+        cfg.codex.config_dir = ConfigDir::Custom(ConfigPath::new("/nonexistent/config"));
         let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("codex.config_dir"),
@@ -5128,7 +5181,7 @@ skip = ["not-a-slug"]
         );
         assert_eq!(
             cfg.data_dir,
-            dirs::home_dir().unwrap().join("coop-data"),
+            ConfigPath::new(dirs::home_dir().unwrap().join("coop-data")),
             "should resolve to home directory"
         );
     }
@@ -5142,7 +5195,7 @@ skip = ["not-a-slug"]
         let cfg = CoopConfig::load(&path).unwrap();
         assert_eq!(
             cfg.firecracker_bin,
-            dirs::home_dir().unwrap().join("bin/firecracker"),
+            ConfigPath::new(dirs::home_dir().unwrap().join("bin/firecracker")),
             "should resolve to home directory"
         );
     }
@@ -5156,8 +5209,34 @@ skip = ["not-a-slug"]
         let cfg = CoopConfig::load(&path).unwrap();
         assert_eq!(
             cfg.vm.kernel_path,
-            dirs::home_dir().unwrap().join("kernels/vmlinux"),
+            ConfigPath::new(dirs::home_dir().unwrap().join("kernels/vmlinux")),
             "should resolve to home directory"
+        );
+    }
+
+    // The `ConfigPath` newtype expands `~` during deserialization, so the
+    // invariant holds on every path into a `CoopConfig` — not only the
+    // `load` wrapper. Pins the bypass that previously left a bare
+    // `toml::from_str` / `serde_json::from_str` (and the `config_load`
+    // fuzz target) with literal tildes.
+    #[test]
+    fn deserialize_expands_tilde_without_load() {
+        let home = dirs::home_dir().unwrap();
+        let toml_src = "data_dir = \"~/d\"\n\
+             firecracker_bin = \"~/fc\"\n\
+             [vm]\n\
+             kernel_path = \"~/k\"\n\
+             [claude]\n\
+             config_dir = \"~/cc\"\n";
+
+        let cfg: CoopConfig = toml::from_str(toml_src).unwrap();
+
+        assert_eq!(cfg.data_dir, ConfigPath::new(home.join("d")));
+        assert_eq!(cfg.firecracker_bin, ConfigPath::new(home.join("fc")));
+        assert_eq!(cfg.vm.kernel_path, ConfigPath::new(home.join("k")));
+        assert_eq!(
+            cfg.claude.config_dir,
+            ConfigDir::Custom(ConfigPath::new(home.join("cc")))
         );
     }
 
