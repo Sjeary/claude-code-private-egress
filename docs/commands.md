@@ -428,6 +428,64 @@ coop status
 coop status my-project
 ```
 
+### `model`
+
+Show or switch a VM's model backend between cloud (Anthropic / OpenAI) and a
+host-side local model server. The selection is per-instance and persists across
+restarts. Switching rewrites the guest agent config; it never rebuilds or
+restarts the VM.
+
+```
+coop model [NAME] [local|remote]
+```
+
+| Argument | Description |
+|----------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `local` | Route this VM's agents at a host-side local model server |
+| `remote` | Restore cloud defaults (Anthropic / OpenAI) |
+
+With no subcommand, `model` prints the current mode and the endpoint each tool
+(Claude, Codex) resolves to:
+
+```
+$ coop model my-project
+Instance: my-project
+Mode:     local
+Claude   local — qwen2.5-coder:32b @ http://172.16.0.1:11434
+Codex    cloud (no local endpoint configured)
+```
+
+`coop model NAME local` switches the VM to local mode. Each tool routes locally
+only if it resolves an endpoint — from `[claude.local_model]` /
+`[codex.local_model]` in `config.toml`, or from one saved earlier. For any tool
+that has neither, and only in an interactive terminal, coop prompts for a host
+URL, model name, and optional auth token, then saves that endpoint for the
+instance. (A non-interactive run declines the prompt.) If no tool ends up with
+an endpoint, the command fails. Claude and Codex are independent: you can put
+one on a local model and leave the other on cloud.
+
+`coop model NAME remote` switches back to cloud defaults for both tools. Saved
+endpoints are kept, so a later `local` does not re-prompt.
+
+Switching never requires a VM restart — coop rewrites the guest config live over
+SSH when the VM is running, or saves it to apply on the next start. An
+already-running `claude`/`codex` reads its config at launch, so relaunch the
+agent (for example `coop claude NAME`) to pick up the change.
+
+```
+coop model
+coop model my-project
+coop model my-project local
+coop model my-project remote
+```
+
+See the [`local_model`](configuration.md#local-model-routing) configuration
+reference and the local-model sections of
+[docs/claude-integration.md](claude-integration.md) and
+[docs/codex-integration.md](codex-integration.md) for the resolution and
+materialization details.
+
 ### `logs`
 
 Stream the VM serial console output.

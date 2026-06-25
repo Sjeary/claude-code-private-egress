@@ -192,6 +192,7 @@ Claude Code configuration injected into the guest VM at start time. Every field 
 | `marketplaces` | array of strings | `[]` | Plugin marketplace sources. Each entry is a GitHub repo URL or an absolute local directory path. Local directories are copied into the guest before registration. |
 | `plugins` | array of strings | `[]` | Plugins to install from registered marketplaces. Format: `plugin-name@marketplace-name`. |
 | `mcp_servers` | table | `{}` | MCP servers to register in the guest. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
+| `local_model` | table | unset | Host-side model endpoint to route Claude Code at when the VM is in local mode (`coop model <vm> local`). See [Local-model routing](#local-model-routing). |
 
 ### MCP servers
 
@@ -238,8 +239,41 @@ Codex configuration injected into the guest VM at start time. Every field is opt
 | `config_dir` | string (path) or `false` | `~/.codex` | Source directory for Codex config files. Copies an allowlist of entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from this directory to `~/.codex/` in the guest on start. Set to `false` to disable. Supports `~` expansion. |
 | `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `OPENAI_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set; list additional variables here. |
 | `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.codex/config.toml`. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
+| `local_model` | table | unset | Host-side model endpoint to route Codex at when the VM is in local mode (`coop model <vm> local`). See [Local-model routing](#local-model-routing). |
 
 coop preserves any other settings already present in the staged `config.toml`, but the `mcp_servers` table is owned by coop when `codex.mcp_servers` is configured.
+
+## Local-model routing
+
+`[claude.local_model]` and `[codex.local_model]` declare a host-side model
+endpoint to route an agent at instead of the cloud. They are inert until the VM
+is switched to local mode with [`coop model <vm> local`](commands.md#model);
+`coop model <vm> remote` restores the cloud defaults. The two tools are
+independent — configure one, both, or neither.
+
+Each block takes the same fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `host_url` | string (URL) | required | Endpoint as seen **on the host**, where the model server runs (Ollama / LM Studio / vLLM / llama.cpp). Must be an `http`/`https` URL with a host. A `localhost`/`127.0.0.1` host is rewritten to the guest's view of the host (Firecracker: the TAP gateway; Lima: `host.lima.internal`); any other host passes through verbatim, so a LAN endpoint also works. |
+| `model` | string | required | Model name to request. Must not be empty. For Claude, coop pins every model tier (opus/sonnet/haiku and the small-fast model) to this name so any tier routes locally. |
+| `auth_token` | string | unset | Auth token for the endpoint. Optional — permissive local servers (Ollama, LM Studio, vLLM) ignore it, and coop sends a dummy value when it is omitted. The value is used verbatim; unlike `api_key` it does not resolve a `cmd:` prefix. |
+
+```toml
+[claude.local_model]
+host_url = "http://localhost:11434"   # Anthropic Messages API
+model = "qwen2.5-coder:32b"
+
+[codex.local_model]
+host_url = "http://localhost:11434/v1/"   # Responses API
+model = "gpt-oss:120b"
+```
+
+An endpoint set here takes precedence over one entered interactively and saved
+in the instance's `model.json` by `coop model … local`. See the local-model
+sections of [docs/claude-integration.md](claude-integration.md) and
+[docs/codex-integration.md](codex-integration.md) for how each endpoint is
+materialized into guest config.
 
 ## `profiles` section
 

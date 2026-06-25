@@ -101,7 +101,7 @@ type = "http"
 url = "https://mcp.sentry.dev/mcp"
 ```
 
-If `config_dir` also provides a `config.toml`, coop preserves its other settings but replaces the `mcp_servers` table with the one derived from `codex.mcp_servers`.
+If `config_dir` also provides a `config.toml`, coop preserves its other settings but replaces the `mcp_servers` table with the one derived from `codex.mcp_servers`. When the VM is in [local-model mode](#local-model-support), coop also owns the `model` and `model_provider` keys and a `[model_providers.coop_local]` block; these are written on a switch to local and removed on a switch back to remote, so they are not preserved across a mode change.
 
 ## Bootstrap sequence
 
@@ -123,3 +123,33 @@ coop start --no-agents
 ```
 
 This skips the guest bootstrap sequence entirely. The VM still includes both CLIs because they are baked into the image during `coop setup`.
+
+## Local model support
+
+A VM can route Codex at a host-side local model server (Ollama / LM Studio /
+vLLM / llama.cpp) instead of OpenAI's cloud. The endpoint must serve the
+Responses API — the only wire API Codex currently supports. Switch a VM with
+[`coop model <vm> local`](commands.md#model) and back with
+`coop model <vm> remote`; configure the endpoint under
+[`[codex.local_model]`](configuration.md#local-model-routing) or interactively
+at the `coop model … local` prompt.
+
+The selection is per VM and independent of Claude — Codex can run on a local
+model while Claude stays on cloud, or the reverse. The endpoint Codex resolves
+is the `[codex.local_model]` config block if present, otherwise an endpoint
+saved interactively for the instance, otherwise none (it stays on cloud).
+Config takes precedence over the saved endpoint.
+
+In local mode coop injects three coop-owned keys into `~/.codex/config.toml`:
+`model` (the configured model), `model_provider` (`coop_local`), and a
+`[model_providers.coop_local]` block pointing `base_url` at the guest-visible
+endpoint with `wire_api = "responses"`. The provider reads its API key from the
+`COOP_LOCAL_API_KEY` env var, which coop forwards with the configured (or dummy)
+token. These keys are coop-owned: they are written on a switch to local and
+removed on a switch back to remote, so they are not preserved across a mode
+change.
+
+Switching takes effect without a VM restart: coop rewrites `config.toml` live
+over SSH on a running VM (or saves the selection to apply on the next start). A
+running `codex` reads its config at launch, so relaunch it (`coop codex <vm>`)
+to pick up the change.
