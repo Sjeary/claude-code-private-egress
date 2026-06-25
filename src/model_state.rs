@@ -161,10 +161,29 @@ impl ModelState {
 /// [`crate::network::rewrite_host_url`]). Every model tier is pinned to
 /// the same local model so requests for any tier route locally. A
 /// `BTreeMap` gives deterministic JSON for stable diffs and tests.
+///
+/// Two keys exist purely to keep a local inference server's KV cache
+/// warm. Local backends (llama.cpp, vLLM) reuse the prompt cache only on
+/// an exact prefix match, so anything Claude Code mutates per request
+/// forces a full re-prefill of the 20K+ token system prompt — seconds of
+/// latency on every tool call. We disable the two known mutators:
+/// `CLAUDE_CODE_ATTRIBUTION_HEADER` (a per-request billing/version
+/// fingerprint) and `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS` (the `git
+/// status` snapshot, which changes every time a file is touched). Both
+/// only matter against a self-hosted endpoint, and this block is written
+/// only in local mode, so they are correctly scoped.
 pub fn claude_env_block(base_url: &str, model: &str, auth_token: &str) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("ANTHROPIC_BASE_URL".to_string(), base_url.to_string());
     env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), auth_token.to_string());
+    env.insert(
+        "CLAUDE_CODE_ATTRIBUTION_HEADER".to_string(),
+        "0".to_string(),
+    );
+    env.insert(
+        "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS".to_string(),
+        "1".to_string(),
+    );
     for tier in [
         "ANTHROPIC_MODEL",
         "ANTHROPIC_SMALL_FAST_MODEL",
@@ -416,6 +435,17 @@ mod tests {
         ] {
             assert_eq!(env[tier], "qwen2.5-coder", "tier {tier} not pinned");
         }
+    }
+
+    #[test]
+    fn claude_env_block_disables_prefix_cache_busters() {
+        // Both keys keep a local KV cache warm by stopping Claude Code
+        // from mutating the system prompt per request (see the doc on
+        // `claude_env_block`). A regression here silently restores the
+        // ~60s-per-tool-call latency on local backends.
+        let env = claude_env_block("http://172.16.0.1:11434", "qwen2.5-coder", "tok");
+        assert_eq!(env["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0");
+        assert_eq!(env["CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"], "1");
     }
 
     #[test]
