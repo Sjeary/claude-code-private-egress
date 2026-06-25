@@ -583,7 +583,7 @@ pub fn merge_forward_ports(
 /// just by using the type. There is no central expansion function to
 /// remember to update — the bug class #349 fixed cannot reappear.
 ///
-/// Distinct from [`crate::paths::HostPath`], which is a direction marker
+/// Distinct from `paths::HostPath`, which is a direction marker
 /// (host vs. guest) for scp/rsync call sites and carries no invariant.
 /// This type is about the tilde-expansion invariant on config input, so
 /// it is a separate concept rather than a reuse of that marker.
@@ -1803,9 +1803,14 @@ impl CoopConfig {
     /// Scalar path fields (`data_dir`, `firecracker_bin`,
     /// `vm.kernel_path`) and the `config_dir` enums are [`ConfigPath`]s,
     /// expanded by construction during deserialization, so they need no
-    /// handling here. Marketplace entries stay special-cased: each is a
-    /// mixed URL / GitHub slug / host path, so only the path-shaped ones
-    /// (a leading `~`) can be expanded.
+    /// handling here — and a future host-path field must be typed
+    /// [`ConfigPath`] (never a bare `PathBuf` or `paths::HostPath`) so the
+    /// same holds for it automatically. The expansion invariant
+    /// lives at the source because the consumers are generic filesystem /
+    /// command sinks shared with derived paths (`data_dir.join(..)`), which
+    /// cannot require the type. Marketplace entries stay special-cased:
+    /// each is a mixed URL / GitHub slug / host path, so only the
+    /// path-shaped ones (a leading `~`) can be expanded.
     fn expand_user_paths(&mut self) {
         expand_marketplaces(&mut self.claude.marketplaces);
         for profile in self.profiles.values_mut() {
