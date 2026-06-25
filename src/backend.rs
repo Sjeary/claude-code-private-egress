@@ -1724,8 +1724,9 @@ fn managed_claude_settings_json(local_env: &BTreeMap<String, String>) -> String 
 /// Merge coop's managed permission keys into an existing `settings.json` body.
 ///
 /// Only the managed `permissions` keys are forced; every other key Claude
-/// Code writes is preserved — notably `enabledPlugins` and
-/// `extraKnownMarketplaces`, which record installed plugins and marketplaces.
+/// Code writes is preserved (except the coop-managed `env` block — see below)
+/// — notably `enabledPlugins` and `extraKnownMarketplaces`, which record
+/// installed plugins and marketplaces.
 /// Overwriting the whole file (the previous behavior) wiped those on every
 /// boot, so plugins installed on first boot vanished from `/plugins` after a
 /// stop/start cycle, since plugin install only runs on `BootMode::FirstBoot`.
@@ -1799,8 +1800,12 @@ fn write_managed_claude_settings(
     // Read and merge as one fallible step so a read failure falls back to
     // managed defaults rather than aborting boot. `capture` decodes the file as
     // UTF-8, so a non-UTF-8 settings.json fails here; that is corrupt input,
-    // handled the same as unparseable JSON below. A genuine SSH transport
-    // failure would also fail the subsequent write on the same channel.
+    // handled the same as unparseable JSON below. The realistic Err is exactly
+    // that corrupt file, which we want to reset anyway. A transient SSH read
+    // failure (read and write are separate connections) is rare and back-to-
+    // back with the write that follows; if that is ever shown to lose a
+    // readable file in practice, distinguish a non-zero ssh exit from a decode
+    // error and `?`-propagate the former.
     let merged = match target
         .capture("cat ~/.claude/settings.json 2>/dev/null || true")
         .and_then(|existing| merge_managed_claude_settings(&existing, local_env))
@@ -2756,6 +2761,34 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
                 .and_then(serde_json::Value::as_str),
             Some("qwen2.5-coder"),
             "local-model env block must be merged in",
+        );
+    }
+
+    #[test]
+    fn merge_managed_claude_settings_replaces_existing_env_in_local_mode() {
+        // Local mode replaces the whole env block rather than key-merging: coop
+        // owns env (for local-model routing), so a stale/foreign env entry is
+        // dropped, not preserved alongside the managed keys.
+        let existing = r#"{"env": {"STALE": "1", "ANTHROPIC_MODEL": "old"}}"#;
+        let env = crate::model_state::claude_env_block(
+            "http://172.16.0.1:11434",
+            "qwen2.5-coder",
+            "coop-local",
+        );
+
+        let merged = merge_managed_claude_settings(existing, &env).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
+
+        assert!(
+            parsed.pointer("/env/STALE").is_none(),
+            "coop owns the env block; a foreign env entry must not survive: {merged}",
+        );
+        assert_eq!(
+            parsed
+                .pointer("/env/ANTHROPIC_MODEL")
+                .and_then(serde_json::Value::as_str),
+            Some("qwen2.5-coder"),
+            "the managed env block must replace the prior one",
         );
     }
 
