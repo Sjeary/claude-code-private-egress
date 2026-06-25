@@ -4,7 +4,7 @@ coop reads configuration from `~/.coop/config.toml` by default. Pass `--config <
 
 If the file does not exist, coop falls back to built-in defaults. A valid minimal config is an empty file.
 
-A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, and the `marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
+A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, and the `claude.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
 
 Run `coop validate` to surface errors and warnings before anything touches a VM.
 
