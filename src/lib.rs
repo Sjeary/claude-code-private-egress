@@ -1288,6 +1288,15 @@ mod tests {
     }
 
     #[test]
+    fn model_action_maps_to_mode() {
+        use crate::model_state::ModelMode;
+
+        use super::ModelAction;
+        assert_eq!(ModelMode::from(ModelAction::Local), ModelMode::Local);
+        assert_eq!(ModelMode::from(ModelAction::Remote), ModelMode::Remote);
+    }
+
+    #[test]
     fn shell_subcommand_parses() {
         let cli = parse(&["shell"]);
         assert!(matches!(cli.command, super::Commands::Shell { .. }));

@@ -286,6 +286,12 @@ mod tests {
     }
 
     #[test]
+    fn mode_as_str_round_trips() {
+        assert_eq!(ModelMode::Remote.as_str(), "remote");
+        assert_eq!(ModelMode::Local.as_str(), "local");
+    }
+
+    #[test]
     fn try_load_returns_none_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let inst = fake_instance(tmp.path().to_path_buf());
@@ -300,6 +306,24 @@ mod tests {
             ModelState::load_or_default(&inst).unwrap().mode,
             ModelMode::Remote
         );
+    }
+
+    #[test]
+    fn load_or_default_returns_saved_state() {
+        // Distinguishes load_or_default from "always default": a saved
+        // non-default (Local) state must come back as Local, not Remote.
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = fake_instance(tmp.path().to_path_buf());
+        ModelState {
+            mode: ModelMode::Local,
+            claude_endpoint: Some(endpoint("http://localhost:11434", "qwen", None)),
+            ..Default::default()
+        }
+        .save(&inst)
+        .unwrap();
+        let loaded = ModelState::load_or_default(&inst).unwrap();
+        assert_eq!(loaded.mode, ModelMode::Local);
+        assert_eq!(loaded.claude_endpoint.as_ref().unwrap().model(), "qwen");
     }
 
     #[test]
