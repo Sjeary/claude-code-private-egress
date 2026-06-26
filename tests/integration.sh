@@ -120,7 +120,7 @@ coop() {
 }
 
 # Run a command expecting failure. Returns 0 if the command fails.
-moat_fails() {
+coop_fails() {
     if coop "$@"; then
         return 1
     else
@@ -137,12 +137,12 @@ guest_exec() {
 }
 
 # Run the exec subcommand (captures stdout, propagates exit code).
-moat_exec() {
+coop_exec() {
     local inst="${GUEST_INSTANCE:-$INSTANCE}"
     RUST_LOG=off "$BINARY" exec "$inst" -- "$@" 2>"$tmpdir/guest_stderr"
 }
 
-# Return captured stderr from the last guest_exec/moat_exec call.
+# Return captured stderr from the last guest_exec/coop_exec call.
 guest_stderr() {
     cat "$tmpdir/guest_stderr" 2>/dev/null
 }
@@ -293,21 +293,21 @@ test_invalid_names() {
     echo "=== Phase: invalid instance names ==="
 
     # Path traversal
-    if moat_fails start "../../../tmp/evil" --no-agents; then
+    if coop_fails start "../../../tmp/evil" --no-agents; then
         pass "rejects path traversal name"
     else
         fail "rejects path traversal name" "should have failed"
     fi
 
     # Newline injection
-    if moat_fails start $'evil\nname' --no-agents; then
+    if coop_fails start $'evil\nname' --no-agents; then
         pass "rejects newline in name"
     else
         fail "rejects newline in name" "should have failed"
     fi
 
     # Empty name is fine (auto-generated), but spaces are not
-    if moat_fails start "name with spaces" --no-agents; then
+    if coop_fails start "name with spaces" --no-agents; then
         pass "rejects spaces in name"
     else
         fail "rejects spaces in name" "should have failed"
@@ -370,7 +370,7 @@ test_profiles_cli() {
     done
 
     # `profiles show <unknown>` fails
-    if moat_fails profiles show nonexistent-profile; then
+    if coop_fails profiles show nonexistent-profile; then
         pass "profiles show rejects unknown profile"
     else
         fail "profiles show rejects unknown profile" "should have failed"
@@ -428,7 +428,7 @@ test_start_rejects_missing_instance() {
     echo "=== Phase: start rejects missing instance ==="
 
     local missing="${INSTANCE}-missing"
-    if moat_fails start "$missing" --no-agents; then
+    if coop_fails start "$missing" --no-agents; then
         pass "start rejects missing instance"
     else
         fail "start rejects missing instance" "should have failed"
@@ -442,7 +442,7 @@ test_duplicate_name() {
 
     local other_ws="$tmpdir/duplicate-ws"
     mkdir -p "$other_ws"
-    if moat_fails up "$other_ws" --name "$INSTANCE" --no-agents --no-devcontainer; then
+    if coop_fails up "$other_ws" --name "$INSTANCE" --no-agents --no-devcontainer; then
         pass "rejects duplicate instance name"
     else
         fail "rejects duplicate instance name" "should have failed"
@@ -450,7 +450,7 @@ test_duplicate_name() {
         coop destroy "$INSTANCE" 2>/dev/null || true
     fi
 
-    if moat_fails up "$tmpdir/primary-ws" --name "${INSTANCE}-other" --no-agents --no-devcontainer; then
+    if coop_fails up "$tmpdir/primary-ws" --name "${INSTANCE}-other" --no-agents --no-devcontainer; then
         pass "rejects mismatched name for existing project"
     else
         fail "rejects mismatched name for existing project" "should have failed"
@@ -696,7 +696,7 @@ test_exec() {
     echo "=== Phase: exec ==="
 
     local output
-    if output=$(moat_exec echo "exec-works"); then
+    if output=$(coop_exec echo "exec-works"); then
         pass "exec exits 0"
     else
         fail "exec exits 0"
@@ -711,7 +711,7 @@ test_exec() {
 
     # Verify non-zero exit code propagates
     local rc=0
-    moat_exec false || rc=$?
+    coop_exec false || rc=$?
     if [[ $rc -ne 0 ]]; then
         pass "exec propagates non-zero exit code"
     else
@@ -734,7 +734,7 @@ test_claude_bin_path() {
     fi
 
     # Verify coop exec can invoke it by full path
-    if moat_exec /home/ubuntu/.local/bin/claude --version >/dev/null; then
+    if coop_exec /home/ubuntu/.local/bin/claude --version >/dev/null; then
         pass "claude binary invocable via full path"
     else
         # --version may fail without auth, but any output means the binary ran
@@ -804,7 +804,7 @@ test_claude_settings_merge() {
     local seed='mkdir -p ~/.claude && printf "%s" '
     seed+='"{\"enabledPlugins\":{\"sentinel@m\":true},\"permissions\":{\"defaultMode\":\"default\"}}" '
     seed+='> ~/.claude/settings.json'
-    if moat_exec sh -c "$seed"; then
+    if coop_exec sh -c "$seed"; then
         pass "seed settings.json with sentinel plugin"
     else
         fail "seed settings.json with sentinel plugin" "stderr: $(guest_stderr)"
@@ -825,7 +825,7 @@ test_claude_settings_merge() {
     fi
 
     local merged
-    if ! merged=$(moat_exec sh -c 'cat ~/.claude/settings.json'); then
+    if ! merged=$(coop_exec sh -c 'cat ~/.claude/settings.json'); then
         fail "read merged settings.json after restart" "stderr: $(guest_stderr)"
         return
     fi
@@ -843,6 +843,77 @@ test_claude_settings_merge() {
     fi
 }
 
+test_claude_onboarding_seed() {
+    echo ""
+    echo "=== Phase: claude onboarding seed (issue #365) ==="
+
+    # Claude Code gates its onboarding wizard on hasCompletedOnboarding in
+    # ~/.claude.json and ignores CLAUDE_CODE_OAUTH_TOKEN for that check, so coop
+    # seeds the flag in seed_claude_onboarding (src/backend.rs). The seed is
+    # gated on CLAUDE_CODE_OAUTH_TOKEN reaching the guest env and runs inside
+    # bootstrap_agents on every boot (FirstBoot and Restart). This phase pins
+    # the env gate and the restart path with the same real stop/start round-trip
+    # the settings-merge phase above uses. No --no-agents: that skips
+    # bootstrap_agents entirely, so the seed never runs.
+    #
+    # Order matters: --env persists into guest_env_state.json across restarts,
+    # so the negative (no-token) case must run before the positive case adds the
+    # token. The dummy token makes the throwaway `claude -p` call in
+    # seed_claude_json fail/time out by design — the file is written from the
+    # merge step regardless, so this phase asserts only on ~/.claude.json, never
+    # on that command's exit status.
+
+    # Negative env gate: restart without the token. The early return in
+    # seed_claude_onboarding must make this a complete no-op — ~/.claude.json
+    # must NOT be created, or credential-less guests would lose the interactive
+    # login flow. Remove the file first: an earlier phase ran `claude --version`,
+    # which can leave a ~/.claude.json behind, so the assertion must test "the
+    # seed did not (re)create it" rather than "the file never existed."
+    if ! coop_exec sh -c 'rm -f ~/.claude.json'; then
+        fail "remove ~/.claude.json before negative case" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    coop stop "$INSTANCE" || true
+    if coop start "$INSTANCE"; then
+        pass "restart without token exits 0"
+    else
+        fail "restart without token exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    if coop_exec sh -c 'test ! -e ~/.claude.json'; then
+        pass "~/.claude.json absent without CLAUDE_CODE_OAUTH_TOKEN"
+    else
+        fail "~/.claude.json absent without CLAUDE_CODE_OAUTH_TOKEN" \
+            "file was seeded despite no token; stderr: $(guest_stderr)"
+    fi
+
+    # Positive env gate on BootMode::Restart: stop/start with the token
+    # forwarded. bootstrap_agents runs seed_claude_onboarding, which seeds
+    # ~/.claude.json with hasCompletedOnboarding: true.
+    coop stop "$INSTANCE" || true
+    if coop start "$INSTANCE" --env "CLAUDE_CODE_OAUTH_TOKEN=dummy-token-issue-365"; then
+        pass "restart with token exits 0"
+    else
+        fail "restart with token exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    local seeded
+    if ! seeded=$(coop_exec sh -c 'cat ~/.claude.json'); then
+        fail "read ~/.claude.json after seeding" \
+            "file missing after restart with token; stderr: $(guest_stderr)"
+        return
+    fi
+
+    if echo "$seeded" | grep -q '"hasCompletedOnboarding":[[:space:]]*true'; then
+        pass "~/.claude.json seeded with hasCompletedOnboarding: true"
+    else
+        fail "~/.claude.json seeded with hasCompletedOnboarding: true" "$seeded"
+    fi
+}
+
 test_codex_bin_path() {
     echo ""
     echo "=== Phase: codex binary path ==="
@@ -854,7 +925,7 @@ test_codex_bin_path() {
         return
     fi
 
-    if moat_exec /usr/local/bin/codex --version >/dev/null; then
+    if coop_exec /usr/local/bin/codex --version >/dev/null; then
         pass "codex binary invocable via full path"
     else
         fail "codex binary invocable via full path" "stderr: $(guest_stderr)"
@@ -895,7 +966,7 @@ test_codex_sandbox_bypass() {
     # coop<->Codex contract: the installed Codex must accept that exact flag in the
     # global position coop uses. If a Codex release renames or moves it, this fails
     # loudly rather than silently re-enabling the broken sandbox.
-    if moat_exec /usr/local/bin/codex --dangerously-bypass-approvals-and-sandbox \
+    if coop_exec /usr/local/bin/codex --dangerously-bypass-approvals-and-sandbox \
         exec --help >/dev/null; then
         pass "codex accepts global --dangerously-bypass-approvals-and-sandbox flag"
     else
@@ -1460,7 +1531,7 @@ test_auto_resolve_stopped() {
         return
     fi
 
-    if moat_fails shell -- echo "should-not-work"; then
+    if coop_fails shell -- echo "should-not-work"; then
         pass "shell rejects when only stopped instances exist"
         if echo "$HARNESS_ERR" | grep -qi "stopped"; then
             pass "shell error mentions instance is stopped"
@@ -1621,7 +1692,7 @@ test_commit_restore() {
     fi
 
     # Committing onto an existing name without --force is refused.
-    if moat_fails commit "$INSTANCE" --image "$snap"; then
+    if coop_fails commit "$INSTANCE" --image "$snap"; then
         pass "commit without --force refuses to overwrite"
         if echo "$HARNESS_ERR" | grep -qi "already exists\|--force"; then
             pass "overwrite error suggests --force"
@@ -1654,7 +1725,7 @@ test_commit_restore() {
     fi
 
     # Restoring a non-existent image fails with a clear message.
-    if moat_fails restore "$INSTANCE" --image "no-such-image-$$"; then
+    if coop_fails restore "$INSTANCE" --image "no-such-image-$$"; then
         pass "restore rejects unknown image"
     else
         fail "restore rejects unknown image" "should have failed"
@@ -1682,7 +1753,7 @@ test_commit_restore() {
         fi
 
         # commit/restore on a running instance must be refused.
-        if moat_fails commit "$INSTANCE" --image "$snap-live"; then
+        if coop_fails commit "$INSTANCE" --image "$snap-live"; then
             pass "commit refuses a running instance"
             if echo "$HARNESS_ERR" | grep -qi "running\|stop"; then
                 pass "commit error tells the user to stop first"
@@ -1749,7 +1820,7 @@ test_restart_stopped() {
     fi
 
     # Verify duplicate start of running instance is rejected
-    if moat_fails start "$INSTANCE" --no-agents; then
+    if coop_fails start "$INSTANCE" --no-agents; then
         pass "rejects start of already-running instance"
     else
         fail "rejects start of already-running instance" "should have failed"
@@ -1770,7 +1841,7 @@ test_restart_rejects_ignored_flags() {
     local mount_dir
     mount_dir=$(mktemp -d)
 
-    if moat_fails start "$INSTANCE" --no-agents --workspace "$mount_dir"; then
+    if coop_fails start "$INSTANCE" --no-agents --workspace "$mount_dir"; then
         pass "restart with --workspace rejected"
     else
         fail "restart with --workspace rejected" "should have failed"
@@ -1789,7 +1860,7 @@ test_restart_rejects_ignored_flags() {
     local flag
     for flag in "--mount $mount_dir" "--disk 20" "--vcpus 4" --exclude-git; do
         # shellcheck disable=SC2086
-        if moat_fails start "$INSTANCE" --no-agents $flag; then
+        if coop_fails start "$INSTANCE" --no-agents $flag; then
             pass "start ${flag%% *} rejected by clap"
         else
             fail "start ${flag%% *} rejected by clap" "should have failed"
@@ -1848,7 +1919,7 @@ test_auto_resolve_no_instances() {
         return
     fi
 
-    if moat_fails shell -- echo "should-not-work"; then
+    if coop_fails shell -- echo "should-not-work"; then
         pass "shell rejects when no instances exist"
         if echo "$HARNESS_ERR" | grep -qi "no instances"; then
             pass "shell error mentions no instances"
@@ -2079,7 +2150,7 @@ test_up_project_workflow() {
     local reject_ws data_dir
     reject_ws=$(mktemp -d "$tmpdir/up-reject-XXXXXX")
     data_dir=$(mktemp -d "$tmpdir/up-data-XXXXXX")
-    if moat_fails up "$reject_ws" --extra-mount "$data_dir" --no-devcontainer; then
+    if coop_fails up "$reject_ws" --extra-mount "$data_dir" --no-devcontainer; then
         if echo "$HARNESS_ERR" | grep -q "/workspace"; then
             pass "up copy rejects host-only extra mount at /workspace"
         else
@@ -2177,12 +2248,12 @@ test_git_repo() {
     # no VM boot).
     local some_dir
     some_dir=$(mktemp -d "$tmpdir/gitrepo-dir-XXXXXX")
-    if moat_fails up "$some_dir" --git-repo "$repo_url" --no-devcontainer; then
+    if coop_fails up "$some_dir" --git-repo "$repo_url" --no-devcontainer; then
         pass "up --git-repo conflicts with a positional directory"
     else
         fail "up --git-repo conflicts with a positional directory" "should have failed"
     fi
-    if moat_fails up --git-repo "$repo_url" --mount --no-devcontainer; then
+    if coop_fails up --git-repo "$repo_url" --mount --no-devcontainer; then
         pass "up --git-repo conflicts with --mount"
     else
         fail "up --git-repo conflicts with --mount" "should have failed"
@@ -2191,7 +2262,7 @@ test_git_repo() {
 
     # --extra-mount targeting /workspace collides with the clone; rejected
     # before boot (--no-devcontainer avoids remote devcontainer discovery).
-    if moat_fails up --git-repo "$repo_url" --name "$gr_instance" \
+    if coop_fails up --git-repo "$repo_url" --name "$gr_instance" \
             --extra-mount "$data_dir:/workspace" --no-agents --no-devcontainer; then
         if echo "$HARNESS_ERR" | grep -q "/workspace"; then
             pass "up --git-repo rejects --extra-mount at /workspace"
@@ -2345,7 +2416,7 @@ test_workspace_sync() {
     fi
 
     # Modify file in guest, then pull
-    moat_exec sh -c 'echo modified-in-guest > /workspace/hello.txt' || true
+    coop_exec sh -c 'echo modified-in-guest > /workspace/hello.txt' || true
 
     local pull_dir
     pull_dir=$(mktemp -d)
@@ -2436,7 +2507,7 @@ test_multi_instance() {
     fi
 
     # Auto-resolve should fail when multiple instances are running
-    if moat_fails shell -- echo "should-not-work"; then
+    if coop_fails shell -- echo "should-not-work"; then
         pass "shell rejects auto-resolve with multiple running"
         if echo "$HARNESS_ERR" | grep -qi "multiple"; then
             pass "error mentions multiple running instances"
@@ -3874,7 +3945,7 @@ EOF
         fail "devcontainer clear removes stale deleted-project opt-out" "ignore failed: $HARNESS_ERR"
     fi
 
-    if moat_fails --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref-cleared" --no-agents; then
+    if coop_fails --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref-cleared" --no-agents; then
         if grep -qi "devcontainer" <<< "$HARNESS_ERR" \
             && grep -q -- "--no-devcontainer" <<< "$HARNESS_ERR"; then
             pass "cleared devcontainer opt-out restores non-TTY prompt error"
@@ -3887,7 +3958,7 @@ EOF
 
     # Non-interactive + discovered file + no escape hatch must error with the
     # hint pointing at --devcontainer / --no-devcontainer.
-    if moat_fails up "$dcdir" --name "${INSTANCE}-dc-noopt" --no-agents; then
+    if coop_fails up "$dcdir" --name "${INSTANCE}-dc-noopt" --no-agents; then
         if grep -qi "devcontainer" <<< "$HARNESS_ERR" \
             && grep -q -- "--no-devcontainer" <<< "$HARNESS_ERR"; then
             pass "non-TTY without escape hatch errors with hint"
@@ -4174,14 +4245,14 @@ test_guest_user_validation() {
 
     # `root` is rejected by the GuestUser validator: coop requires an
     # unprivileged uid-1000 account.
-    if moat_fails setup -y --guest-user root --dry-run; then
+    if coop_fails setup -y --guest-user root --dry-run; then
         pass "setup --guest-user root is rejected"
     else
         fail "setup --guest-user root is rejected" "should have failed"
     fi
 
     # Uppercase and other non-POSIX-portable characters are rejected.
-    if moat_fails setup -y --guest-user Vscode --dry-run; then
+    if coop_fails setup -y --guest-user Vscode --dry-run; then
         pass "setup --guest-user with uppercase rejected"
     else
         fail "setup --guest-user with uppercase rejected" "should have failed"
@@ -4189,7 +4260,7 @@ test_guest_user_validation() {
 
     # `--guest-user` is only on `setup` — the rest of the lifecycle
     # reads the persisted value. clap should reject the flag on `start`.
-    if moat_fails start "${INSTANCE}-gu-flag" --guest-user vscode --no-agents; then
+    if coop_fails start "${INSTANCE}-gu-flag" --guest-user vscode --no-agents; then
         if grep -qi "unexpected\|unknown\|unrecognized\|--guest-user" <<< "$HARNESS_ERR"; then
             pass "start --guest-user is rejected as unknown flag"
         else
@@ -4399,6 +4470,7 @@ main() {
     test_exec
     test_claude_bin_path
     test_claude_settings_merge
+    test_claude_onboarding_seed
     test_codex_bin_path
     test_codex_sandbox_bypass
     test_github_token_forwarding
