@@ -34,6 +34,12 @@ exclude_globs = [
     "src/vm.rs",
     # Thin binary shim: `fn main() { coop::run() }`. All logic is in the lib.
     "src/main.rs",
+    # Interactive y/N + free-form line prompts (confirm / confirm_default_yes /
+    # read_line). Every function short-circuits to Ok(false)/Ok(None) off a TTY
+    # and otherwise reads stdin; the trailing match on the reply is only
+    # reachable behind a real terminal, so a `--lib` test cannot observe any of
+    # it. Whole-module exclude (cf. read_line added for #352, issue #373).
+    "src/prompt.rs",
 ]
 
 # Individual functions in otherwise-logic-bearing modules. Patterns match
@@ -207,6 +213,43 @@ exclude_re = [
     # lib.rs shim — tracing-subscriber install. (The `run` dispatch is scoped
     # out via an in-source `#[mutants::skip]`; see the TranslatorInputs note.)
     "\\binit_tracing\\b",
+
+    # ---- coop model (#352): local/cloud model switch ----
+    # The pure logic is extracted and unit-tested in scope: tools_needing_prompt,
+    # switch_report_lines, resolved_claude / resolved_codex, ModelMode::as_str
+    # (pinned by mode_as_str_round_trips), and the From<ModelAction> mapping
+    # (pinned by model_action_maps_to_mode in lib.rs). What is excluded below
+    # writes stdout, drives the backend over SSH, or reads a TTY —
+    # tests/integration.sh covers those, a `--lib` test cannot.
+
+    # commands/model.rs — stdout writers, the state-save + SSH-apply
+    # orchestrators (set_local/set_remote, including set_local's `&&` endpoint
+    # guard), the thin stdout wrapper over switch_report_lines (report_switch),
+    # the `&PlatformBackend` handler (apply_to_running), and the TTY prompt.
+    # render_status is file-anchored because github_pat.rs has a *pure* (kept,
+    # tested) render_status; a bare \brender_status\b would wrongly scope it out.
+    "src/commands/model\\.rs:.*\\brender_status\\b",
+    "\\bwrite_tool_line\\b",
+    "\\bset_local\\b",
+    "\\bset_remote\\b",
+    "\\breport_switch\\b",
+    "\\bapply_to_running\\b",
+    "\\bprompt_endpoint\\b",
+
+    # (model_state.rs's load_or_default stays IN scope: it is tempdir-testable,
+    # and load_or_default_returns_saved_state kills its `Ok(Default::default())`
+    # mutant — which load_or_default_is_remote_when_missing alone cannot, since
+    # the default IS Remote on the missing-file path.)
+
+    # (prompt.rs — read_line and the other TTY prompts are scoped whole-module
+    # via exclude_globs above.)
+
+    # lifecycle.rs — backend-driving session/bootstrap helpers. Both open an SSH
+    # session and bootstrap guest agents (prepare_session_from_target also reads
+    # persisted guest-env / model state from disk); their effects are observable
+    # only against a real VM.
+    "\\bbootstrap_and_post_start\\b",
+    "\\bprepare_session_from_target\\b",
 
     # NOTE on `delete field … from struct …` mutants: cargo-mutants (27.x) does
     # not honour exclude_re for these — the regex never matches their name (not
