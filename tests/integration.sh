@@ -3696,11 +3696,26 @@ CFGEOF
         fail "model local exits 0" "exit: $? stderr: $HARNESS_ERR"
     fi
 
-    # Claude settings.json carries the env block with a rewritten host.
+    # The VM is running, so the change applies live: assert the no-restart
+    # fast-path report line rather than the "applies on next start" message.
+    if echo "$HARNESS_OUT" | grep -qi "no restart needed"; then
+        pass "model local reports no-restart fast path"
+    else
+        fail "model local reports no-restart fast path" "out: $HARNESS_OUT"
+    fi
+
+    # Claude settings.json carries the env block with a rewritten host. The
+    # two cache-buster keys (CLAUDE_CODE_ATTRIBUTION_HEADER,
+    # CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS) disable the per-request prompt
+    # mutators that would otherwise re-prefill a local backend's KV cache on
+    # every tool call; they exist only in the local env block, so assert they
+    # reach the guest — the unit test pins only the in-process map shape.
     local settings
     if settings=$(lm_exec cat ./.claude/settings.json); then
         if echo "$settings" | grep -q "$claude_model" \
             && echo "$settings" | grep -q "ANTHROPIC_BASE_URL" \
+            && echo "$settings" | grep -q "CLAUDE_CODE_ATTRIBUTION_HEADER" \
+            && echo "$settings" | grep -q "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS" \
             && ! echo "$settings" | grep -q "localhost"; then
             pass "claude settings.json has rewritten local env block"
         else
