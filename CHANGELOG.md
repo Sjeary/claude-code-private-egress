@@ -1,8 +1,22 @@
 # Changelog
 
-## Unreleased
+## v0.5.2
 
 ### New features
+
+- **`coop model` — route a VM at a host-side local model** (#352) —
+  Points Claude Code and Codex at a local model server (Ollama, LM
+  Studio, vLLM, llama.cpp) running on the host instead of the cloud,
+  configured per tool under `[claude.local_model]` /
+  `[codex.local_model]` in `config.toml`. `coop model <vm>` reports the
+  per-tool mode and resolved endpoint; `coop model <vm> local` routes
+  the VM at the local model(s) and `coop model <vm> remote` restores
+  the cloud defaults. The selection is a persisted per-VM setting (not
+  a per-launch flag), so it applies to `coop shell`, `coop claude`,
+  `coop codex`, and VS Code alike; switching writes guest config over
+  SSH with no rebuild and is re-applied on the next boot. A
+  `localhost`/loopback `host_url` is rewritten to the backend's
+  guest-visible host automatically.
 
 - **`coop codex` bypasses Codex's sandbox by default** (#353) — `coop codex`
   now launches Codex with `--dangerously-bypass-approvals-and-sandbox`, so it
@@ -20,6 +34,36 @@
   stopped instance back to an image's filesystem in place, keeping the
   instance's name, index, IP, and workspace association. Both require a
   stopped instance; `commit --force` overwrites an existing image name.
+
+### Fixes
+
+- **OAuth-token users no longer land in Claude Code's onboarding wizard**
+  (#87) — Running `coop claude` with subscription auth
+  (`CLAUDE_CODE_OAUTH_TOKEN` forwarded into the guest) dropped the user
+  into the first-run theme/login wizard, whose login step ignores the
+  token. Claude Code gates the wizard on `hasCompletedOnboarding` in
+  `~/.claude.json`, which coop never staged. coop now seeds that flag on
+  boot when an OAuth token is forwarded and the flag is not already set.
+  Idempotent and a no-op for API-key and no-credential users. Reverts
+  when anthropics/claude-code#8938 is fixed upstream.
+
+- **Installed Claude plugins survive a stop/start cycle** (#350) —
+  `write_managed_claude_settings` rewrote `~/.claude/settings.json` from
+  scratch on every boot with only a `permissions` block, deleting the
+  `enabledPlugins` and `extraKnownMarketplaces` keys Claude Code uses to
+  track installed plugins and marketplaces. Plugins installed on first
+  boot then showed as uninstalled in `/plugins` after a restart. coop now
+  merges its managed `permissions` into the existing file, preserving
+  those keys.
+
+- **`~` is expanded in every `config.toml` path field** (#349, #351) — A
+  leading `~` was only expanded for `claude.config_dir`,
+  `codex.config_dir`, and `claude.marketplaces`; other host-path fields
+  (`data_dir`, `firecracker_bin`, `vm.kernel_path`, per-profile
+  `marketplaces`) kept a literal `~`, so e.g. `data_dir = "~/coop-data"`
+  resolved to a literal `./~/coop-data` directory. Expansion now happens
+  at deserialization via a `ConfigPath` newtype, so every path field —
+  including ones added later — is expanded on every load path.
 
 ## v0.5.1
 
