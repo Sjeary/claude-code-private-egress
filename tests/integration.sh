@@ -1676,6 +1676,27 @@ test_commit_restore() {
     # require a stopped instance for filesystem consistency.
     local snap="snap-$$"
 
+    # Seed a sentinel into the guest home directory and capture the
+    # instance's Guest IP before any commit/restore. The home dir lives on
+    # the rootfs that commit/restore swaps, so the sentinel round-trips with
+    # the disk: baking "committed" into the image now lets a later read prove
+    # restore brought the committed bytes back (not a default or wrong disk).
+    # The IP is captured so we can later assert it survived the disk swap.
+    local ip_before=""
+    if coop start "$INSTANCE" --no-agents >/dev/null 2>&1; then
+        if guest_exec sh -c 'echo committed > ~/sentinel'; then
+            pass "seed sentinel into guest before commit"
+        else
+            fail "seed sentinel into guest before commit" "stderr: $(guest_stderr)"
+        fi
+        if coop status "$INSTANCE" 2>/dev/null; then
+            ip_before=$(echo "$HARNESS_OUT" | sed -n 's/.*Guest IP: \([0-9.][0-9.]*\).*/\1/p' | head -1)
+        fi
+        coop stop "$INSTANCE" >/dev/null 2>&1 || true
+    else
+        fail "start instance to seed sentinel" "could not start instance"
+    fi
+
     # Commit the stopped instance's filesystem as a new image.
     if coop commit "$INSTANCE" --image "$snap"; then
         pass "commit exits 0"
@@ -1710,6 +1731,67 @@ test_commit_restore() {
         fail "commit --force overwrites existing image" "exit code: $?; stderr: $HARNESS_ERR"
     fi
 
+    # A committed image is an ordinary launchable base image. `coop up
+    # --image <snap>` boots a brand-new instance from it, exercising the
+    # TemplateConfig carry-over (guest_user/profiles/hashes) that cmd_commit
+    # writes and `up` reads back — a path `restore` (same-instance disk swap)
+    # never takes. A commit that wrote a broken template config would still
+    # pass every restore assertion but fail here.
+    local commit_inst="${INSTANCE}-from-commit"
+    local commit_ws="$tmpdir/${commit_inst}-ws"
+    mkdir -p "$commit_ws"
+    if coop up "$commit_ws" --name "$commit_inst" --no-agents --no-devcontainer --image "$snap"; then
+        STARTED_INSTANCES+=("$commit_inst")
+        pass "up --image (committed snapshot) exits 0"
+
+        if coop status "$commit_inst" && echo "$HARNESS_OUT" | grep -qi "running"; then
+            pass "instance from committed image is running"
+        else
+            fail "instance from committed image is running" "status: $HARNESS_OUT"
+        fi
+
+        GUEST_INSTANCE="$commit_inst"
+        local up_hostname up_sentinel
+        up_hostname=$(guest_exec hostname) || up_hostname=""
+        up_sentinel=$(coop_exec sh -c 'cat ~/sentinel') || up_sentinel=""
+        unset GUEST_INSTANCE
+
+        if [[ -n "$up_hostname" ]]; then
+            pass "guest from committed image reachable via SSH"
+        else
+            fail "guest from committed image reachable via SSH" "no response"
+        fi
+        # The committed bytes carried through the up path, not just a boot.
+        if [[ "$up_sentinel" == "committed" ]]; then
+            pass "committed contents present in up --image instance"
+        else
+            fail "committed contents present in up --image instance" \
+                "sentinel='$up_sentinel' (expected 'committed')"
+        fi
+
+        coop destroy "$commit_inst" >/dev/null 2>&1 || true
+        untrack_instance "$commit_inst"
+    else
+        fail "up --image (committed snapshot) exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        coop destroy "$commit_inst" 2>/dev/null || true
+        untrack_instance "$commit_inst"
+    fi
+
+    # Mutate the live disk before restoring, so the restore has something to
+    # roll back. Without this the sentinel would still read "committed" even
+    # if restore were a no-op; overwriting it first makes the post-restore
+    # read a real discriminator.
+    if coop start "$INSTANCE" --no-agents >/dev/null 2>&1; then
+        if guest_exec sh -c 'echo modified > ~/sentinel'; then
+            pass "mutate sentinel on live disk before restore"
+        else
+            fail "mutate sentinel on live disk before restore" "stderr: $(guest_stderr)"
+        fi
+        coop stop "$INSTANCE" >/dev/null 2>&1 || true
+    else
+        fail "start instance to mutate sentinel" "could not start instance"
+    fi
+
     # Restore rolls the instance back to the committed image in place.
     if coop restore "$INSTANCE" --image "$snap"; then
         pass "restore exits 0"
@@ -1742,14 +1824,52 @@ test_commit_restore() {
             fail "instance boots from restored committed image" "status: $HARNESS_OUT"
         fi
 
+        # Identity: the Guest IP must survive the disk swap. The IP is
+        # derived from the instance index, so this guards against a future
+        # restore that reassigns the index/IP instead of swapping only the
+        # disk (restore's contract is name/index/IP/workspace unchanged).
+        # Firecracker status surfaces the IP; Lima status does not, so the
+        # compare degrades to a skip there rather than a spurious failure.
+        local ip_after=""
+        if coop status "$INSTANCE" 2>/dev/null; then
+            ip_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Guest IP: \([0-9.][0-9.]*\).*/\1/p' | head -1)
+        fi
+        if [[ -z "$ip_before" || -z "$ip_after" ]]; then
+            skip "guest IP preserved across restore" "status does not surface Guest IP"
+        elif [[ "$ip_before" == "$ip_after" ]]; then
+            pass "guest IP preserved across restore ($ip_after)"
+        else
+            fail "guest IP preserved across restore" "before=$ip_before after=$ip_after"
+        fi
+
         GUEST_INSTANCE="$INSTANCE"
-        local snap_hostname
+        local snap_hostname restored_sentinel
         snap_hostname=$(guest_exec hostname) || snap_hostname=""
+        restored_sentinel=$(coop_exec sh -c 'cat ~/sentinel') || restored_sentinel=""
         unset GUEST_INSTANCE
         if [[ -n "$snap_hostname" ]]; then
             pass "guest reachable after restore from committed image"
         else
             fail "guest reachable after restore from committed image" "no response"
+        fi
+
+        # Content fidelity: the restored disk carries the *committed* bytes,
+        # not the "modified" overwrite from before the restore. This is the
+        # assertion that distinguishes a working disk swap from a no-op or a
+        # wrong-disk swap that still boots and answers hostname.
+        if [[ "$restored_sentinel" == "committed" ]]; then
+            pass "restore brings back committed contents"
+        else
+            fail "restore brings back committed contents" \
+                "sentinel='$restored_sentinel' (expected 'committed')"
+        fi
+
+        # Association: the workspace mapping survived the disk swap, so
+        # /workspace is present and reachable after restore.
+        if coop exec "$INSTANCE" -- test -d /workspace; then
+            pass "workspace association preserved across restore"
+        else
+            fail "workspace association preserved across restore" "/workspace missing after restore"
         fi
 
         # commit/restore on a running instance must be refused.
