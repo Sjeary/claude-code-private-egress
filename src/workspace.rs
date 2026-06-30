@@ -768,8 +768,9 @@ fn tar_command() -> Command {
     // `._*` sidecars for xattrs/resource forks. Apple tar checks this env var
     // to disable that path:
     // https://github.com/apple-oss-distributions/libarchive/blob/main/libarchive/tar/bsdtar.c#L262-L270
-    #[cfg(target_os = "macos")]
-    cmd.env("COPYFILE_DISABLE", "1");
+    if cfg!(target_os = "macos") {
+        cmd.env("COPYFILE_DISABLE", "1");
+    }
     cmd
 }
 
