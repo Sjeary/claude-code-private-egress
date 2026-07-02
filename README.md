@@ -2,6 +2,8 @@
 
 Isolated VM environments for running Claude Code and Codex.
 
+> **Pronunciation:** "coop" (/kuːp/) — one syllable, rhymes with "loop", like the thing you keep chickens in. Not "co-op".
+
 coop is a Rust CLI that manages disposable virtual machines where Claude Code and Codex have full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy. On Linux, coop runs Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. The backend is selected automatically based on platform.
 
 ## Quick start
