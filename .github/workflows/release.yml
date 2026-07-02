@@ -122,4 +122,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --notes-file RELEASE_NOTES.md coop-*.tar.gz SHA256SUMS
+        run: gh release create "$TAG" --title "$TAG" --notes-file RELEASE_NOTES.md coop-*.tar.gz SHA256SUMS
