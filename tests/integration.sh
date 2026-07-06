@@ -505,6 +505,39 @@ test_status_running() {
         fail "status shows valid disk" "used=$disk_used total=$disk_total from: $HARNESS_OUT"
     fi
 
+    # JSON output: HARNESS_OUT captures stdout only (tracing stays on stderr),
+    # so `coop status --json` must be clean, parseable JSON. This exercises the
+    # real stdout/stderr split on both backends.
+    if coop status "$INSTANCE" --json; then
+        if command -v jq >/dev/null 2>&1; then
+            if echo "$HARNESS_OUT" | jq -e '.state == "running"' >/dev/null; then
+                pass "status --json reports running state"
+            else
+                fail "status --json reports running state" "got: $HARNESS_OUT"
+            fi
+            if echo "$HARNESS_OUT" | jq -e '.usage.mem_total_mib > 0' >/dev/null; then
+                pass "status --json carries usage"
+            else
+                fail "status --json carries usage" "got: $HARNESS_OUT"
+            fi
+        elif echo "$HARNESS_OUT" | grep -q '"state": "running"'; then
+            pass "status --json reports running state (no jq)"
+        else
+            fail "status --json reports running state (no jq)" "got: $HARNESS_OUT"
+        fi
+    else
+        fail "status --json exits 0" "exit code: $?"
+    fi
+
+    # Bare `--json` (no name) emits a JSON array of the common shape.
+    if coop status --json && command -v jq >/dev/null 2>&1; then
+        if echo "$HARNESS_OUT" | jq -e 'type == "array" and (.[0].state | test("running|stopped"))' >/dev/null; then
+            pass "status --json (all) emits an array"
+        else
+            fail "status --json (all) emits an array" "got: $HARNESS_OUT"
+        fi
+    fi
+
     # Multi-instance list: compact summary with valid percentages
     # Format: "load=X.XX mem=NN% disk=NN%"
     if coop status; then
@@ -552,6 +585,24 @@ test_list_running() {
         fi
     else
         fail "ls alias exits 0" "exit code: $?"
+    fi
+
+    # JSON output: parseable array with the running instance.
+    if coop list --json; then
+        if command -v jq >/dev/null 2>&1; then
+            if echo "$HARNESS_OUT" | jq -e --arg n "$INSTANCE" \
+                'any(.[]; .name == $n and .state == "running")' >/dev/null; then
+                pass "list --json shows instance running"
+            else
+                fail "list --json shows instance running" "got: $HARNESS_OUT"
+            fi
+        elif echo "$HARNESS_OUT" | grep -q '"state": "running"'; then
+            pass "list --json shows running (no jq)"
+        else
+            fail "list --json shows running (no jq)" "got: $HARNESS_OUT"
+        fi
+    else
+        fail "list --json exits 0" "exit code: $?"
     fi
 }
 

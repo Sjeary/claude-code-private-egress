@@ -617,6 +617,7 @@ impl SshSession {
 // ── Resource usage ────────────────────────────────────────────
 
 /// Runtime resource usage gathered from a running guest VM.
+#[derive(serde::Serialize)]
 pub struct ResourceUsage {
     /// 1-minute load average.
     pub load_1m: f64,

@@ -33,7 +33,12 @@ use crate::naming::validate_safe_chars;
 /// system keychain is meaningless on the other.
 ///
 /// `OnePassword` and `File` are cross-platform and always present.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The `serde` token (`snake_case`, e.g. `"macos_keychain"`) is a stable
+/// machine identifier for `coop github status --json`, distinct from the
+/// human [`label`](Backend::label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Backend {
     /// macOS Keychain via `/usr/bin/security`.
     #[cfg(target_os = "macos")]

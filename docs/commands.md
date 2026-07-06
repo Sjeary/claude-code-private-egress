@@ -64,6 +64,7 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 | `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt) |
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation |
 | `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work |
+| `--json` | With `--dry-run`, emit the resolved plan as JSON on stdout (`{ report, profiles, guest_user, vm }`) instead of the text report on stderr |
 
 ```
 coop up .
@@ -191,8 +192,11 @@ coop devcontainer check <path> [--stage setup|start|both]
 |------|-------------|
 | `<path>` | Path to the `devcontainer.json` file to inspect |
 | `--stage <stage>` | Which lifecycle translation to report: `setup`, `start`, or `both` (default: `both`) |
+| `--json` | Emit the report as JSON on stdout instead of the text table on stderr |
 
 Use `--stage setup` to inspect setup-time keys such as `features`, `hostRequirements.cpus`, `hostRequirements.memory`, and `remoteUser`. Use `--stage start` to inspect start-time keys such as `postStartCommand`, `containerEnv`, `forwardPorts`, `mounts`, and `hostRequirements.storage`.
+
+With `--json`, a single stage emits one report object (`{ entries, source_path, ignored_paths }`, or `null` when no file applied); `--stage both` emits `{ "setup": <report>, "start": <report> }`. Each entry is `{ key, status, source, value, note }`, with `status` one of `applied`/`overridden`/`unsupported`/`invalid` and `source` one of `cli`/`devcontainer`. CI can branch on the translation without scraping the table.
 
 ### `devcontainer ignore`
 
@@ -243,6 +247,7 @@ instances, pass the instance name.
 | `--devcontainer <path>` | Dry-run translation aid; normal restarts reject devcontainer creation options. |
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation (escape hatch for CI). |
 | `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work. |
+| `--json` | With `--dry-run`, emit the resolved plan as JSON on stdout instead of the text report on stderr. |
 
 Normal `start` restarts an existing VM without re-reading or re-applying
 `devcontainer.json`. If the instance was created with a devcontainer file, coop
@@ -411,6 +416,10 @@ coop ls
 
 Alias: `ls`.
 
+| Flag | Description |
+|------|-------------|
+| `--json` | Emit a JSON array (`[{ "name", "state" }, …]`) instead of the text table |
+
 ### `status`
 
 Print instance status. Without a name, lists every instance with its state, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
@@ -422,10 +431,30 @@ coop status [NAME]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (shows all if omitted) |
+| `--json` | Emit machine-readable JSON instead of the text output |
 
 ```
 coop status
 coop status my-project
+```
+
+With `--json`, a bare `coop status` emits a JSON array and `coop status NAME`
+emits a single object. Each carries the common fields — `name`, `state`
+(`running`/`stopped`), `image`, `backend` (`firecracker`/`lima`), and `usage`
+(raw MiB / load, or `null` when stopped or the query fails). The rich
+single-instance text report (guest IP, PID, SSH port, …) is text-only. JSON goes
+to stdout; tracing stays on stderr, so `coop status --json | jq` stays clean.
+
+```
+$ coop status my-project --json
+{
+  "name": "my-project",
+  "state": "running",
+  "image": "default",
+  "backend": "firecracker",
+  "usage": { "load_1m": 0.12, "mem_used_mib": 512, "mem_total_mib": 2048,
+             "disk_used_mib": 8192, "disk_total_mib": 20480 }
+}
 ```
 
 ### `model`
@@ -619,11 +648,17 @@ coop images [FLAGS]
 | Flag | Description |
 |------|-------------|
 | `--delete <name>` | Delete a named image |
+| `--json` | Emit a JSON array instead of the text table |
 
 ```
 coop images
 coop images --delete old-image
 ```
+
+With `--json`, each element is `{ "name", "profiles", "created", "size_bytes" }`.
+Absence is modelled honestly: `profiles` is `[]` (not `"none"`), `created` is
+`null` (not `"unknown"`), and `size_bytes` is the raw byte count (the text path's
+`"8.0 GiB"` is presentation only).
 
 ### `resize`
 
@@ -708,10 +743,13 @@ coop profiles [SUBCOMMAND]
 ```
 coop profiles
 coop profiles list
+coop profiles list --json
 coop profiles show rust
 ```
 
 `list` groups builtin and custom profiles separately. `show` resolves the name against custom profiles first, then builtins, and prints `(custom)` or `(builtin)` next to the name.
+
+`coop profiles list --json` emits `{ "builtin": [...], "custom": [...] }`, each entry `{ "name", "summary" }`.
 
 ### `update`
 
@@ -798,16 +836,23 @@ coop github <subcommand>
 |------------|--------|
 | `setup-pat [--repo owner/name]` | Run the wizard end-to-end: open the GitHub PAT-creation form, validate the pasted token against `api.github.com`, store it in a chosen secret manager (Keychain / Secret Service / 1Password / file), and write a `[github.pat."owner/repo"]` entry. The repo is auto-detected from `git remote get-url origin` when `--repo` is omitted. |
 | `rotate-pat --repo owner/name` | Re-run the wizard for an existing entry (FGPATs expire — max 1 year). |
-| `status [--probe]` | List configured entries and their storage backend. By default the cmd-invocation is *not* resolved (so Keychain / 1Password prompts don't fire). Pass `--probe` to also resolve each entry and report whether the secret store still serves it. |
+| `status [--probe] [--json]` | List configured entries and their storage backend. By default the cmd-invocation is *not* resolved (so Keychain / 1Password prompts don't fire). Pass `--probe` to also resolve each entry and report whether the secret store still serves it. Pass `--json` for machine-readable output. |
 | `forget-pat --repo owner/name` | Delete the stored secret from its backend and drop the `[github.pat."owner/repo"]` entry. Does **not** add a skip marker — use the auto-prompt's `never` answer if you want coop to stop asking about this repo. Does **not** revoke the PAT on GitHub. |
 
 ```
 coop github setup-pat --repo trailofbits/coop
 coop github status
 coop github status --probe
+coop github status --json
 coop github rotate-pat --repo trailofbits/coop
 coop github forget-pat --repo trailofbits/coop
 ```
+
+`coop github status --json` emits `{ "mode", "entries", "skip" }`. `mode` is
+`off`/`auto`/`env`/`pat`; each entry is `{ "repo", "storage", "probe" }` with
+`storage` a stable token (`macos_keychain`/`linux_secret_service`/`one_password`/
+`file`, or `null` when unparseable) and `probe` (`ok`/`unexpected_format`/
+`resolve_failed`, or `null` unless `--probe`). The token value is never emitted.
 
 ### `validate`
 

@@ -5,18 +5,44 @@ use std::io::Write as _;
 use anyhow::{Context, Result};
 
 use crate::backend::VmBackend as _;
+use crate::commands::json;
 use crate::{ProfilesAction, backend, config, guest};
 
 pub(crate) fn cmd_profiles(cfg: &config::CoopConfig, action: &ProfilesAction) -> Result<()> {
-    let out = &mut std::io::stdout();
-    let write_result = match action {
-        ProfilesAction::List => write_profiles_list(out, cfg),
+    match action {
+        ProfilesAction::List { json: true } => json::render_json(&collect_profiles_list(cfg)),
+        ProfilesAction::List { json: false } => write_profiles_list(&mut std::io::stdout(), cfg)
+            .context("failed to write profile output"),
         ProfilesAction::Show { name } => {
             let def = guest::lookup_profile(name, &cfg.profiles)?;
-            write_profile_show(out, cfg, name, &def)
+            write_profile_show(&mut std::io::stdout(), cfg, name, &def)
+                .context("failed to write profile output")
         }
-    };
-    write_result.context("failed to write profile output")
+    }
+}
+
+/// Assemble the builtin + custom profile inventory, sorted the same way
+/// the human listing prints them.
+fn collect_profiles_list(cfg: &config::CoopConfig) -> json::ProfilesList {
+    let builtin = guest::BUILTIN_PROFILES
+        .iter()
+        .map(|bp| json::ProfileEntry {
+            name: bp.name.to_string(),
+            summary: builtin_summary(bp),
+        })
+        .collect();
+
+    let mut custom_names: Vec<&str> = cfg.profiles.keys().map(String::as_str).collect();
+    custom_names.sort_unstable();
+    let custom = custom_names
+        .into_iter()
+        .map(|name| json::ProfileEntry {
+            name: name.to_string(),
+            summary: format_custom_summary(&cfg.profiles[name]),
+        })
+        .collect();
+
+    json::ProfilesList { builtin, custom }
 }
 
 fn write_profiles_list(
@@ -167,12 +193,30 @@ pub(crate) fn cmd_images(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     delete: Option<&config::ImageName>,
+    json_out: bool,
 ) -> Result<()> {
     if let Some(name) = delete {
         return be.destroy_image(cfg, name);
     }
 
     let images = cfg.list_images()?;
+
+    if json_out {
+        let infos: Vec<json::ImageInfo<'_>> = images
+            .iter()
+            .map(|img| json::ImageInfo {
+                name: &img.name,
+                profiles: img
+                    .config
+                    .as_ref()
+                    .map_or(&[][..], |c| c.profiles.as_slice()),
+                created: img.config.as_ref().map(|c| c.created.as_str()),
+                size_bytes: dir_size_bytes(&img.dir),
+            })
+            .collect();
+        return json::render_json(&infos);
+    }
+
     if images.is_empty() {
         writeln!(
             std::io::stdout(),
@@ -192,7 +236,7 @@ pub(crate) fn cmd_images(
             .config
             .as_ref()
             .map_or("unknown", |c| c.created.as_str());
-        let size = dir_size_display(&img.dir);
+        let size = format_dir_size(dir_size_bytes(&img.dir));
         writeln!(
             std::io::stdout(),
             "{:<20} profiles: {:<30} created: {:<24} size: {}",
@@ -206,7 +250,9 @@ pub(crate) fn cmd_images(
     Ok(())
 }
 
-fn dir_size_display(dir: &std::path::Path) -> String {
+/// Sum the byte sizes of the files directly under `dir`. Best-effort: an
+/// unreadable directory or entry contributes zero.
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
     let mut total: u64 = 0;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -215,7 +261,7 @@ fn dir_size_display(dir: &std::path::Path) -> String {
             }
         }
     }
-    format_dir_size(total)
+    total
 }
 
 /// Render a byte count as one-decimal gibibytes (1 GiB = 1024³ bytes).
@@ -226,9 +272,13 @@ fn format_dir_size(total_bytes: u64) -> String {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
-    use super::{builtin_summary, format_custom_summary, format_dir_size, script_summary};
-    use crate::config::CustomProfile;
+    use super::{
+        builtin_summary, collect_profiles_list, format_custom_summary, format_dir_size,
+        script_summary,
+    };
+    use crate::config::{CoopConfig, CustomProfile};
     use crate::guest::BuiltinProfile;
 
     #[test]
@@ -300,6 +350,33 @@ mod tests {
         // line as multi-line).
         let s = script_summary(Some("first\nsecond\nthird"));
         assert_eq!(s, "first ... (3 lines)");
+    }
+
+    #[test]
+    fn collect_profiles_list_includes_builtin_and_sorts_custom() {
+        let mut cfg = CoopConfig::default();
+        let empty = || CustomProfile {
+            apt_packages: Vec::new(),
+            pre_install: None,
+            post_install: None,
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+        };
+        cfg.profiles.insert("zeta".to_string(), empty());
+        cfg.profiles.insert("alpha".to_string(), empty());
+
+        let list = collect_profiles_list(&cfg);
+        assert!(
+            !list.builtin.is_empty(),
+            "builtin profiles should be listed"
+        );
+        let custom_names: Vec<&str> = list.custom.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(custom_names, ["alpha", "zeta"], "custom names sorted");
+
+        let v = serde_json::to_value(&list).expect("serializes");
+        assert!(v["builtin"].is_array());
+        assert_eq!(v["custom"][0]["name"], serde_json::json!("alpha"));
+        assert_eq!(v["custom"][0]["summary"], serde_json::json!("(empty)"));
     }
 
     #[test]
