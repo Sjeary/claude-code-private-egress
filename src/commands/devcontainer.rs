@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::commands::json;
 use crate::{
     DevcontainerCheckStage, DevcontainerCommands, config, devcontainer, devcontainer_oci,
     git_repo_devcontainer, guest, prompt,
@@ -115,18 +116,39 @@ fn maybe_record_devcontainer_opt_out(opts: &DevcontainerOpts<'_>, project: &Path
 }
 
 /// Discover, prompt, and translate a `devcontainer.json` for the given
-/// lifecycle `stage`.
+/// lifecycle `stage`, rendering the human report to stderr.
 ///
 /// Returns `None` when the user opts out, no file is found, or stdin is
 /// not a TTY with no explicit flag (in which case an error is returned
 /// instead — the issue forbids silently choosing). The report is always
 /// emitted to stderr when a file is loaded, so the user sees every key
 /// that did and didn't take effect.
+///
+/// This is the human-output wrapper over [`resolve_devcontainer_collect`];
+/// `--json` callers use the collector directly and serialize the report
+/// to stdout instead.
 #[expect(
     clippy::print_stderr,
     reason = "devcontainer report is intentional user-facing CLI output"
 )]
 pub(crate) fn resolve_devcontainer(
+    opts: &DevcontainerOpts<'_>,
+    inputs: &devcontainer::TranslatorInputs,
+    stage: devcontainer::Stage,
+) -> Result<Option<devcontainer::Translation>> {
+    let translation = resolve_devcontainer_collect(opts, inputs, stage)?;
+    if let Some(t) = &translation {
+        eprintln!("{}", t.report.render());
+    }
+    Ok(translation)
+}
+
+/// Collect the devcontainer translation without emitting any report.
+///
+/// Identical resolution logic to [`resolve_devcontainer`], minus the
+/// stderr render — the returned `Translation` carries the `report`, so
+/// callers render it however they like (`--json` serializes it to stdout).
+pub(crate) fn resolve_devcontainer_collect(
     opts: &DevcontainerOpts<'_>,
     inputs: &devcontainer::TranslatorInputs,
     stage: devcontainer::Stage,
@@ -227,8 +249,6 @@ pub(crate) fn resolve_devcontainer(
     translation.report.ignored_paths = losers;
     resolve_oci_feature_requests(&mut translation);
 
-    eprintln!("{}", translation.report.render());
-
     Ok(Some(translation))
 }
 
@@ -281,7 +301,11 @@ fn resolve_oci_feature_requests(translation: &mut devcontainer::Translation) {
 #[mutants::skip]
 pub(crate) fn cmd_devcontainer_check(command: &DevcontainerCommands) -> Result<()> {
     match command {
-        DevcontainerCommands::Check { path, stage } => {
+        DevcontainerCommands::Check {
+            path,
+            stage,
+            json: json_out,
+        } => {
             let dc_input = DevcontainerInput::Explicit(path.clone());
             let opts = DevcontainerOpts {
                 input: &dc_input,
@@ -292,6 +316,9 @@ pub(crate) fn cmd_devcontainer_check(command: &DevcontainerCommands) -> Result<(
                 github_auth: None,
                 preference_path: None,
             };
+            if *json_out {
+                return check_render_json(&opts, *stage);
+            }
             let setup_inputs = devcontainer::TranslatorInputs::default();
 
             match stage {
@@ -326,6 +353,55 @@ pub(crate) fn cmd_devcontainer_check(command: &DevcontainerCommands) -> Result<(
         | DevcontainerCommands::Status { .. }
         | DevcontainerCommands::Clear { .. } => {
             unreachable!("devcontainer preference commands require config")
+        }
+    }
+}
+
+/// `--stage both` JSON payload: one report per lifecycle stage.
+#[derive(serde::Serialize)]
+struct BothReports<'a> {
+    setup: Option<&'a devcontainer::Report>,
+    start: Option<&'a devcontainer::Report>,
+}
+
+/// Emit `coop devcontainer check --json` to stdout. A single stage emits
+/// one `Report` (or `null` when no file applied); `--stage both` emits
+/// `{ "setup": <Report>, "start": <Report> }`.
+// Drives the IO collector and builds TranslatorInputs inline; the report
+// content it serializes comes from the separately-tested `translate`. Skipped
+// in-source (not exclude_re) because exclude_re cannot suppress the
+// `delete field … from TranslatorInputs` mutants — see the note in
+// .cargo/mutants.toml.
+#[mutants::skip]
+fn check_render_json(opts: &DevcontainerOpts<'_>, stage: DevcontainerCheckStage) -> Result<()> {
+    let setup_inputs = devcontainer::TranslatorInputs::default();
+    match stage {
+        DevcontainerCheckStage::Setup => {
+            let t = resolve_devcontainer_collect(opts, &setup_inputs, devcontainer::Stage::Setup)?;
+            json::render_json(&t.as_ref().map(|t| &t.report))
+        }
+        DevcontainerCheckStage::Start => {
+            let start_inputs = devcontainer::TranslatorInputs {
+                persisted_guest_user: Some(guest::GuestUser::default()),
+                ..devcontainer::TranslatorInputs::default()
+            };
+            let t = resolve_devcontainer_collect(opts, &start_inputs, devcontainer::Stage::Start)?;
+            json::render_json(&t.as_ref().map(|t| &t.report))
+        }
+        DevcontainerCheckStage::Both => {
+            let setup_t =
+                resolve_devcontainer_collect(opts, &setup_inputs, devcontainer::Stage::Setup)?;
+            let assumed_guest_user = devcontainer_check_assumed_guest_user(setup_t.as_ref());
+            let start_inputs = devcontainer::TranslatorInputs {
+                persisted_guest_user: Some(assumed_guest_user),
+                ..devcontainer::TranslatorInputs::default()
+            };
+            let start_t =
+                resolve_devcontainer_collect(opts, &start_inputs, devcontainer::Stage::Start)?;
+            json::render_json(&BothReports {
+                setup: setup_t.as_ref().map(|t| &t.report),
+                start: start_t.as_ref().map(|t| &t.report),
+            })
         }
     }
 }
