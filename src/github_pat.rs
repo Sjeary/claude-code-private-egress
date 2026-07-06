@@ -23,11 +23,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use thiserror::Error;
 
 use crate::cmd::Cmd;
+use crate::commands::json;
 use crate::config::{CoopConfig, GitHubAuth, resolve_cmd_value};
 use crate::github_repo::{RepoSlug, detect_workspace_repo};
 use crate::github_submodules::{SubmoduleDiscovery, classify_urls, extract_urls};
 use crate::secret_store::{
-    AccountName, CmdToken, SERVICE, available_backends, delete_secret, store_secret,
+    AccountName, Backend, CmdToken, SERVICE, available_backends, delete_secret, store_secret,
 };
 
 /// Prefix every fine-grained PAT starts with. Surfaced as `pub const` so
@@ -103,66 +104,160 @@ pub fn run_rotate_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
 /// printed. When `probe` is true, each `cmd:` invocation is resolved to
 /// confirm the secret store still serves it — this may trigger a
 /// Keychain dialog / `op` Touch-ID prompt per entry, so it is opt-in.
-pub fn run_status(cfg: &CoopConfig, probe: bool) {
-    print!("{}", render_status(cfg, probe));
+pub fn run_status(cfg: &CoopConfig, probe: bool, json_out: bool) -> Result<()> {
+    let view = build_status(cfg, probe);
+    if json_out {
+        return json::render_json(&view);
+    }
+    print!("{}", format_status(&view));
+    Ok(())
 }
 
-/// Render the `coop github status` report as a string.
-///
-/// Pure for the non-probe path; when `probe` is true, each entry's
-/// `cmd:` invocation is resolved (running the underlying command) to
-/// confirm the secret store still serves it.
-fn render_status(cfg: &CoopConfig, probe: bool) -> String {
+/// Configured `github` auth mode. Mirrors [`GitHubAuth`]'s discriminants;
+/// `None` config maps to [`GithubMode::Off`]. The `lowercase` serde token
+/// matches [`GitHubAuth::mode_name`], so human and JSON labels agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum GithubMode {
+    Auto,
+    Env,
+    Off,
+    Pat,
+}
+
+impl GithubMode {
+    /// Project the configured auth (or its absence) into the mode enum.
+    pub(crate) fn of(auth: Option<&GitHubAuth>) -> Self {
+        match auth {
+            Some(GitHubAuth::Auto) => Self::Auto,
+            Some(GitHubAuth::Env) => Self::Env,
+            Some(GitHubAuth::Off) | None => Self::Off,
+            Some(GitHubAuth::Pat(_)) => Self::Pat,
+        }
+    }
+
+    #[mutants::skip] // equivalent: human label only; the serde token is the tested contract
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Env => "env",
+            Self::Off => "off",
+            Self::Pat => "pat",
+        }
+    }
+}
+
+/// Outcome of resolving a PAT entry's `cmd:` invocation under `--probe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProbeStatus {
+    Ok,
+    UnexpectedFormat,
+    ResolveFailed,
+}
+
+impl ProbeStatus {
+    /// Classify a resolved-token result.
+    pub(crate) fn from_resolved(resolved: &Result<String>) -> Self {
+        match resolved {
+            Ok(token) if token.starts_with(TOKEN_PREFIX) => Self::Ok,
+            Ok(_) => Self::UnexpectedFormat,
+            Err(_) => Self::ResolveFailed,
+        }
+    }
+
+    /// Human status line, unchanged from the original text output.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "resolves, format ok",
+            Self::UnexpectedFormat => "resolves but unexpected format",
+            Self::ResolveFailed => "FAILED to resolve",
+        }
+    }
+}
+
+/// `coop github status` view model. Never carries a token value — only
+/// repo, storage backend, and (opt-in) probe result.
+#[derive(serde::Serialize)]
+pub(crate) struct GithubStatus<'a> {
+    pub mode: GithubMode,
+    pub entries: Vec<PatEntryView<'a>>,
+    pub skip: Vec<&'a RepoSlug>,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct PatEntryView<'a> {
+    pub repo: &'a RepoSlug,
+    /// `None` when the `cmd:` invocation is unparseable (human: "unknown").
+    pub storage: Option<Backend>,
+    /// `None` unless `--probe` resolved the entry.
+    pub probe: Option<ProbeStatus>,
+}
+
+/// Assemble the status view. Pure for the non-probe path; when `probe` is
+/// true each entry's `cmd:` invocation is resolved (running the underlying
+/// command) to confirm the secret store still serves it.
+// The probe branch shells out via resolve_cmd_value, so this cannot be
+// fully lib-tested; excluded in .cargo/mutants.toml. The pure projections
+// (GithubMode::of, ProbeStatus::from_resolved) and the non-probe shape are
+// covered by tests.
+fn build_status(cfg: &CoopConfig, probe: bool) -> GithubStatus<'_> {
+    let mode = GithubMode::of(cfg.github.as_ref());
+    let (entries, skip) = match cfg.github.as_ref() {
+        Some(GitHubAuth::Pat(c)) => {
+            let entries = c
+                .entries
+                .iter()
+                .map(|(repo, entry)| PatEntryView {
+                    repo,
+                    storage: CmdToken::parse(entry.token.expose()).map(|t| t.backend()),
+                    probe: probe.then(|| {
+                        ProbeStatus::from_resolved(&resolve_cmd_value(entry.token.expose()))
+                    }),
+                })
+                .collect();
+            let skip = c.skip.iter().collect();
+            (entries, skip)
+        }
+        _ => (Vec::new(), Vec::new()),
+    };
+    GithubStatus {
+        mode,
+        entries,
+        skip,
+    }
+}
+
+/// Render the status view as the plain-text report (unchanged output).
+fn format_status(view: &GithubStatus<'_>) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
-    let pat = match cfg.github.as_ref() {
-        Some(GitHubAuth::Pat(c)) => c,
-        Some(other) => {
-            let _ = writeln!(s, "github mode: {} (no PAT entries)", other.mode_name());
-            return s;
-        }
-        None => {
-            let _ = writeln!(s, "github mode: off (no PAT entries)");
-            return s;
-        }
-    };
-
-    if pat.entries.is_empty() && pat.skip.is_empty() {
+    if view.mode != GithubMode::Pat {
+        let _ = writeln!(s, "github mode: {} (no PAT entries)", view.mode.label());
+        return s;
+    }
+    if view.entries.is_empty() && view.skip.is_empty() {
         let _ = writeln!(s, "github mode: pat (no entries)");
         return s;
     }
 
     let _ = writeln!(s, "github mode: pat");
-    let _ = writeln!(s, "entries ({}):", pat.entries.len());
-    for (repo, entry) in &pat.entries {
-        let backend_label = CmdToken::parse(entry.token.expose()).map_or_else(
-            || "unknown".to_string(),
-            |t| t.backend().label().to_string(),
-        );
-        let _ = writeln!(s, "  {repo}");
-        let _ = writeln!(s, "    storage: {backend_label}");
-        if probe {
-            let validity = probe_status_label(&resolve_cmd_value(entry.token.expose()));
-            let _ = writeln!(s, "    status:  {validity}");
+    let _ = writeln!(s, "entries ({}):", view.entries.len());
+    for entry in &view.entries {
+        let storage_label = entry.storage.map_or("unknown", Backend::label);
+        let _ = writeln!(s, "  {}", entry.repo);
+        let _ = writeln!(s, "    storage: {storage_label}");
+        if let Some(probe) = entry.probe {
+            let _ = writeln!(s, "    status:  {}", probe.label());
         }
     }
-    if !pat.skip.is_empty() {
-        let _ = writeln!(s, "skip ({}):", pat.skip.len());
-        for repo in &pat.skip {
+    if !view.skip.is_empty() {
+        let _ = writeln!(s, "skip ({}):", view.skip.len());
+        for repo in &view.skip {
             let _ = writeln!(s, "  {repo}");
         }
     }
     s
-}
-
-/// Classify a resolved-token result into the one-line status label
-/// printed by `coop github status --probe`.
-fn probe_status_label(resolved: &Result<String>) -> &'static str {
-    match resolved {
-        Ok(token) if token.starts_with(TOKEN_PREFIX) => "resolves, format ok",
-        Ok(_) => "resolves but unexpected format",
-        Err(_) => "FAILED to resolve",
-    }
 }
 
 /// `coop github forget-pat --repo owner/name` — remove the secret and
@@ -1418,36 +1513,72 @@ mod tests {
         assert!(!doc_contains_literal_token(&doc));
     }
 
-    // ── probe_status_label ──────────────────────────────────────
+    // ── ProbeStatus ─────────────────────────────────────────────
 
     #[test]
-    fn probe_status_label_ok_with_prefix_is_format_ok() {
+    fn probe_status_ok_with_prefix_is_format_ok() {
         let resolved: Result<String> = Ok(format!("{TOKEN_PREFIX}abc"));
-        assert_eq!(probe_status_label(&resolved), "resolves, format ok");
-    }
-
-    #[test]
-    fn probe_status_label_ok_without_prefix_is_unexpected() {
-        let resolved: Result<String> = Ok("ghp_classic".to_string());
+        let status = ProbeStatus::from_resolved(&resolved);
+        assert_eq!(status, ProbeStatus::Ok);
+        assert_eq!(status.label(), "resolves, format ok");
         assert_eq!(
-            probe_status_label(&resolved),
-            "resolves but unexpected format"
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!("ok")
         );
     }
 
     #[test]
-    fn probe_status_label_err_is_failed() {
-        let resolved: Result<String> = Err(anyhow!("boom"));
-        assert_eq!(probe_status_label(&resolved), "FAILED to resolve");
+    fn probe_status_ok_without_prefix_is_unexpected() {
+        let resolved: Result<String> = Ok("ghp_classic".to_string());
+        let status = ProbeStatus::from_resolved(&resolved);
+        assert_eq!(status, ProbeStatus::UnexpectedFormat);
+        assert_eq!(status.label(), "resolves but unexpected format");
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!("unexpected_format")
+        );
     }
 
-    // ── render_status ───────────────────────────────────────────
+    #[test]
+    fn probe_status_err_is_failed() {
+        let resolved: Result<String> = Err(anyhow!("boom"));
+        let status = ProbeStatus::from_resolved(&resolved);
+        assert_eq!(status, ProbeStatus::ResolveFailed);
+        assert_eq!(status.label(), "FAILED to resolve");
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!("resolve_failed")
+        );
+    }
+
+    #[test]
+    fn github_mode_of_covers_all_discriminants() {
+        use crate::config::PatConfig;
+        assert_eq!(GithubMode::of(None), GithubMode::Off);
+        assert_eq!(GithubMode::of(Some(&GitHubAuth::Off)), GithubMode::Off);
+        assert_eq!(GithubMode::of(Some(&GitHubAuth::Auto)), GithubMode::Auto);
+        assert_eq!(GithubMode::of(Some(&GitHubAuth::Env)), GithubMode::Env);
+        assert_eq!(
+            GithubMode::of(Some(&GitHubAuth::Pat(PatConfig::default()))),
+            GithubMode::Pat
+        );
+        assert_eq!(
+            serde_json::to_value(GithubMode::Pat).unwrap(),
+            serde_json::json!("pat")
+        );
+    }
+
+    // ── status report ───────────────────────────────────────────
 
     fn config_from(s: &str) -> CoopConfig {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, s).unwrap();
         CoopConfig::load(&path).unwrap()
+    }
+
+    fn render_status(cfg: &CoopConfig, probe: bool) -> String {
+        format_status(&build_status(cfg, probe))
     }
 
     #[test]
@@ -1488,6 +1619,41 @@ mod tests {
         let cfg = config_from("github = \"off\"\n");
         let out = render_status(&cfg, false);
         assert!(out.contains("(no PAT entries)"));
+    }
+
+    #[test]
+    fn build_status_off_mode_json_shape() {
+        let cfg = config_from("github = \"off\"\n");
+        let view = build_status(&cfg, false);
+        let v = serde_json::to_value(&view).unwrap();
+        assert_eq!(v["mode"], serde_json::json!("off"));
+        assert_eq!(v["entries"], serde_json::json!([]));
+        assert_eq!(v["skip"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn build_status_pat_entry_json_carries_storage_and_no_probe() {
+        // `cmd:echo` is not a recognised secret-store invocation, so storage
+        // parses to `null` (the "unknown" case); probe is absent without
+        // `--probe`.
+        let cfg = config_from(
+            "[github]\nmode = \"pat\"\n\n[github.pat.\"a/b\"]\ntoken = \"cmd:echo x\"\n",
+        );
+        let view = build_status(&cfg, false);
+        let v = serde_json::to_value(&view).unwrap();
+        assert_eq!(v["mode"], serde_json::json!("pat"));
+        assert_eq!(v["entries"][0]["repo"], serde_json::json!("a/b"));
+        assert_eq!(v["entries"][0]["storage"], serde_json::Value::Null);
+        assert_eq!(v["entries"][0]["probe"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_status_skip_only_json_lists_repo() {
+        let cfg = config_from("[github]\nmode = \"pat\"\nskip = [\"a/b\"]\n");
+        let view = build_status(&cfg, false);
+        let v = serde_json::to_value(&view).unwrap();
+        assert_eq!(v["skip"], serde_json::json!(["a/b"]));
+        assert_eq!(v["entries"], serde_json::json!([]));
     }
 
     // ── parse_gh_token ──────────────────────────────────────────

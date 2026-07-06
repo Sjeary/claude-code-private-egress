@@ -64,6 +64,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::engine::ArgValueCandidates;
 
 use backend::VmBackend as _;
+use commands::json;
 use commands::{
     DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
     StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts, apply_runtime_guest_env,
@@ -71,7 +72,7 @@ use commands::{
     cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_quickstart,
     cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up,
     cmd_validate, codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
-    resolve_devcontainer, resolve_running,
+    resolve_devcontainer, resolve_devcontainer_collect, resolve_running,
 };
 
 #[derive(Parser)]
@@ -174,6 +175,9 @@ enum Commands {
         /// before any VM work.
         #[arg(long)]
         dry_run: bool,
+        /// With --dry-run, emit the resolved plan as JSON on stdout
+        #[arg(long, requires = "dry_run")]
+        json: bool,
     },
     /// One-shot: ensure default image, start an instance for cwd, launch Claude.
     ///
@@ -306,6 +310,9 @@ enum Commands {
         /// before doing any VM work.
         #[arg(long)]
         dry_run: bool,
+        /// With --dry-run, emit the resolved plan as JSON on stdout
+        #[arg(long, requires = "dry_run")]
+        json: bool,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
     #[command(alias = "ssh")]
@@ -389,7 +396,11 @@ enum Commands {
     },
     /// List instances by name and state
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Emit machine-readable JSON instead of the text table
+        #[arg(long)]
+        json: bool,
+    },
     /// Show VM status
     Status {
         /// Instance name (shows all if omitted)
@@ -398,6 +409,9 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
+        /// Emit machine-readable JSON instead of the text output
+        #[arg(long)]
+        json: bool,
     },
     /// Show or switch a VM's model backend (cloud vs. local)
     Model {
@@ -515,6 +529,9 @@ enum Commands {
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         delete: Option<config::ImageName>,
+        /// Emit machine-readable JSON instead of the text table
+        #[arg(long)]
+        json: bool,
     },
     /// Resize a stopped instance's disk
     Resize {
@@ -655,7 +672,11 @@ impl From<ModelAction> for model_state::ModelMode {
 #[derive(Subcommand)]
 enum ProfilesAction {
     /// List all available profiles (builtin and custom)
-    List,
+    List {
+        /// Emit machine-readable JSON instead of the text listing
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the full definition of a profile
     Show {
         /// Profile name to inspect
@@ -684,6 +705,9 @@ enum GithubAction {
         /// 1Password prompts) to confirm the secret store still serves it.
         #[arg(long)]
         probe: bool,
+        /// Emit machine-readable JSON instead of the text report
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a configured PAT entry and its stored secret
     ForgetPat {
@@ -702,6 +726,9 @@ enum DevcontainerCommands {
         /// Which lifecycle translation to report
         #[arg(long, value_enum, default_value_t = DevcontainerCheckStage::Both)]
         stage: DevcontainerCheckStage,
+        /// Emit machine-readable JSON on stdout instead of the text report on stderr
+        #[arg(long)]
+        json: bool,
     },
     /// Persistently ignore discovered devcontainer.json for a project.
     Ignore {
@@ -871,6 +898,7 @@ pub fn run() -> Result<()> {
             devcontainer,
             no_devcontainer,
             dry_run,
+            json,
         } => {
             let validated = cfg.validate_and_warn()?;
             let transport = match (copy, mount) {
@@ -911,6 +939,7 @@ pub fn run() -> Result<()> {
                 devcontainer: UpDevcontainerOpts {
                     input: DevcontainerInput::from_flags(devcontainer, no_devcontainer),
                     dry_run,
+                    json,
                 },
             };
             cmd_up(&be, &mut cfg, &validated, &cli.config, &opts)
@@ -1022,6 +1051,7 @@ pub fn run() -> Result<()> {
             devcontainer,
             no_devcontainer,
             dry_run,
+            json: json_out,
         } => {
             let validated = cfg.validate_and_warn()?;
             if raw_args_use_deprecated_no_claude(&raw_args) {
@@ -1032,29 +1062,45 @@ pub fn run() -> Result<()> {
             if dry_run {
                 let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
                 let dry_run_image = config::default_image_name();
+                let dry_run_guest_user = backend::persisted_guest_user(&cfg, &dry_run_image);
                 let inputs = devcontainer::TranslatorInputs {
                     cli_post_start: post_start.clone(),
                     cli_guest_env_keys: cli_env_keys,
                     cli_forward_ports: forward_ports.clone(),
-                    persisted_guest_user: Some(backend::persisted_guest_user(&cfg, &dry_run_image)),
+                    persisted_guest_user: Some(dry_run_guest_user.clone()),
                     cli_workspace_or_git_repo: workspace.is_some(),
                     ..devcontainer::TranslatorInputs::default()
                 };
                 let ws_path = workspace.as_deref().map(Path::new);
                 let dc_input = DevcontainerInput::from_flags(devcontainer.clone(), no_devcontainer);
-                let _ = resolve_devcontainer(
-                    &DevcontainerOpts {
-                        input: &dc_input,
-                        dry_run,
-                        workspace: ws_path,
-                        mounts: &[],
-                        git_repo: None,
-                        github_auth: cfg.github.as_ref(),
-                        preference_path: Some(&cfg.devcontainer_preferences_path()),
-                    },
-                    &inputs,
-                    devcontainer::Stage::Start,
-                )?;
+                let dc_opts = DevcontainerOpts {
+                    input: &dc_input,
+                    dry_run,
+                    workspace: ws_path,
+                    mounts: &[],
+                    git_repo: None,
+                    github_auth: cfg.github.as_ref(),
+                    preference_path: Some(&cfg.devcontainer_preferences_path()),
+                };
+                if json_out {
+                    let translation = resolve_devcontainer_collect(
+                        &dc_opts,
+                        &inputs,
+                        devcontainer::Stage::Start,
+                    )?;
+                    let plan = json::DryRunPlan {
+                        report: translation.as_ref().map(|t| &t.report),
+                        profiles: &[],
+                        guest_user: &dry_run_guest_user,
+                        vm: json::VmOverrides {
+                            vcpus: None,
+                            mem_mib: None,
+                            disk_gib: None,
+                        },
+                    };
+                    return json::render_json(&plan);
+                }
+                resolve_devcontainer(&dc_opts, &inputs, devcontainer::Stage::Start)?;
                 return Ok(());
             }
 
@@ -1113,8 +1159,8 @@ pub fn run() -> Result<()> {
             let _guard = signal::install_handlers();
             cmd_destroy(&be, &cfg, name.as_ref(), all)
         }
-        Commands::List => cmd_list(&be, &cfg),
-        Commands::Status { name } => cmd_status(&be, &cfg, name.as_ref()),
+        Commands::List { json } => cmd_list(&be, &cfg, json),
+        Commands::Status { name, json } => cmd_status(&be, &cfg, name.as_ref(), json),
         Commands::Model { name, action } => {
             cmd_model(&be, &cfg, name.as_ref(), action.map(Into::into))
         }
@@ -1171,15 +1217,16 @@ pub fn run() -> Result<()> {
             let running = resolve_running(&be, &cfg, name.as_ref())?;
             workspace::write_ssh_config(&running)
         }
-        Commands::Images { delete } => cmd_images(&be, &cfg, delete.as_ref()),
+        Commands::Images { delete, json } => cmd_images(&be, &cfg, delete.as_ref(), json),
         Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_ref(), size),
         Commands::Commit { name, image, force } => {
             cmd_commit(&be, &cfg, name.as_ref(), &image, force)
         }
         Commands::Restore { name, image } => cmd_restore(&be, &cfg, name.as_ref(), &image),
-        Commands::Profiles { action } => {
-            cmd_profiles(&cfg, &action.unwrap_or(ProfilesAction::List))
-        }
+        Commands::Profiles { action } => cmd_profiles(
+            &cfg,
+            &action.unwrap_or(ProfilesAction::List { json: false }),
+        ),
         Commands::Github { action } => cmd_github(&cfg, &cli.config, action),
         Commands::Validate { probe } => cmd_validate(&cfg, &be, probe),
         Commands::Init
@@ -1667,13 +1714,28 @@ mod tests {
     #[test]
     fn list_subcommand_parses() {
         let cli = parse(&["list"]);
-        assert!(matches!(cli.command, super::Commands::List));
+        assert!(matches!(cli.command, super::Commands::List { json: false }));
+    }
+
+    #[test]
+    fn list_json_flag_parses() {
+        let cli = parse(&["list", "--json"]);
+        assert!(matches!(cli.command, super::Commands::List { json: true }));
     }
 
     #[test]
     fn ls_alias_parses_as_list() {
         let cli = parse(&["ls"]);
-        assert!(matches!(cli.command, super::Commands::List));
+        assert!(matches!(cli.command, super::Commands::List { .. }));
+    }
+
+    #[test]
+    fn status_json_flag_parses() {
+        let cli = parse(&["status", "--json"]);
+        let super::Commands::Status { json, .. } = cli.command else {
+            panic!("expected Status variant");
+        };
+        assert!(json);
     }
 
     #[test]
@@ -1682,7 +1744,22 @@ mod tests {
         let super::Commands::Profiles { action } = cli.command else {
             panic!("expected Profiles variant");
         };
-        assert!(matches!(action, Some(super::ProfilesAction::List)));
+        assert!(matches!(
+            action,
+            Some(super::ProfilesAction::List { json: false })
+        ));
+    }
+
+    #[test]
+    fn profiles_list_json_flag_parses() {
+        let cli = parse(&["profiles", "list", "--json"]);
+        let super::Commands::Profiles { action } = cli.command else {
+            panic!("expected Profiles variant");
+        };
+        assert!(matches!(
+            action,
+            Some(super::ProfilesAction::List { json: true })
+        ));
     }
 
     #[test]
@@ -1924,7 +2001,7 @@ mod tests {
         let super::Commands::Devcontainer { command } = cli.command else {
             panic!("expected Devcontainer variant");
         };
-        let super::DevcontainerCommands::Check { path, stage } = command else {
+        let super::DevcontainerCommands::Check { path, stage, json } = command else {
             panic!("expected devcontainer check variant");
         };
         assert_eq!(
@@ -1932,6 +2009,24 @@ mod tests {
             std::path::PathBuf::from(".devcontainer/devcontainer.json")
         );
         assert!(matches!(stage, super::DevcontainerCheckStage::Both));
+        assert!(!json);
+    }
+
+    #[test]
+    fn devcontainer_check_json_flag_parses() {
+        let cli = parse(&[
+            "devcontainer",
+            "check",
+            ".devcontainer/devcontainer.json",
+            "--json",
+        ]);
+        let super::Commands::Devcontainer { command } = cli.command else {
+            panic!("expected Devcontainer variant");
+        };
+        let super::DevcontainerCommands::Check { json, .. } = command else {
+            panic!("expected devcontainer check variant");
+        };
+        assert!(json);
     }
 
     #[test]

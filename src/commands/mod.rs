@@ -7,6 +7,7 @@
 mod admin;
 mod devcontainer;
 mod github;
+pub(crate) mod json;
 mod lifecycle;
 mod model;
 mod profiles;
@@ -15,7 +16,7 @@ mod quickstart;
 pub(crate) use admin::{UninstallOpts, cmd_init, cmd_uninstall, cmd_validate};
 pub(crate) use devcontainer::{
     DevcontainerInput, DevcontainerOpts, cmd_devcontainer, cmd_devcontainer_check,
-    resolve_devcontainer,
+    resolve_devcontainer, resolve_devcontainer_collect,
 };
 pub(crate) use github::cmd_github;
 pub(crate) use lifecycle::{

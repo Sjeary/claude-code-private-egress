@@ -23,10 +23,7 @@ pub(crate) fn cmd_github(
             };
             github_pat::run_rotate_pat(cfg, &opts)
         }
-        GithubAction::Status { probe } => {
-            github_pat::run_status(cfg, probe);
-            Ok(())
-        }
+        GithubAction::Status { probe, json } => github_pat::run_status(cfg, probe, json),
         GithubAction::ForgetPat { repo } => github_pat::run_forget_pat(cfg, &repo, config_path),
     }
 }

@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use super::{DevcontainerInput, DevcontainerOpts, resolve_devcontainer};
+use super::json;
+use super::{
+    DevcontainerInput, DevcontainerOpts, resolve_devcontainer, resolve_devcontainer_collect,
+};
 use super::{merge_runtime_guest_env, purge_all_data};
 use crate::backend::VmBackend as _;
 use crate::{
@@ -55,6 +58,8 @@ pub(crate) struct UpRuntimeOpts {
 pub(crate) struct UpDevcontainerOpts {
     pub(crate) input: DevcontainerInput,
     pub(crate) dry_run: bool,
+    /// Emit the dry-run plan as JSON on stdout (only meaningful with `dry_run`).
+    pub(crate) json: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,8 +124,9 @@ pub(crate) fn cmd_up(
     };
 
     if opts.devcontainer.dry_run {
-        let inputs = up_translator_inputs(cfg, opts);
-        resolve_devcontainer(
+        return emit_up_dry_run(
+            cfg,
+            opts,
             &DevcontainerOpts {
                 input: &opts.devcontainer.input,
                 dry_run: true,
@@ -130,10 +136,7 @@ pub(crate) fn cmd_up(
                 github_auth: cfg.github.as_ref(),
                 preference_path: Some(&cfg.devcontainer_preferences_path()),
             },
-            &inputs,
-            devcontainer::Stage::Start,
-        )?;
-        return Ok(());
+        );
     }
 
     if let Some(inst) = find_workspace_instance(cfg, &project_dir)? {
@@ -178,8 +181,9 @@ fn cmd_up_git_repo(
     repo_url: &str,
 ) -> Result<()> {
     if opts.devcontainer.dry_run {
-        let inputs = up_translator_inputs(cfg, opts);
-        resolve_devcontainer(
+        return emit_up_dry_run(
+            cfg,
+            opts,
             &DevcontainerOpts {
                 input: &opts.devcontainer.input,
                 dry_run: true,
@@ -189,10 +193,7 @@ fn cmd_up_git_repo(
                 github_auth: cfg.github.as_ref(),
                 preference_path: Some(&cfg.devcontainer_preferences_path()),
             },
-            &inputs,
-            devcontainer::Stage::Start,
-        )?;
-        return Ok(());
+        );
     }
 
     if let Some(inst) = find_git_repo_instance(cfg, repo_url)? {
@@ -240,6 +241,41 @@ fn up_translator_inputs(
         cli_workspace_or_git_repo: true,
         ..devcontainer::TranslatorInputs::default()
     }
+}
+
+/// Run the shared up dry-run: resolve the devcontainer for `Stage::Start`,
+/// then either render the human report to stderr or emit the resolved
+/// [`json::DryRunPlan`] to stdout.
+fn emit_up_dry_run(
+    cfg: &config::CoopConfig,
+    opts: &UpOpts<'_>,
+    dc_opts: &DevcontainerOpts<'_>,
+) -> Result<()> {
+    let inputs = up_translator_inputs(cfg, opts);
+    if !opts.devcontainer.json {
+        resolve_devcontainer(dc_opts, &inputs, devcontainer::Stage::Start)?;
+        return Ok(());
+    }
+    let translation = resolve_devcontainer_collect(dc_opts, &inputs, devcontainer::Stage::Start)?;
+    // Features that map to profiles are baked into the image at `coop setup`
+    // time, not selected per-start, so a Start-stage translation contributes
+    // no profiles; the effective set is exactly the CLI `--profile` list.
+    let profiles = opts
+        .profile_target
+        .as_ref()
+        .map_or(&[][..], |t| t.profiles.as_slice());
+    let guest_user = backend::persisted_guest_user(cfg, &opts.effective_image());
+    let plan = json::DryRunPlan {
+        report: translation.as_ref().map(|t| &t.report),
+        profiles,
+        guest_user: &guest_user,
+        vm: json::VmOverrides {
+            vcpus: opts.vcpus,
+            mem_mib: opts.mem,
+            disk_gib: opts.disk,
+        },
+    };
+    json::render_json(&plan)
 }
 
 fn create_up_instance(
@@ -1586,36 +1622,78 @@ pub(crate) fn cmd_destroy(
     Ok(())
 }
 
-pub(crate) fn cmd_list(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Result<()> {
+pub(crate) fn cmd_list(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    json_out: bool,
+) -> Result<()> {
     let mut instances = cfg.list_instances()?;
-    if instances.is_empty() {
+    instances.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    let summaries: Vec<json::InstanceSummary<'_>> = instances
+        .iter()
+        .map(|inst| json::InstanceSummary {
+            name: &inst.name,
+            state: json::InstanceState::from_running(be.is_running(inst)),
+        })
+        .collect();
+
+    if json_out {
+        return json::render_json(&summaries);
+    }
+
+    if summaries.is_empty() {
         writeln!(std::io::stdout(), "No instances found")
             .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
         return Ok(());
     }
-    instances.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-
     writeln!(std::io::stdout(), "{:<16} STATE", "NAME")
         .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
-    for inst in &instances {
-        let state = if be.is_running(inst) {
-            "running"
-        } else {
-            "stopped"
-        };
-        writeln!(std::io::stdout(), "{:<16} {state}", inst.name.as_str())
-            .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
+    for summary in &summaries {
+        writeln!(
+            std::io::stdout(),
+            "{:<16} {}",
+            summary.name.as_str(),
+            summary.state.label()
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
     }
     Ok(())
+}
+
+/// Assemble the common JSON status shape for one instance. Runs the same
+/// state/usage queries as the human path, so the shared fields agree.
+fn instance_status<'a>(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &'a config::Instance,
+) -> Result<json::InstanceStatus<'a>> {
+    let (state, usage) = match be.as_running(cfg, inst.clone())? {
+        Some(running) => (
+            json::InstanceState::Running,
+            backend::query_resource_usage(running.target()),
+        ),
+        None => (json::InstanceState::Stopped, None),
+    };
+    Ok(json::InstanceStatus {
+        name: &inst.name,
+        state,
+        image: &inst.image,
+        backend: json::BackendKind::of(be),
+        usage,
+    })
 }
 
 pub(crate) fn cmd_status(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     name: Option<&config::InstanceName>,
+    json_out: bool,
 ) -> Result<()> {
     if let Some(name) = name {
         let inst = cfg.resolve_instance(Some(name))?;
+        if json_out {
+            return json::render_json(&instance_status(be, cfg, &inst)?);
+        }
         let report = match be.as_running(cfg, inst.clone())? {
             Some(running) => be.status(cfg, &running)?,
             None => format!(
@@ -1627,6 +1705,13 @@ pub(crate) fn cmd_status(
             .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
     } else {
         let instances = cfg.list_instances()?;
+        if json_out {
+            let statuses = instances
+                .iter()
+                .map(|inst| instance_status(be, cfg, inst))
+                .collect::<Result<Vec<_>>>()?;
+            return json::render_json(&statuses);
+        }
         if instances.is_empty() {
             writeln!(std::io::stdout(), "No instances found")
                 .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
@@ -1850,6 +1935,7 @@ mod tests {
             devcontainer: super::UpDevcontainerOpts {
                 input: super::DevcontainerInput::Disabled,
                 dry_run: false,
+                json: false,
             },
         }
     }

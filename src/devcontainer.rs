@@ -345,7 +345,8 @@ pub fn warn_if_applied_devcontainer_changed(inst: &config::Instance) {
 // ── Reporting ────────────────────────────────────────────────
 
 /// Result of translating one key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReportStatus {
     /// Value from devcontainer.json took effect.
     Applied,
@@ -369,7 +370,8 @@ impl ReportStatus {
 }
 
 /// Origin of the effective value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReportSource {
     Cli,
     Devcontainer,
@@ -387,7 +389,7 @@ impl ReportSource {
 /// One row in the report table. `key` is the dotted devcontainer.json path
 /// (e.g. `hostRequirements.cpus`); `value` is the effective value (after
 /// CLI/precedence) rendered as a short string; `note` is free-form context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ReportEntry {
     pub key: String,
     pub status: ReportStatus,
@@ -398,7 +400,7 @@ pub struct ReportEntry {
 
 /// Loud per-key report rendered after translation. Implements `Display`
 /// for direct `writeln!` into stderr.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct Report {
     pub entries: Vec<ReportEntry>,
     pub source_path: Option<PathBuf>,
