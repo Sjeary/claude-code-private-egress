@@ -757,11 +757,11 @@ fn tar_extract_cmd(guest_path: &GuestPath) -> RemoteCommand {
     RemoteCommand::new().literal("tar xf - -C ").arg(guest_path)
 }
 
-/// Local tar command used for host-side archive creation/extraction.
+/// Local tar command used for host-side archive creation.
 ///
-/// `COPYFILE_DISABLE=1` is only meaningful to macOS libarchive/bsdtar, where
-/// it suppresses `AppleDouble` `._*` entries for resource forks and extended
-/// attributes.
+/// On macOS, `COPYFILE_DISABLE=1` stops libarchive/bsdtar from emitting
+/// `AppleDouble` `._*` entries for xattrs/resource forks while packing. It
+/// only affects archive creation (`readdisk_flags`), not extraction.
 fn tar_command() -> Command {
     let mut cmd = Command::new("tar");
     // On macOS, tar's default copyfile(3) metadata path can emit AppleDouble
