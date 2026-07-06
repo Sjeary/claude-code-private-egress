@@ -822,7 +822,7 @@ fn tar_pipe_pull(
         .take()
         .context("Failed to get SSH stderr")?;
 
-    let mut tar_child = tar_command()
+    let mut tar_child = Command::new("tar")
         .arg("xf")
         .arg("-")
         .arg("-C")
