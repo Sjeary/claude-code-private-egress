@@ -126,11 +126,12 @@ All transfers (rsync and tar-pipe) exclude these reproducible build and cache di
 - `.venv/`
 - `.coop/`
 
-When coop uses tar on a macOS host, host-side tar commands run with
+When coop uses tar on a macOS host, host-side tar archive creation runs with
 `COPYFILE_DISABLE=1`. This suppresses tar-generated AppleDouble (`._*`) entries
-for resource forks or extended attributes. Without that setting, those metadata
-entries can land in a Linux guest as ordinary files, including inside `.git/`,
-where they can break Git's pack/ref discovery.
+for resource forks or extended attributes while packing (the setting has no
+effect on extraction). Without it, those metadata entries can land in a Linux
+guest as ordinary files, including inside `.git/`, where they can break Git's
+pack/ref discovery.
 
 `.git/` is **included** by default so agents in the guest get full history, branches, and the ability to make commits that survive a `coop pull`. Pass `--exclude-git` to `coop up`, `coop push`, or `coop pull` to skip it on a per-transfer basis (useful for very large repos where transfer time dominates).
 
