@@ -2632,6 +2632,86 @@ test_workspace_sync() {
     ws_tmpdir=""
 }
 
+# macOS hosts: `coop up --copy` streams the workspace through host tar, whose
+# default copyfile(3) metadata path emits AppleDouble `._*` sidecar entries
+# for xattrs/resource forks. Those land in the Linux guest as ordinary files
+# (they can break Git's pack/ref discovery inside .git/) and get pulled back
+# to the host. coop sets COPYFILE_DISABLE=1 on host-side tar creation to
+# suppress them; this phase reproduces the round-trip and pins the fix.
+# Skipped off macOS, where tar has no copyfile path.
+test_appledouble_sidecars() {
+    echo ""
+    echo "=== Phase: appledouble sidecars (macOS --copy round-trip) ==="
+
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        skip "copy/pull round-trip creates no AppleDouble sidecars" "macOS-only"
+        return
+    fi
+
+    local ad_instance="${INSTANCE}-appledouble"
+    local repo_dir="$tmpdir/appledouble-repo"
+    local pull_dir="$tmpdir/appledouble-pull"
+
+    mkdir -p "$repo_dir"
+    (
+        cd "$repo_dir" && \
+        git init --quiet --initial-branch=main && \
+        echo "hi" > AGENTS.md && \
+        git add . && \
+        git -c user.email=ci@test -c user.name=CI commit --quiet -m "init" && \
+        xattr -w com.example.coop-test value AGENTS.md
+    ) || {
+        fail "set up xattr-bearing git repo" "git init/commit/xattr failed"
+        return
+    }
+
+    local sidecars
+    sidecars=$(find "$repo_dir" -name '._*')
+    if [[ -n "$sidecars" ]]; then
+        fail "source fixture is sidecar-free" "found: $sidecars"
+        return
+    fi
+
+    if coop up "$repo_dir" --name "$ad_instance" --copy \
+        --no-agents --no-prompt --no-devcontainer; then
+        STARTED_INSTANCES+=("$ad_instance")
+        pass "up --copy with xattr-bearing repo exits 0"
+    else
+        fail "up --copy with xattr-bearing repo exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    # The push side is where host tar creation runs, so check the guest
+    # first: sidecars appearing here mean COPYFILE_DISABLE didn't apply.
+    GUEST_INSTANCE="$ad_instance"
+    if sidecars=$(coop_exec sh -c 'find /workspace -name "._*"'); then
+        if [[ -z "$sidecars" ]]; then
+            pass "guest workspace has no AppleDouble sidecars"
+        else
+            fail "guest workspace has no AppleDouble sidecars" "found: $sidecars"
+        fi
+    else
+        fail "guest workspace has no AppleDouble sidecars" \
+            "find failed: $(guest_stderr)"
+    fi
+    unset GUEST_INSTANCE
+
+    mkdir -p "$pull_dir"
+    if coop pull "$ad_instance" --force --dir "$pull_dir"; then
+        sidecars=$(find "$pull_dir" -name '._*')
+        if [[ -z "$sidecars" ]]; then
+            pass "pulled checkout has no AppleDouble sidecars"
+        else
+            fail "pulled checkout has no AppleDouble sidecars" "found: $sidecars"
+        fi
+    else
+        fail "pull for sidecar check exits 0" "stderr: $HARNESS_ERR"
+    fi
+
+    coop destroy "$ad_instance" 2>/dev/null || true
+    untrack_instance "$ad_instance"
+}
+
 # ── Multi-instance tests (--full only) ────────────────────────
 
 test_multi_instance() {
@@ -4695,6 +4775,7 @@ main() {
         test_host_mount_custom_guest_path
         test_port_forwards
         test_workspace_sync
+        test_appledouble_sidecars
         test_multi_instance
         test_named_images
         test_guest_user_alt

@@ -167,7 +167,7 @@ pub fn tar_pipe_transfer_to(
         source_dir.display(),
     );
 
-    let mut tar_cmd = Command::new("tar");
+    let mut tar_cmd = tar_command();
     tar_cmd.args(["cf", "-"]);
     for exc in DEFAULT_EXCLUDES {
         tar_cmd.arg(format!("--exclude={exc}"));
@@ -755,6 +755,23 @@ fn rsync_pull(
 /// as a single, literal directory argument regardless of its contents.
 fn tar_extract_cmd(guest_path: &GuestPath) -> RemoteCommand {
     RemoteCommand::new().literal("tar xf - -C ").arg(guest_path)
+}
+
+/// Local tar command used for host-side archive creation.
+///
+/// On macOS, `COPYFILE_DISABLE=1` stops libarchive/bsdtar from emitting
+/// `AppleDouble` `._*` entries for xattrs/resource forks while packing. It
+/// only affects archive creation (`readdisk_flags`), not extraction.
+fn tar_command() -> Command {
+    let mut cmd = Command::new("tar");
+    // On macOS, tar's default copyfile(3) metadata path can emit AppleDouble
+    // `._*` sidecars for xattrs/resource forks. Apple tar checks this env var
+    // to disable that path:
+    // https://github.com/apple-oss-distributions/libarchive/blob/main/libarchive/tar/bsdtar.c#L262-L270
+    if cfg!(target_os = "macos") {
+        cmd.env("COPYFILE_DISABLE", "1");
+    }
+    cmd
 }
 
 /// Remote command that streams a tar archive of `guest_path` to stdout,
@@ -1825,6 +1842,21 @@ Host coop-other\n\
             "DEFAULT_EXCLUDES must not contain a .git pattern; got {DEFAULT_EXCLUDES:?}"
         );
         assert_eq!(GIT_EXCLUDE, ".git/");
+    }
+
+    #[test]
+    fn host_tar_sets_copyfile_disable_on_macos() {
+        let cmd = tar_command();
+        let copyfile_disable = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "COPYFILE_DISABLE")
+            .and_then(|(_, value)| value);
+
+        if cfg!(target_os = "macos") {
+            assert_eq!(copyfile_disable, Some(std::ffi::OsStr::new("1")));
+        } else {
+            assert_eq!(copyfile_disable, None);
+        }
     }
 
     proptest! {
