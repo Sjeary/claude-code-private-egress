@@ -67,12 +67,13 @@ use backend::VmBackend as _;
 use commands::json;
 use commands::{
     DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
-    StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts, apply_runtime_guest_env,
-    apply_vm_overrides, cmd_commit, cmd_destroy, cmd_devcontainer, cmd_devcontainer_check,
-    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_quickstart,
-    cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up,
-    cmd_validate, codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
-    resolve_devcontainer, resolve_devcontainer_collect, resolve_running,
+    ResizeOpts, StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts,
+    apply_runtime_guest_env, apply_vm_overrides, cmd_commit, cmd_destroy, cmd_devcontainer,
+    cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model,
+    cmd_profiles, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status,
+    cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, open_ssh_session,
+    preflight_start_target, prepend_binary, resolve_devcontainer, resolve_devcontainer_collect,
+    resolve_running,
 };
 
 #[derive(Parser)]
@@ -533,7 +534,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Resize a stopped instance's disk
+    /// Resize a stopped instance's disk, memory, or vCPU count
+    #[command(group(clap::ArgGroup::new("resize_targets")
+        .required(true)
+        .multiple(true)
+        .args(["size", "mem", "vcpus"])))]
     Resize {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -541,9 +546,18 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// New size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
-        #[arg(long, required = true, value_parser = config::DiskSize::parse)]
-        size: config::DiskSize,
+        /// New disk size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
+        #[arg(long, value_parser = config::DiskSize::parse)]
+        size: Option<config::DiskSize>,
+        /// New memory in MiB (minimum 128)
+        #[arg(long, value_parser = config::MiB::parse_cli)]
+        mem: Option<config::MiB>,
+        /// New vCPU count
+        #[arg(long)]
+        vcpus: Option<std::num::NonZeroU8>,
+        /// Start the instance after applying the change instead of leaving it stopped
+        #[arg(long)]
+        start: bool,
     },
     /// Save a stopped instance's filesystem as a reusable image
     Commit {
@@ -1218,7 +1232,23 @@ pub fn run() -> Result<()> {
             workspace::write_ssh_config(&running)
         }
         Commands::Images { delete, json } => cmd_images(&be, &cfg, delete.as_ref(), json),
-        Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_ref(), size),
+        Commands::Resize {
+            name,
+            size,
+            mem,
+            vcpus,
+            start,
+        } => cmd_resize(
+            &be,
+            &cfg,
+            &ResizeOpts {
+                name: name.as_ref(),
+                disk: size,
+                mem,
+                vcpus,
+                start,
+            },
+        ),
         Commands::Commit { name, image, force } => {
             cmd_commit(&be, &cfg, name.as_ref(), &image, force)
         }
