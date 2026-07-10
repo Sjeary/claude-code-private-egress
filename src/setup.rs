@@ -17,8 +17,9 @@ use crate::guest::{
 };
 use crate::sha256_hash::Sha256Hash;
 
+// Path-style URL: the bucket name contains dots, so virtual-hosted HTTPS
+// (`https://spec.ccfc.min.s3.amazonaws.com`) fails TLS wildcard-cert matching.
 const S3_BUCKET: &str = "https://s3.amazonaws.com/spec.ccfc.min";
-const S3_LIST: &str = "http://spec.ccfc.min.s3.amazonaws.com";
 const GH_RELEASES: &str = "https://github.com/firecracker-microvm/firecracker/releases";
 
 /// Monotonic version bumped when the base install script changes
@@ -1100,7 +1101,7 @@ const FC_CI_FALLBACK_MINORS: u16 = 4;
 /// XML response. An empty response (the prefix has no objects) returns
 /// an empty Vec rather than an error.
 fn s3_list_keys(prefix: &str) -> Result<Vec<String>> {
-    let list_url = format!("{S3_LIST}/?prefix={prefix}&list-type=2");
+    let list_url = format!("{S3_BUCKET}/?prefix={prefix}&list-type=2");
     let output = Command::new("curl")
         .args(["-sf", &list_url])
         .output()

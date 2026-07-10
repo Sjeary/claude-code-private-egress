@@ -778,7 +778,7 @@ coop profiles show rust
 
 Replace the running coop binary with a release from `github.com/trailofbits/coop`. Downloads the tarball matching the current host triple, verifies its SHA-256 against the release's `SHA256SUMS`, and (when `gh` is installed) verifies the GitHub build-provenance attestation before swapping the binary atomically.
 
-While `trailofbits/coop` is private, `coop update` requires either [`gh`](https://cli.github.com/) authenticated against `github.com` or `GITHUB_TOKEN` in the environment to reach the API and download release assets. Once the repository is public, no auth is needed.
+No authentication is required. When [`gh`](https://cli.github.com/) is authenticated against `github.com` or `GITHUB_TOKEN` is set, `coop update` uses it, which helps avoid GitHub API rate limits.
 
 ```
 coop update [FLAGS]
