@@ -14,12 +14,6 @@ Install:
 curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | bash
 ```
 
-For internal/private repos (requires [GitHub CLI](https://cli.github.com/)):
-
-```
-gh api repos/trailofbits/coop/contents/install.sh -H "Accept: application/vnd.github.raw" | bash
-```
-
 Or build from source (requires [Rust](https://rustup.rs/)):
 
 ```
@@ -104,10 +98,9 @@ host triple, verifies the SHA-256 against the release's `SHA256SUMS`, and
 (when `gh` is installed) verifies the GitHub build-provenance attestation
 before swapping the binary atomically.
 
-While `trailofbits/coop` is private, `coop update` requires either
-[`gh`](https://cli.github.com/) authenticated against `github.com` or
-`GITHUB_TOKEN` in the environment to reach the API and download release
-assets. Once the repository is public, no auth is needed.
+No authentication is required. When [`gh`](https://cli.github.com/) is
+authenticated against `github.com` or `GITHUB_TOKEN` is set, `coop update`
+uses it, which helps avoid GitHub API rate limits.
 
 ```sh
 coop update --check             # report whether a newer release exists

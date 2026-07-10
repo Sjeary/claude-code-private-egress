@@ -4,6 +4,7 @@ version = "0.5.3"
 edition = "2024"
 description = "Isolated VM environment for running Claude Code"
 license = "Apache-2.0"
+repository = "https://github.com/trailofbits/coop"
 
 [dependencies]
 anyhow = "1"

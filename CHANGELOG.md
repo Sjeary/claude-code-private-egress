@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **Firecracker CI artifact listing fetched over HTTPS** (#401) — the S3
+  `ListObjectsV2` request that discovers kernel/rootfs versions during
+  setup used plain HTTP: the bucket name contains dots, which breaks TLS
+  certificate matching for the virtual-hosted URL. It now uses the same
+  path-style HTTPS endpoint as the downloads themselves, so a network
+  attacker can no longer steer version selection.
+
+### Documentation
+
+- **Docs describe the public repository** (#401) — removed the
+  transitional "while `trailofbits/coop` is private" wording from the
+  README and `docs/commands.md`. `coop update` and `install.sh` work
+  anonymously and use `gh`/`GITHUB_TOKEN` opportunistically when present.
+
+### Internal
+
+- **`repository` metadata added to Cargo.toml** (#401).
+
 ## v0.5.3
 
 ### New features
