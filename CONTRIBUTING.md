@@ -12,8 +12,18 @@ backend. The sections below note where that applies.
 
 - **Rust** via [rustup](https://rustup.rs/). The toolchain version is pinned in
   `rust-toolchain.toml` and installed automatically when you build.
-- **[prek](https://github.com/j178/prek)** for git hooks (`cargo install prek`
-  or see its install docs).
+- **Dev tools** at pinned versions — [prek](https://github.com/j178/prek) (git
+  hooks), [taplo](https://taplo.tamasfe.dev/) (TOML formatting), and cargo-deny
+  (supply-chain checks). Install them with:
+
+  ```bash
+  ./scripts/install-dev-tools.sh          # baseline
+  ./scripts/install-dev-tools.sh --all    # also cargo-mutants, cargo-fuzz, kani
+  ```
+
+  The script pins the local dev-tool versions; bump a version there rather than
+  installing a floating `latest`. CI pins its own copies of taplo and cargo-deny
+  in `.github/workflows/ci.yml`, so keep those in sync when bumping.
 - To run the full integration suite you need a working backend:
   - **macOS**: Apple Silicon with [Lima](https://github.com/lima-vm/lima)
     (`limactl` on your PATH).
@@ -43,9 +53,9 @@ prek install
 ```
 
 The hooks run `cargo fmt -- --check`, `cargo clippy --all-targets --all-features
--- -D warnings`, `cargo test`, and a set of file checks (trailing whitespace,
-end-of-file, YAML, large files, merge conflicts). Run them by hand at any time
-with:
+-- -D warnings`, `cargo test`, `taplo format --check` (TOML formatting, also
+enforced by CI), and a set of file checks (trailing whitespace, end-of-file,
+YAML, large files, merge conflicts). Run them by hand at any time with:
 
 ```bash
 prek run --all-files
