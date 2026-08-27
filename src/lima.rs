@@ -1354,6 +1354,10 @@ fn ensure_private_egress_base(cfg: &CoopConfig, image: &ImageName) -> Result<Pat
         .canonicalize()
         .context("Golden image not found - run setup first")?;
     let (guarded, stamp) = private_egress_image_paths(cfg, image);
+    // Every image uses the same temporary Lima builder name. A global lock is
+    // required even when concurrent processes request different images.
+    let builder_state = cfg.data_dir.join("private-egress").join("image-builder");
+    let _builder_lock = crate::fs_util::lock_sibling(&builder_state)?;
     let fingerprint = private_egress_source_fingerprint(&source)?;
     if guarded.exists() && fs::read_to_string(&stamp).is_ok_and(|existing| existing == fingerprint)
     {

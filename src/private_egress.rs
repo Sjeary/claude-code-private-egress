@@ -34,6 +34,7 @@ mod platform {
     use crate::sha256_hash::Sha256Hash;
 
     const MAX_SUBSCRIPTION_BYTES: usize = 16 * 1024 * 1024;
+    const GATEWAY_CONFIG_VERSION: u32 = 2;
     type HardenedConfig = (Vec<u8>, String, Vec<(String, String)>);
 
     fn lima_cmd() -> Cmd {
@@ -70,6 +71,20 @@ mod platform {
         command
     }
 
+    fn host_https_curl_cmd() -> Cmd {
+        host_curl_cmd().args([
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--retry",
+            "3",
+            "--retry-all-errors",
+            "--retry-delay",
+            "1",
+        ])
+    }
+
     pub fn ensure_gateway(cfg: &CoopConfig) -> Result<()> {
         let Some(egress) = &cfg.private_egress else {
             return Ok(());
@@ -79,17 +94,96 @@ mod platform {
             "private_egress requires Lima (limactl) on macOS"
         );
 
+        // Config installation restarts a shared gateway and rotates its
+        // controller secret. Serialize the complete operation so concurrent
+        // `coop` processes cannot invalidate each other's selector state.
+        let gateway_state = cfg.data_dir.join("private-egress").join("gateway-state");
+        let _gateway_lock = crate::fs_util::lock_sibling(&gateway_state)?;
+
         ensure_gateway_vm(cfg)?;
         ensure_mihomo_binary()?;
 
+        let raw_subscription = egress
+            .subscription
+            .resolve()
+            .context("Failed to resolve private_egress.subscription")?;
+        let expected_egress = egress
+            .expected_egress_ip
+            .resolve()
+            .context("Failed to resolve private_egress.expected_egress_ip")?;
+        expected_egress
+            .parse::<Ipv4Addr>()
+            .context("Expected egress value is not a single IPv4 address")?;
+        let deployment =
+            gateway_deployment_fingerprint(egress, &raw_subscription, &expected_egress);
+        let deployment_stamp = cfg
+            .data_dir
+            .join("private-egress")
+            .join("gateway-deployment.stamp");
+        if fs::read_to_string(&deployment_stamp).is_ok_and(|current| current.trim() == deployment) {
+            if gateway_service_healthy() {
+                return Ok(());
+            }
+            // A reboot or transient service failure should recover from the
+            // already-hardened on-disk config without requiring the remote
+            // subscription endpoint to be available.
+            let _ = lima_cmd()
+                .args([
+                    "shell",
+                    GATEWAY_NAME,
+                    "--",
+                    "sudo",
+                    "systemctl",
+                    "restart",
+                    "mihomo.service",
+                ])
+                .run();
+            if gateway_service_healthy() {
+                return Ok(());
+            }
+        }
+
         let bootstrap_dns = gateway_bootstrap_dns()?;
-        let subscription = fetch_subscription(egress)?;
+        let subscription = fetch_subscription(&raw_subscription)?;
         let (config, controller_secret, selections) =
             harden_config(subscription, egress, bootstrap_dns)?;
-        install_gateway_config(&config, bootstrap_dns)?;
-        select_routes(&controller_secret, &selections)?;
+        let selector_state = selector_payload(&controller_secret, &selections)?;
+        install_gateway_config(&config, &selector_state, bootstrap_dns)?;
         verify_gateway_connectivity()?;
+        crate::fs_util::atomic_write_with_mode(&deployment_stamp, &deployment, 0o600)?;
         Ok(())
+    }
+
+    fn gateway_deployment_fingerprint(
+        config: &PrivateEgressConfig,
+        subscription: &str,
+        expected_egress: &str,
+    ) -> String {
+        let source = format!(
+            "version={GATEWAY_CONFIG_VERSION}\nsubscription={}\nexpected={}\nentry_group={}\nentry_choice={}\nexit_group={}\nexit_prefix={}\nexit_suffix={}\n",
+            Sha256Hash::of(subscription.as_bytes()),
+            Sha256Hash::of(expected_egress.as_bytes()),
+            config.entry_group,
+            config.entry_choice,
+            config.exit_group,
+            config.exit_choice_prefix,
+            config.exit_choice_suffix,
+        );
+        Sha256Hash::of(source.as_bytes()).to_string()
+    }
+
+    fn gateway_service_healthy() -> bool {
+        lima_cmd()
+            .args([
+                "shell",
+                GATEWAY_NAME,
+                "--",
+                "sudo",
+                "sh",
+                "-c",
+                "systemctl is-active --quiet mihomo.service && ip link show coop-egress >/dev/null && nft list chain inet coop_gateway_killswitch forward | grep -q 'oifname \\\"coop-egress\\\" accept'",
+            ])
+            .status_ok()
     }
 
     fn ensure_gateway_vm(cfg: &CoopConfig) -> Result<()> {
@@ -196,7 +290,7 @@ provision:
             return Ok(());
         }
 
-        let release = host_curl_cmd()
+        let release = host_https_curl_cmd()
             .args([
                 "--fail",
                 "--silent",
@@ -238,7 +332,7 @@ provision:
 
         let dir = tempfile::tempdir().context("Failed to create Mihomo download directory")?;
         let archive = dir.path().join("mihomo.gz");
-        host_curl_cmd()
+        host_https_curl_cmd()
             .args(["--fail", "--silent", "--show-error", "--location"])
             .arg(url)
             .arg("--output")
@@ -282,12 +376,8 @@ provision:
         Ok(())
     }
 
-    fn fetch_subscription(config: &PrivateEgressConfig) -> Result<Value> {
-        let raw_url = config
-            .subscription
-            .resolve()
-            .context("Failed to resolve private_egress.subscription")?;
-        let url = Url::parse(&raw_url).context("Subscription secret is not a valid URL")?;
+    fn fetch_subscription(raw_url: &str) -> Result<Value> {
+        let url = Url::parse(raw_url).context("Subscription secret is not a valid URL")?;
         ensure!(url.scheme() == "https", "Subscription URL must use HTTPS");
         ensure!(
             !url.cannot_be_a_base() && url.host_str().is_some(),
@@ -304,9 +394,7 @@ provision:
             "Subscription URL contains characters unsupported by curl config input"
         );
 
-        let curl_config = format!(
-            "url = \"{raw_url}\"\nfail\nsilent\nshow-error\nlocation\nmax-time = 30\nmax-filesize = {MAX_SUBSCRIPTION_BYTES}\n"
-        );
+        let curl_config = subscription_curl_config(raw_url);
         let yaml = host_curl_cmd()
             .args(["--config", "-"])
             .stdin_input(curl_config)
@@ -317,6 +405,12 @@ provision:
             "Subscription exceeds {MAX_SUBSCRIPTION_BYTES} bytes"
         );
         serde_yaml_ng::from_str(&yaml).context("Subscription is not valid YAML")
+    }
+
+    fn subscription_curl_config(raw_url: &str) -> String {
+        format!(
+            "url = \"{raw_url}\"\nproto = \"=https\"\nproto-redir = \"=https\"\nretry = 3\nretry-all-errors\nretry-delay = 1\nfail\nsilent\nshow-error\nlocation\nmax-time = 30\nmax-filesize = {MAX_SUBSCRIPTION_BYTES}\n"
+        )
     }
 
     fn harden_config(
@@ -397,6 +491,7 @@ provision:
     fn hardened_tun() -> Value {
         let mut tun = Mapping::new();
         insert(&mut tun, "enable", Value::Bool(true));
+        insert(&mut tun, "device", Value::String("coop-egress".into()));
         insert(&mut tun, "stack", Value::String("mixed".into()));
         insert(&mut tun, "auto-route", Value::Bool(true));
         insert(&mut tun, "auto-redirect", Value::Bool(true));
@@ -524,7 +619,19 @@ provision:
             .context("Gateway VM default route did not provide an IPv4 bootstrap resolver")
     }
 
-    fn install_gateway_config(config: &[u8], bootstrap_dns: Ipv4Addr) -> Result<()> {
+    fn selector_payload(secret: &str, selections: &[(String, String)]) -> Result<Vec<u8>> {
+        serde_json::to_vec(&serde_json::json!({
+            "secret": secret,
+            "selections": selections,
+        }))
+        .context("Failed to encode Mihomo selector state")
+    }
+
+    fn install_gateway_config(
+        config: &[u8],
+        selector_state: &[u8],
+        bootstrap_dns: Ipv4Addr,
+    ) -> Result<()> {
         lima_cmd()
             .args([
                 "shell",
@@ -533,34 +640,30 @@ provision:
                 "sudo",
                 "sh",
                 "-c",
-                "umask 077; install -d -m 0700 /etc/mihomo; rm -f /etc/mihomo/selector-state.json; cat > /etc/mihomo/config.yaml",
+                "umask 077; install -d -m 0700 /etc/mihomo; cat > /etc/mihomo/config.yaml.tmp && mv /etc/mihomo/config.yaml.tmp /etc/mihomo/config.yaml",
             ])
             .stdin_input(config.to_vec())
             .run()
             .context("Failed to transfer private egress config")?;
-        lima_cmd()
-            .args(["shell", GATEWAY_NAME, "--", "sudo", "sh", "-s", "--"])
-            .arg(bootstrap_dns.to_string())
-            .stdin_input(GATEWAY_SETUP_SCRIPT.as_bytes().to_vec())
-            .run()
-            .context("Failed to configure the private egress service")
-    }
-
-    fn select_routes(secret: &str, selections: &[(String, String)]) -> Result<()> {
-        let payload = serde_json::json!({"secret": secret, "selections": selections});
         lima_cmd()
             .args([
                 "shell",
                 GATEWAY_NAME,
                 "--",
                 "sudo",
-                "python3",
+                "sh",
                 "-c",
-                SELECTOR_SCRIPT,
+                "umask 077; cat > /etc/mihomo/selector-state.json.tmp && mv /etc/mihomo/selector-state.json.tmp /etc/mihomo/selector-state.json",
             ])
-            .stdin_input(serde_json::to_vec(&payload).context("Failed to encode selections")?)
+            .stdin_input(selector_state.to_vec())
             .run()
-            .context("Failed to pin Mihomo proxy selectors")
+            .context("Failed to transfer private egress selector state")?;
+        lima_cmd()
+            .args(["shell", GATEWAY_NAME, "--", "sudo", "sh", "-s", "--"])
+            .arg(bootstrap_dns.to_string())
+            .stdin_input(GATEWAY_SETUP_SCRIPT.as_bytes().to_vec())
+            .run()
+            .context("Failed to configure the private egress service")
     }
 
     fn verify_gateway_connectivity() -> Result<()> {
@@ -598,7 +701,7 @@ provision:
                 "--",
                 "sh",
                 "-c",
-                "hostname -I | awk '{print $1}'",
+                "iface=$(ip -4 route show default | awk 'NR == 1 { for (i=1; i<=NF; i++) if ($i == \"dev\") { print $(i+1); exit } }'); test -n \"$iface\"; ip -4 -o address show dev \"$iface\" scope global | awk 'NR == 1 { split($4, addr, \"/\"); print addr[1]; exit }'",
             ])
             .capture()
             .context("Failed to discover the private egress gateway address")?;
@@ -610,6 +713,10 @@ provision:
 
     const GATEWAY_SETUP_SCRIPT: &str = r#"set -eu
 BOOTSTRAP_DNS=$1
+UPLINK=$(ip -4 route show default | awk 'NR == 1 { for (i=1; i<=NF; i++) if ($i == "dev") { print $(i+1); exit } }')
+case "$UPLINK" in
+  ''|*[!A-Za-z0-9_.:-]*) echo "invalid gateway uplink interface" >&2; exit 1 ;;
+esac
 install -d -o root -g root -m 0755 /usr/local/libexec
 cat >/usr/local/libexec/mihomo-restore-selectors <<'PYTHON'
 #!/usr/bin/python3
@@ -617,7 +724,7 @@ import json, pathlib, time, urllib.parse, urllib.request
 
 state_path = pathlib.Path("/etc/mihomo/selector-state.json")
 if not state_path.exists():
-    raise SystemExit(0)
+    raise SystemExit("selector state is missing; refusing to open forwarding")
 payload = json.loads(state_path.read_text())
 headers = {"Authorization": "Bearer " + payload["secret"], "Content-Type": "application/json"}
 for group, choice in payload["selections"]:
@@ -647,10 +754,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
+ExecStartPre=/usr/sbin/nft -f /etc/mihomo/killswitch-closed.nft
 ExecStartPre=/usr/local/bin/mihomo -t -d /etc/mihomo
-ExecStartPre=/usr/sbin/nft -f /etc/mihomo/killswitch.nft
 ExecStart=/usr/local/bin/mihomo -d /etc/mihomo
 ExecStartPost=/usr/local/libexec/mihomo-restore-selectors
+ExecStartPost=/usr/sbin/nft -f /etc/mihomo/killswitch-open.nft
+ExecStopPost=/usr/sbin/nft -f /etc/mihomo/killswitch-closed.nft
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
@@ -665,17 +774,25 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 [Install]
 WantedBy=multi-user.target
 UNIT
-cat >/etc/mihomo/killswitch.nft <<'NFT'
+cat >/etc/mihomo/killswitch-closed.nft <<'NFT'
 destroy table inet coop_gateway_killswitch
 table inet coop_gateway_killswitch {
   chain forward {
     type filter hook forward priority 100; policy drop;
-    iifname "eth0" oifname "Meta" accept
-    iifname "Meta" oifname "eth0" accept
   }
 }
 NFT
-chmod 0600 /etc/mihomo/killswitch.nft
+cat >/etc/mihomo/killswitch-open.nft <<NFT
+destroy table inet coop_gateway_killswitch
+table inet coop_gateway_killswitch {
+  chain forward {
+    type filter hook forward priority 100; policy drop;
+    iifname "$UPLINK" oifname "coop-egress" accept
+    iifname "coop-egress" oifname "$UPLINK" accept
+  }
+}
+NFT
+chmod 0600 /etc/mihomo/killswitch-closed.nft /etc/mihomo/killswitch-open.nft
 cat >/etc/sysctl.d/90-coop-egress.conf <<'SYSCTL'
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.disable_ipv6=1
@@ -701,32 +818,6 @@ systemctl --no-pager status mihomo.service >&2
 exit 1
 "#;
 
-    const SELECTOR_SCRIPT: &str = r#"import json, os, pathlib, sys, time, urllib.parse, urllib.request
-payload = json.load(sys.stdin)
-state_path = pathlib.Path("/etc/mihomo/selector-state.json")
-temporary = state_path.with_suffix(".tmp")
-temporary.write_text(json.dumps(payload, separators=(",", ":")))
-os.chmod(temporary, 0o600)
-temporary.replace(state_path)
-headers = {"Authorization": "Bearer " + payload["secret"], "Content-Type": "application/json"}
-for group, choice in payload["selections"]:
-    url = "http://127.0.0.1:9090/proxies/" + urllib.parse.quote(group, safe="")
-    body = json.dumps({"name": choice}).encode()
-    last = None
-    for _ in range(30):
-        try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="PUT")
-            with urllib.request.urlopen(req, timeout=2) as response:
-                if response.status in (200, 204):
-                    last = None
-                    break
-        except Exception as exc:
-            last = exc
-            time.sleep(1)
-    if last is not None:
-        raise last
-"#;
-
     #[cfg(test)]
     #[expect(clippy::expect_used, reason = "test failures should identify fixtures")]
     mod tests {
@@ -748,6 +839,33 @@ exit_choice_suffix = ""
             )
             .expect("valid test config");
             config.private_egress.expect("private egress configured")
+        }
+
+        #[test]
+        fn deployment_fingerprint_tracks_resolved_secrets_without_exposing_them() {
+            let config = egress_config();
+            let first = gateway_deployment_fingerprint(
+                &config,
+                "https://secret.example/sub/token-one",
+                "203.0.113.10",
+            );
+            let second = gateway_deployment_fingerprint(
+                &config,
+                "https://secret.example/sub/token-two",
+                "203.0.113.10",
+            );
+            assert_ne!(first, second);
+            assert_eq!(first.len(), 64);
+            assert!(!first.contains("token-one"));
+        }
+
+        #[test]
+        fn subscription_download_forbids_redirect_downgrades_and_retries() {
+            let curl = subscription_curl_config("https://secret.example/sub/token");
+            assert!(curl.contains("proto = \"=https\""));
+            assert!(curl.contains("proto-redir = \"=https\""));
+            assert!(curl.contains("retry-all-errors"));
+            assert!(curl.contains("max-filesize = 16777216"));
         }
 
         #[test]
@@ -806,6 +924,11 @@ rules: [MATCH,DIRECT]
                 .and_then(Value::as_mapping)
                 .expect("tun mapping");
             assert_eq!(
+                tun.get(Value::String("device".into()))
+                    .and_then(Value::as_str),
+                Some("coop-egress")
+            );
+            assert_eq!(
                 tun.get(Value::String("strict-route".into())),
                 Some(&Value::Bool(true))
             );
@@ -862,6 +985,23 @@ rules: [MATCH,DIRECT]
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("iptables -w -D OUTPUT -j PRIVATE_EGRESS_BOOT"));
             assert!(GATEWAY_SETUP_SCRIPT.contains("destroy table inet coop_gateway_killswitch"));
             assert!(!GATEWAY_SETUP_SCRIPT.contains("nft delete table"));
+            let restore = GATEWAY_SETUP_SCRIPT
+                .find("ExecStartPost=/usr/local/libexec/mihomo-restore-selectors")
+                .expect("selector restore hook");
+            let open = GATEWAY_SETUP_SCRIPT
+                .find("ExecStartPost=/usr/sbin/nft -f /etc/mihomo/killswitch-open.nft")
+                .expect("forward-open hook");
+            assert!(
+                restore < open,
+                "forwarding must open after selector restore"
+            );
+            assert!(
+                GATEWAY_SETUP_SCRIPT
+                    .contains("ExecStopPost=/usr/sbin/nft -f /etc/mihomo/killswitch-closed.nft")
+            );
+            assert!(GATEWAY_SETUP_SCRIPT.contains("iifname \"$UPLINK\""));
+            assert!(GATEWAY_SETUP_SCRIPT.contains("refusing to open forwarding"));
+            assert!(!GATEWAY_SETUP_SCRIPT.contains("raise SystemExit(0)"));
         }
     }
 }

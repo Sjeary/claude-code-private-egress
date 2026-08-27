@@ -35,6 +35,10 @@
   Agent images now contain an early-boot OUTPUT guard before their first boot,
   agent commands start from an empty environment, subscription listener ports
   are removed, and the gateway bootstrap resolver is discovered dynamically.
+  Gateway restarts now keep forwarding closed until selectors are restored,
+  concurrent reconfiguration is serialized, and HTTPS redirects cannot
+  downgrade subscription or Mihomo downloads to plaintext HTTP. Healthy,
+  unchanged gateways are reused instead of restarting on every agent launch.
 
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side

@@ -190,6 +190,14 @@ every Mihomo service start, and verifies the observed public IPv4 against
 `expected_egress_ip`. Download, selector, service, or HTTP exit verification
 failure aborts startup.
 
+Gateway reconfiguration is serialized across Coop processes. During every
+Mihomo start or restart, forwarded traffic remains blocked until all configured
+selectors have been restored successfully; service stop and failed start paths
+close forwarding again. Subscription and binary downloads also require HTTPS
+for the initial request and every redirect. Coop stores only a SHA-256 deployment
+fingerprint on the host; unchanged healthy gateways are reused without
+redownloading the subscription or interrupting other running agent VMs.
+
 The proxy server hostname has to be resolved before the encrypted chain exists.
 Mihomo therefore discovers the gateway VM's DHCP-provided default next hop and
 uses it as Lima's local resolver only for this cold-start bootstrap;
