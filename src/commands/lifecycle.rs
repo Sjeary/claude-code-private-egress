@@ -1104,6 +1104,7 @@ fn restart_instance(
         cfg.guest_env.insert(key.clone(), value.clone());
     }
 
+    crate::private_egress::ensure_gateway(cfg)?;
     be.start_existing(cfg, inst)?;
 
     signal::check_shutdown()?;
@@ -1112,6 +1113,10 @@ fn restart_instance(
     target
         .wait_until_ready(std::time::Duration::from_secs(30))
         .context("Guest booted but SSH is not accepting connections")?;
+
+    let management_session =
+        prepare_session_from_target(cfg, Some(inst), target.clone(), repo.as_ref())?;
+    crate::private_egress::configure_agent_guest(&management_session, cfg)?;
 
     signal::check_shutdown()?;
 
@@ -1201,6 +1206,7 @@ fn start_instance(
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
+    crate::private_egress::ensure_gateway(cfg)?;
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
 
     signal::check_shutdown()?;
@@ -1209,6 +1215,10 @@ fn start_instance(
     target
         .wait_until_ready(std::time::Duration::from_secs(30))
         .context("Guest booted but SSH is not accepting connections")?;
+
+    let management_session =
+        prepare_session_from_target(cfg, Some(inst), target.clone(), repo.as_ref())?;
+    crate::private_egress::configure_agent_guest(&management_session, cfg)?;
 
     signal::check_shutdown()?;
 
@@ -1430,14 +1440,6 @@ pub(crate) fn cmd_shell(
     }
 }
 
-/// Build a remote command by prepending `binary` to `args`.
-pub(crate) fn prepend_binary(binary: &str, args: Vec<String>) -> Vec<String> {
-    let mut command = Vec::with_capacity(1 + args.len());
-    command.push(binary.to_string());
-    command.extend(args);
-    command
-}
-
 /// Codex's flag for running fully unrestricted (no sandbox, no approvals).
 const CODEX_BYPASS_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
 
@@ -1547,7 +1549,7 @@ fn bootstrap_and_post_start(
     }) {
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
-    if opts.no_agents && post_start.is_none() {
+    if opts.no_agents && post_start.is_none() && cfg.guest_timezone.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         return Ok(());
     }
@@ -1556,6 +1558,7 @@ fn bootstrap_and_post_start(
     // raw ANTHROPIC_API_KEY would be forwarded via SendEnv during bootstrap,
     // defeating proxy-mode non-exposure (issue #411).
     let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
+    backend::configure_guest_timezone(&session, cfg)?;
     if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
@@ -1662,9 +1665,35 @@ pub(crate) fn prepare_session_from_target(
                 // `prepare_env_forwarding`.
                 if (proxy_anthropic && name.as_str() == "ANTHROPIC_API_KEY")
                     || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
+                    || (cfg.private_egress.is_some()
+                        && matches!(
+                            name.as_str(),
+                            "HTTP_PROXY"
+                                | "HTTPS_PROXY"
+                                | "ALL_PROXY"
+                                | "NO_PROXY"
+                                | "http_proxy"
+                                | "https_proxy"
+                                | "all_proxy"
+                                | "no_proxy"
+                        ))
                 {
                     let reason = if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
                         "codex.auth = \"chatgpt\""
+                    } else if cfg.private_egress.is_some()
+                        && matches!(
+                            name.as_str(),
+                            "HTTP_PROXY"
+                                | "HTTPS_PROXY"
+                                | "ALL_PROXY"
+                                | "NO_PROXY"
+                                | "http_proxy"
+                                | "https_proxy"
+                                | "all_proxy"
+                                | "no_proxy"
+                        )
+                    {
+                        "private-egress mode"
                     } else {
                         "proxy mode"
                     };
@@ -1691,7 +1720,9 @@ pub(crate) fn prepare_session_from_target(
             }
         }
     }
-    Ok(backend::SshSession { target, env })
+    let mut session = backend::SshSession { target, env };
+    crate::private_egress::mark_session(&mut session, cfg);
+    Ok(session)
 }
 
 pub(crate) fn cmd_stop(
@@ -2103,18 +2134,6 @@ mod tests {
             },
         };
         state.save(inst).expect("save workspace state");
-    }
-
-    #[test]
-    fn prepend_binary_prefixes_command() {
-        let cmd = super::prepend_binary("/usr/bin/claude", vec!["--model".into(), "opus".into()]);
-        assert_eq!(cmd, vec!["/usr/bin/claude", "--model", "opus"]);
-    }
-
-    #[test]
-    fn prepend_binary_with_no_args() {
-        let cmd = super::prepend_binary("/usr/bin/codex", Vec::new());
-        assert_eq!(cmd, vec!["/usr/bin/codex"]);
     }
 
     #[test]

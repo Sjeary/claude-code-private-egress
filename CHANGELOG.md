@@ -18,6 +18,20 @@
   mode. A restart reuses the old guest disk, so an existing VM also needs
   `coop restore <vm> --image <image>` (or a destroy and recreate) to pick up
   the new guest packages.
+- **Guest timezone** — The new `guest_timezone` field applies an IANA timezone
+  to the guest on every boot while keeping its clock synchronized.
+
+- **Fail-closed private egress on macOS** — The new `[private_egress]` mode
+  routes agent VMs through a separate Mihomo TUN gateway VM in global mode,
+  keeps subscription material and proxy settings outside the agent VM, verifies
+  the expected exit address, routes agent UDP/TCP DNS through DoH on that exit,
+  restores selectors after Mihomo restarts, and runs agents without sudo or
+  Docker access.
+  Agent commands now enter a root-built normalized mount/UTS view that removes
+  common Apple VZ, Lima, Rosetta, cloud-init, device, process, and environment
+  fingerprints without changing the network namespace or weakening the
+  fail-closed route. This is practical fingerprint reduction, not a guarantee
+  against timing side channels or direct kernel-level inference.
 
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side

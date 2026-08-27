@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use super::lifecycle::{allocate_and_start, find_workspace_instance};
 use super::merge_runtime_guest_env;
 use super::{
-    DevcontainerInput, DevcontainerOpts, StartOpts, cmd_start, open_ssh_session, prepend_binary,
+    DevcontainerInput, DevcontainerOpts, StartOpts, cmd_start, open_ssh_session,
     resolve_devcontainer,
 };
 use crate::backend::VmBackend as _;
@@ -106,8 +106,12 @@ pub(crate) fn cmd_quickstart(
     };
 
     let sess = open_ssh_session(be, cfg, Some(&inst.name))?;
+    crate::private_egress::ensure_gateway(cfg)?;
+    crate::private_egress::configure_agent_guest(&sess, cfg)?;
     let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-    ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), Vec::new()))
+    let command =
+        crate::private_egress::restricted_agent_command(&sess, claude_bin.as_ref(), Vec::new());
+    ssh::run_interactive(&sess, &command)
 }
 
 /// Drives a fresh start with `--workspace <ws>` defaults (no mounts, no

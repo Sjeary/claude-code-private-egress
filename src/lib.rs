@@ -25,6 +25,7 @@ mod naming;
 mod pat_prompt;
 mod paths;
 mod port_forward;
+mod private_egress;
 mod proxy;
 mod proxy_state;
 mod remote_command;
@@ -74,8 +75,8 @@ use commands::{
     cmd_destroy, cmd_devcontainer, cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images,
     cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize,
     cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
-    codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
-    resolve_devcontainer, resolve_devcontainer_collect, resolve_running,
+    codex_launch_args, open_ssh_session, preflight_start_target, resolve_devcontainer,
+    resolve_devcontainer_collect, resolve_running,
 };
 
 #[derive(Parser)]
@@ -1223,6 +1224,8 @@ pub fn run() -> Result<()> {
             mut args,
         } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            private_egress::ensure_gateway(&cfg)?;
+            private_egress::configure_agent_guest(&sess, &cfg)?;
             // Guest user settings set `defaultMode: bypassPermissions`. Opting in
             // to prompts means overriding that default explicitly.
             if ask {
@@ -1230,16 +1233,24 @@ pub fn run() -> Result<()> {
                 args.insert(0, "--permission-mode".to_string());
             }
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-            ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
+            let command =
+                private_egress::restricted_agent_command(&sess, claude_bin.as_ref(), args);
+            ssh::run_interactive(&sess, &command)
         }
         Commands::ClaudeAgents { name, mut args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            private_egress::ensure_gateway(&cfg)?;
+            private_egress::configure_agent_guest(&sess, &cfg)?;
             args.insert(0, "agents".to_string());
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-            ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
+            let command =
+                private_egress::restricted_agent_command(&sess, claude_bin.as_ref(), args);
+            ssh::run_interactive(&sess, &command)
         }
         Commands::Codex { name, ask, args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            private_egress::ensure_gateway(&cfg)?;
+            private_egress::configure_agent_guest(&sess, &cfg)?;
             let args = codex_launch_args(ask, args);
             let codex_bin = if cfg.codex.auth.uses_chatgpt_account() {
                 let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1254,7 +1265,8 @@ pub fn run() -> Result<()> {
             } else {
                 guest::codex_bin()
             };
-            ssh::run_interactive(&sess, &prepend_binary(codex_bin.as_ref(), args))
+            let command = private_egress::restricted_agent_command(&sess, codex_bin.as_ref(), args);
+            ssh::run_interactive(&sess, &command)
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;

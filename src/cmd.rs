@@ -46,6 +46,7 @@ pub struct Cmd {
     args: Vec<Arg>,
     sudo: bool,
     stdin: Option<Vec<u8>>,
+    env_remove: Vec<OsString>,
 }
 
 impl Cmd {
@@ -55,6 +56,7 @@ impl Cmd {
             args: Vec::new(),
             sudo: false,
             stdin: None,
+            env_remove: Vec::new(),
         }
     }
 
@@ -102,6 +104,12 @@ impl Cmd {
         self
     }
 
+    /// Remove an inherited environment variable from the child process.
+    pub fn env_remove(mut self, name: impl AsRef<OsStr>) -> Self {
+        self.env_remove.push(name.as_ref().to_owned());
+        self
+    }
+
     /// Build the underlying `Command` for complex use cases that
     /// need custom stdio, spawn, or other `Command` methods.
     pub fn build(&self) -> Command {
@@ -110,10 +118,16 @@ impl Cmd {
             let mut cmd = Command::new("sudo");
             cmd.arg(&self.program);
             cmd.args(raw_args);
+            for name in &self.env_remove {
+                cmd.env_remove(name);
+            }
             cmd
         } else {
             let mut cmd = Command::new(&self.program);
             cmd.args(raw_args);
+            for name in &self.env_remove {
+                cmd.env_remove(name);
+            }
             cmd
         }
     }

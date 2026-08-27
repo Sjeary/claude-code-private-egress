@@ -1421,9 +1421,35 @@ pub fn prepare_env_forwarding(
     if suppress_openai_key {
         suppressed.push("OPENAI_API_KEY");
     }
+    if cfg.private_egress.is_some() {
+        suppressed.extend([
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ]);
+    }
     let suppression_reason = |name: &str| {
         if name == "OPENAI_API_KEY" {
             openai_suppression_reason
+        } else if cfg.private_egress.is_some()
+            && matches!(
+                name,
+                "HTTP_PROXY"
+                    | "HTTPS_PROXY"
+                    | "ALL_PROXY"
+                    | "NO_PROXY"
+                    | "http_proxy"
+                    | "https_proxy"
+                    | "all_proxy"
+                    | "no_proxy"
+            )
+        {
+            "private-egress mode"
         } else {
             "proxy mode"
         }
@@ -1459,7 +1485,37 @@ pub fn prepare_env_forwarding(
         env.set(name.as_str(), value.as_str());
     }
 
+    // Apply the managed timezone last so a stale guest_env/env_forward entry
+    // cannot contradict the system timezone configured during boot.
+    if let Some(timezone) = &cfg.guest_timezone {
+        if env.contains("TZ") {
+            tracing::warn!("guest_timezone overrides the guest environment variable 'TZ'");
+        }
+        env.set("TZ", timezone.as_str());
+    }
     Ok(env)
+}
+
+/// Apply the configured system timezone in the guest. The VM clock remains
+/// synchronized with real time; only local-time presentation changes. `TZ` is
+/// also forwarded on every session by [`prepare_env_forwarding`].
+pub fn configure_guest_timezone(session: &SshSession, cfg: &CoopConfig) -> Result<()> {
+    let Some(timezone) = &cfg.guest_timezone else {
+        return Ok(());
+    };
+    let zoneinfo = format!("/usr/share/zoneinfo/{timezone}");
+    session
+        .exec(RemoteCommand::new().literal("test -f ").arg(&zoneinfo))
+        .with_context(|| format!("Guest does not provide timezone '{timezone}'"))?;
+    session
+        .exec(
+            RemoteCommand::new()
+                .literal("sudo timedatectl set-timezone ")
+                .arg(timezone.as_str()),
+        )
+        .with_context(|| format!("Failed to configure guest timezone '{timezone}'"))?;
+    tracing::info!("Configured guest timezone as {timezone}");
+    Ok(())
 }
 
 /// Run a user-supplied post-start hook in the guest.

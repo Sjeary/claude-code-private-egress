@@ -724,6 +724,18 @@ pub struct CoopConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
 
+    /// System timezone applied in the guest on every boot. The guest clock
+    /// remains synchronized; this only changes local-time presentation.
+    #[serde(default)]
+    pub guest_timezone: Option<GuestTimeZone>,
+
+    /// macOS-only transparent egress gateway. When configured, every packet
+    /// from an agent VM is policy-routed through a separate Lima VM running
+    /// Mihomo TUN. The subscription and expected exit address must be
+    /// resolved from host-side secret commands and never enter the agent VM.
+    #[serde(default)]
+    pub private_egress: Option<PrivateEgressConfig>,
+
     /// Literal env vars to set in the guest, independent of the host
     /// process environment. Merged with `env_forward` results during
     /// SSH setup; entries here override forwarded values (with a
@@ -1575,6 +1587,108 @@ pub struct ProxyConfig {
     pub openai: Option<ProxyUpstream>,
 }
 
+/// A secret that must come from a host-side `cmd:` resolver.
+///
+/// Plaintext values are rejected during deserialization so subscription URLs
+/// and verification values cannot accidentally land in `config.toml`.
+#[derive(Clone, Serialize)]
+#[serde(transparent)]
+pub struct SecretCommand(Secret<String>);
+
+impl SecretCommand {
+    pub fn resolve(&self) -> Result<String> {
+        resolve_cmd_value(self.0.expose())
+    }
+}
+
+impl fmt::Debug for SecretCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretCommand(<redacted>)")
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let command = value
+            .strip_prefix("cmd:")
+            .map(str::trim)
+            .unwrap_or_default();
+        if command.is_empty() {
+            return Err(serde::de::Error::custom(
+                "private egress secrets must use a non-empty 'cmd:' resolver",
+            ));
+        }
+        Ok(Self(Secret::new(value)))
+    }
+}
+
+/// Transparent, fail-closed egress gateway settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivateEgressConfig {
+    /// Command that prints the Mihomo subscription URL on stdout.
+    pub subscription: SecretCommand,
+
+    /// Command that prints the single expected public IPv4 exit address.
+    /// Startup fails closed if the gateway observes any other address.
+    pub expected_egress_ip: SecretCommand,
+
+    pub entry_group: String,
+    pub entry_choice: String,
+    pub exit_group: String,
+    pub exit_choice_prefix: String,
+    pub exit_choice_suffix: String,
+}
+
+/// Validated IANA-style timezone name used inside the guest.
+///
+/// This accepts common names such as `America/Los_Angeles`, `Etc/GMT+8`, and
+/// `UTC`, while rejecting absolute paths, traversal components, whitespace,
+/// and shell metacharacters before the value reaches a guest command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GuestTimeZone(String);
+
+impl GuestTimeZone {
+    pub fn new(value: &str) -> Result<Self> {
+        if value.is_empty() || value.len() > 255 {
+            bail!("guest_timezone must be between 1 and 255 characters");
+        }
+        if value.starts_with('/') || value.ends_with('/') {
+            bail!("guest_timezone must be a relative IANA timezone name");
+        }
+        if value
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        {
+            bail!("guest_timezone contains an invalid path component");
+        }
+        if let Some(c) = value
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+')))
+        {
+            bail!("guest_timezone contains invalid character '{c}'");
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for GuestTimeZone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for GuestTimeZone {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A single proxied upstream: the real credential and how to inject it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyUpstream {
@@ -2364,6 +2478,8 @@ impl Default for CoopConfig {
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
             proxy: ProxyConfig::default(),
+            guest_timezone: None,
+            private_egress: None,
             guest_env: BTreeMap::new(),
             profiles: HashMap::new(),
             post_start: None,
@@ -3596,6 +3712,64 @@ model = ""
         let cfg: CoopConfig = toml::from_str("").unwrap();
         assert!(cfg.proxy.anthropic.is_none());
         assert!(cfg.proxy.openai.is_none());
+        assert!(cfg.guest_timezone.is_none());
+        assert!(cfg.private_egress.is_none());
+    }
+
+    #[test]
+    fn guest_timezone_validates_names() {
+        for valid in ["America/Los_Angeles", "UTC", "Etc/GMT+8"] {
+            assert_eq!(GuestTimeZone::new(valid).unwrap().as_str(), valid);
+        }
+        for invalid in [
+            "",
+            "/America/Los_Angeles",
+            "America/../UTC",
+            "America//Los_Angeles",
+            "America/Los Angeles",
+            "UTC; reboot",
+        ] {
+            assert!(
+                GuestTimeZone::new(invalid).is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_egress_rejects_plaintext_secrets() {
+        let plain = r#"
+[private_egress]
+subscription = "https://provider.invalid/secret"
+expected_egress_ip = "203.0.113.10"
+"#;
+        assert!(toml::from_str::<CoopConfig>(plain).is_err());
+
+        let command_backed = r#"
+[private_egress]
+subscription = "cmd:secret-tool lookup service subscription"
+expected_egress_ip = "cmd:secret-tool lookup service exit-ip"
+entry_group = "entry-group"
+entry_choice = "us-entry"
+exit_group = "exit-group"
+exit_choice_prefix = "los-angeles-exit"
+exit_choice_suffix = ""
+"#;
+        assert!(toml::from_str::<CoopConfig>(command_backed).is_ok());
+    }
+
+    #[test]
+    fn private_egress_requires_provider_selector_names() {
+        let missing_selectors = r#"
+[private_egress]
+subscription = "cmd:secret-tool lookup service subscription"
+expected_egress_ip = "cmd:secret-tool lookup service exit-ip"
+"#;
+        let err = toml::from_str::<CoopConfig>(missing_selectors).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field `entry_group`"),
+            "{err}"
+        );
     }
 
     #[test]

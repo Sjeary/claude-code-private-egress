@@ -16,6 +16,8 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
+| `guest_timezone` | string | unset | IANA timezone applied to the guest system and `TZ` on every boot, for example `"America/Los_Angeles"`. The clock remains synchronized with real time. |
+| `private_egress` | table | unset | macOS/Lima transparent full-tunnel gateway. See [Private egress](#private-egress). |
 | `post_start` | string | unset | Shell command run in the guest after every successful boot, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
 
 ## GitHub auth
@@ -138,6 +140,99 @@ Firecracker TAP networking. These fields apply to Linux only. The Lima backend o
 | `host_ip` | string (IPv4) | `172.16.0.1` | Host-side IP address on TAP interfaces. |
 | `subnet_mask` | string (CIDR) | `/24` | Subnet mask in CIDR notation. Must be `/0` through `/32`. |
 | `host_iface` | string | `auto` | Host network interface for NAT (e.g., `eth0`, `ens5`). `auto` detects it at runtime. |
+
+## Private egress
+
+`[private_egress]` is a macOS/Lima-only high-isolation mode. Coop creates a
+separate `coop-egress` Lima VM running Mihomo TUN and connects agent VMs to it
+through Lima `user-v2`. No `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, proxy port,
+subscription URL, or Mihomo controller credential is placed in the agent VM.
+
+```toml
+guest_timezone = "America/Los_Angeles"
+
+[private_egress]
+subscription = "cmd:security find-generic-password -s coop-mihomo-subscription -w"
+expected_egress_ip = "cmd:security find-generic-password -s coop-mihomo-egress-ip -w"
+entry_group = "your-entry-group"
+entry_choice = "your-us-entry-choice"
+exit_group = "your-exit-group"
+exit_choice_prefix = "your-los-angeles-exit"
+exit_choice_suffix = ""
+```
+
+Both secret fields require a non-empty `cmd:` resolver; plaintext values are
+rejected while loading the config. Store the subscription URL and expected
+IPv4 exit in Keychain, 1Password, `pass`, or another host-side secret manager.
+Never place either value in the repository or `.env.example`.
+
+The five selector fields are required because Mihomo subscription providers do
+not use a common naming scheme. `entry_group` and `exit_group` name selector
+groups, `entry_choice` is an exact member of the entry group, and the exit is
+the first member whose name starts with `exit_choice_prefix` and ends with
+`exit_choice_suffix`. Use the full exit name as the prefix and an empty suffix
+when you want an exact, location-pinned choice.
+
+On macOS, `scripts/setup-private-egress-keychain.sh` prompts with terminal echo
+disabled and creates the two Keychain entries used by the example. The script
+never writes either value to a repository file or prints it back to the screen.
+If `~/.coop/config.toml` does not exist, it also creates an owner-only config
+containing the Los Angeles timezone and Keychain-backed references above.
+
+The gateway rewrites the subscription into Mihomo `mode: global`, enables TUN
+`strict-route`, DNS interception, IPv4 forwarding, and disables IPv6. Agent DNS
+queries are sent to Cloudflare DoH through the configured exit group, for both
+UDP and TCP clients. Coop pins the entry, exit, and built-in `GLOBAL` selectors,
+persists those choices in the gateway's root-only state, restores them after
+every Mihomo service start, and verifies the observed public IPv4 against
+`expected_egress_ip`. Download, selector, service, or HTTP exit verification
+failure aborts startup.
+
+The proxy server hostname has to be resolved before the encrypted chain exists.
+Mihomo therefore uses Lima's local resolver only for this cold-start bootstrap;
+it is not exposed to the agent and is not used for agent DNS queries. Avoiding
+even that gateway control-plane exception requires subscription endpoints
+pinned to stable IP addresses. The agent VM itself has no direct fallback path.
+
+The agent VM uses policy routing table 100 with the gateway as its only default
+next hop. DHCP routes in the normal table cannot become a fallback. A root-owned
+timer reasserts the route and firewall, while a second firewall in the gateway
+drops any forwarded packet Mihomo did not intercept. If Mihomo or the gateway
+stops, the agent loses network instead of falling back to the Mac connection.
+
+Claude and Codex run as `developer`, which has no sudo permission and is not in
+the Docker group. Their launcher also creates a private mount/UTS view with a
+neutral hostname and hardware inventory, a minimal `/dev`, filtered process
+metadata, and no ordinary Lima, Rosetta, cloud-init, proxy, SSH-session, or Coop
+name markers. Installed agent tools are remapped under `/opt/tooling`; the
+original management home is not mounted into the view. It does not create PID,
+user, or network namespaces, so common VM and container detection does not gain
+a new container signal and all traffic still uses the VM's fail-closed policy
+route. The ordinary `coop shell` remains a management shell; do not run an agent
+manually from that shell if the route, firewall, or normalized-view controls are
+part of your threat model.
+
+The normalized view reduces passive and ordinary shell-level fingerprinting; it
+is not a claim that virtualization is cryptographically undetectable. In
+particular, raw mount topology still identifies `/dev/vda*`, and netlink reports
+the Ethernet parent bus as `virtio`. Timing side channels provide additional
+evidence. An actively inspecting program, including Claude when asked to inspect
+its environment, can therefore still infer that this is a VM even when
+`systemd-detect-virt` prints `none`. Eliminating those signals requires patched
+virtual hardware or denying kernel interfaces broadly enough to break normal
+development tools. On Apple Silicon this mode favors the native VZ backend's
+performance and compatibility over that tradeoff.
+
+This prevents access to macOS Core Location and host device data because the
+agent runs in Linux without those APIs or host-home mounts. Internet services
+can still infer a coarse location from the configured exit IP; that inferred
+location should be near the exit, not the Mac. `guest_timezone` changes local
+time presentation but deliberately does not freeze the clock, since frozen or
+incorrect time breaks TLS, OAuth, package managers, and Claude authentication.
+
+Existing agent VMs created without `private_egress` are not silently converted.
+Create a new VM after enabling the setting so its Lima template is attached only
+to `user-v2`. The shared gateway remains running across agent VM stops.
 
 ## Guest user
 
@@ -424,6 +519,7 @@ An empty file gives you all defaults (2 vCPUs, 4 GiB RAM, 8 GiB disk).
 ```toml
 data_dir = "~/.coop"
 ssh_port = 22
+guest_timezone = "America/Los_Angeles"
 firecracker_bin = "~/.coop/firecracker"
 github = "auto"  # must be set explicitly; default is off
 
