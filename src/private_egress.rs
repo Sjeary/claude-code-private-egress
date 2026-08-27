@@ -53,6 +53,23 @@ mod platform {
         command
     }
 
+    fn host_curl_cmd() -> Cmd {
+        let mut command = Cmd::new("curl");
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            command = command.env_remove(name);
+        }
+        command
+    }
+
     pub fn ensure_gateway(cfg: &CoopConfig) -> Result<()> {
         let Some(egress) = &cfg.private_egress else {
             return Ok(());
@@ -65,9 +82,11 @@ mod platform {
         ensure_gateway_vm(cfg)?;
         ensure_mihomo_binary()?;
 
+        let bootstrap_dns = gateway_bootstrap_dns()?;
         let subscription = fetch_subscription(egress)?;
-        let (config, controller_secret, selections) = harden_config(subscription, egress)?;
-        install_gateway_config(&config)?;
+        let (config, controller_secret, selections) =
+            harden_config(subscription, egress, bootstrap_dns)?;
+        install_gateway_config(&config, bootstrap_dns)?;
         select_routes(&controller_secret, &selections)?;
         verify_gateway_connectivity()?;
         Ok(())
@@ -177,7 +196,7 @@ provision:
             return Ok(());
         }
 
-        let release = Cmd::new("curl")
+        let release = host_curl_cmd()
             .args([
                 "--fail",
                 "--silent",
@@ -219,7 +238,7 @@ provision:
 
         let dir = tempfile::tempdir().context("Failed to create Mihomo download directory")?;
         let archive = dir.path().join("mihomo.gz");
-        Cmd::new("curl")
+        host_curl_cmd()
             .args(["--fail", "--silent", "--show-error", "--location"])
             .arg(url)
             .arg("--output")
@@ -288,7 +307,7 @@ provision:
         let curl_config = format!(
             "url = \"{raw_url}\"\nfail\nsilent\nshow-error\nlocation\nmax-time = 30\nmax-filesize = {MAX_SUBSCRIPTION_BYTES}\n"
         );
-        let yaml = Cmd::new("curl")
+        let yaml = host_curl_cmd()
             .args(["--config", "-"])
             .stdin_input(curl_config)
             .capture()
@@ -300,14 +319,35 @@ provision:
         serde_yaml_ng::from_str(&yaml).context("Subscription is not valid YAML")
     }
 
-    fn harden_config(mut root: Value, config: &PrivateEgressConfig) -> Result<HardenedConfig> {
+    fn harden_config(
+        mut root: Value,
+        config: &PrivateEgressConfig,
+        bootstrap_dns: Ipv4Addr,
+    ) -> Result<HardenedConfig> {
         let map = root
             .as_mapping_mut()
             .context("Subscription YAML root must be a mapping")?;
+        for key in [
+            "port",
+            "socks-port",
+            "redir-port",
+            "tproxy-port",
+            "mixed-port",
+            "listeners",
+            "authentication",
+            "skip-auth-prefixes",
+            "lan-allowed-ips",
+            "lan-disallowed-ips",
+            "external-ui",
+            "external-ui-url",
+            "external-ui-name",
+        ] {
+            map.remove(Value::String(key.into()));
+        }
         insert(map, "mode", Value::String("global".into()));
         insert(map, "ipv6", Value::Bool(false));
-        insert(map, "allow-lan", Value::Bool(true));
-        insert(map, "bind-address", Value::String("*".into()));
+        insert(map, "allow-lan", Value::Bool(false));
+        insert(map, "bind-address", Value::String("127.0.0.1".into()));
         insert(map, "log-level", Value::String("warning".into()));
         insert(
             map,
@@ -318,7 +358,7 @@ provision:
         let secret = random_secret()?;
         insert(map, "secret", Value::String(secret.clone()));
         insert(map, "tun", hardened_tun());
-        harden_dns(map, &config.exit_group);
+        harden_dns(map, &config.exit_group, bootstrap_dns);
         insert(map, "profile", profile_config());
         map.remove(Value::String("rule-providers".into()));
         insert(
@@ -373,7 +413,7 @@ provision:
         Value::Mapping(tun)
     }
 
-    fn harden_dns(root: &mut Mapping, exit_group: &str) {
+    fn harden_dns(root: &mut Mapping, exit_group: &str, bootstrap_dns: Ipv4Addr) {
         let key = Value::String("dns".into());
         let dns = root
             .entry(key)
@@ -401,7 +441,7 @@ provision:
             insert(
                 map,
                 "default-nameserver",
-                Value::Sequence(vec![Value::String("192.168.104.2".into())]),
+                Value::Sequence(vec![Value::String(bootstrap_dns.to_string())]),
             );
             insert(
                 map,
@@ -413,7 +453,7 @@ provision:
             insert(
                 map,
                 "proxy-server-nameserver",
-                Value::Sequence(vec![Value::String("192.168.104.2#DIRECT".into())]),
+                Value::Sequence(vec![Value::String(format!("{bootstrap_dns}#DIRECT"))]),
             );
         }
     }
@@ -466,7 +506,25 @@ provision:
         Ok(hex::encode(bytes))
     }
 
-    fn install_gateway_config(config: &[u8]) -> Result<()> {
+    fn gateway_bootstrap_dns() -> Result<Ipv4Addr> {
+        let output = lima_cmd()
+            .args([
+                "shell",
+                GATEWAY_NAME,
+                "--",
+                "sh",
+                "-c",
+                "ip -4 route show default | awk 'NR == 1 { print $3; exit }'",
+            ])
+            .capture()
+            .context("Failed to discover the gateway VM bootstrap resolver")?;
+        output
+            .trim()
+            .parse()
+            .context("Gateway VM default route did not provide an IPv4 bootstrap resolver")
+    }
+
+    fn install_gateway_config(config: &[u8], bootstrap_dns: Ipv4Addr) -> Result<()> {
         lima_cmd()
             .args([
                 "shell",
@@ -481,7 +539,8 @@ provision:
             .run()
             .context("Failed to transfer private egress config")?;
         lima_cmd()
-            .args(["shell", GATEWAY_NAME, "--", "sudo", "sh", "-s"])
+            .args(["shell", GATEWAY_NAME, "--", "sudo", "sh", "-s", "--"])
+            .arg(bootstrap_dns.to_string())
             .stdin_input(GATEWAY_SETUP_SCRIPT.as_bytes().to_vec())
             .run()
             .context("Failed to configure the private egress service")
@@ -550,6 +609,7 @@ provision:
     }
 
     const GATEWAY_SETUP_SCRIPT: &str = r#"set -eu
+BOOTSTRAP_DNS=$1
 install -d -o root -g root -m 0755 /usr/local/libexec
 cat >/usr/local/libexec/mihomo-restore-selectors <<'PYTHON'
 #!/usr/bin/python3
@@ -588,7 +648,7 @@ Wants=network-online.target
 Type=simple
 User=root
 ExecStartPre=/usr/local/bin/mihomo -t -d /etc/mihomo
-ExecStartPre=/bin/sh -c '/usr/sbin/nft delete table inet coop_gateway_killswitch 2>/dev/null || true; /usr/sbin/nft -f /etc/mihomo/killswitch.nft'
+ExecStartPre=/usr/sbin/nft -f /etc/mihomo/killswitch.nft
 ExecStart=/usr/local/bin/mihomo -d /etc/mihomo
 ExecStartPost=/usr/local/libexec/mihomo-restore-selectors
 Restart=always
@@ -606,6 +666,7 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 WantedBy=multi-user.target
 UNIT
 cat >/etc/mihomo/killswitch.nft <<'NFT'
+destroy table inet coop_gateway_killswitch
 table inet coop_gateway_killswitch {
   chain forward {
     type filter hook forward priority 100; policy drop;
@@ -623,8 +684,8 @@ SYSCTL
 sysctl --system >/dev/null
 systemctl disable --now systemd-resolved.service >/dev/null 2>&1 || true
 rm -f /etc/resolv.conf
-cat >/etc/resolv.conf <<'RESOLV'
-nameserver 192.168.104.2
+cat >/etc/resolv.conf <<RESOLV
+nameserver $BOOTSTRAP_DNS
 options timeout:2 attempts:3
 RESOLV
 grep -qE '^[^#]*[[:space:]]lima-coop-egress([[:space:]]|$)' /etc/hosts || \
@@ -669,6 +730,7 @@ for group, choice in payload["selections"]:
     #[cfg(test)]
     #[expect(clippy::expect_used, reason = "test failures should identify fixtures")]
     mod tests {
+        use super::super::{AGENT_LOCKDOWN_SCRIPT, BOOT_GUARD_INSTALL_SCRIPT};
         use super::*;
 
         fn egress_config() -> PrivateEgressConfig {
@@ -691,9 +753,14 @@ exit_choice_suffix = ""
         #[test]
         fn subscription_is_forced_to_global_strict_tun() {
             let subscription: Value = serde_yaml_ng::from_str(
-                r"
+                r#"
 mode: rule
 ipv6: true
+allow-lan: true
+bind-address: "*"
+mixed-port: 7890
+socks-port: 7891
+listeners: [{name: leaked-listener, type: socks, port: 7892}]
 dns: false
 proxies: []
 proxy-groups:
@@ -704,11 +771,12 @@ proxy-groups:
     type: select
     proxies: [DIRECT, los-angeles-exit]
 rules: [MATCH,DIRECT]
-",
+"#,
             )
             .expect("valid subscription fixture");
             let (yaml, _secret, selections) =
-                harden_config(subscription, &egress_config()).expect("harden config");
+                harden_config(subscription, &egress_config(), Ipv4Addr::new(192, 0, 2, 53))
+                    .expect("harden config");
             let hardened: Value = serde_yaml_ng::from_slice(&yaml).expect("parse hardened config");
             let root = hardened.as_mapping().expect("mapping root");
 
@@ -721,6 +789,18 @@ rules: [MATCH,DIRECT]
                 root.get(Value::String("ipv6".into())),
                 Some(&Value::Bool(false))
             );
+            assert_eq!(
+                root.get(Value::String("allow-lan".into())),
+                Some(&Value::Bool(false))
+            );
+            assert_eq!(
+                root.get(Value::String("bind-address".into()))
+                    .and_then(Value::as_str),
+                Some("127.0.0.1")
+            );
+            for key in ["mixed-port", "socks-port", "listeners"] {
+                assert!(!root.contains_key(Value::String(key.into())));
+            }
             let tun = root
                 .get(Value::String("tun".into()))
                 .and_then(Value::as_mapping)
@@ -750,6 +830,16 @@ rules: [MATCH,DIRECT]
                     "https://cloudflare-dns.com/dns-query#exit-group".into()
                 )]))
             );
+            assert_eq!(
+                dns.get(Value::String("default-nameserver".into())),
+                Some(&Value::Sequence(vec![Value::String("192.0.2.53".into())]))
+            );
+            assert_eq!(
+                dns.get(Value::String("proxy-server-nameserver".into())),
+                Some(&Value::Sequence(vec![Value::String(
+                    "192.0.2.53#DIRECT".into()
+                )]))
+            );
             let profile = root
                 .get(Value::String("profile".into()))
                 .and_then(Value::as_mapping)
@@ -758,6 +848,20 @@ rules: [MATCH,DIRECT]
                 profile.get(Value::String("store-selected".into())),
                 Some(&Value::Bool(true))
             );
+        }
+
+        #[test]
+        fn agent_scripts_fail_closed_and_start_from_a_clean_environment() {
+            assert!(BOOT_GUARD_INSTALL_SCRIPT.contains("Before=network-pre.target"));
+            assert!(BOOT_GUARD_INSTALL_SCRIPT.contains("iptables -w -P OUTPUT DROP"));
+            assert!(BOOT_GUARD_INSTALL_SCRIPT.contains("--sport 68 --dport 67"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("env -i"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("iptables -w -A \"$NEXT\" -j ACCEPT"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("ip -4 route replace table 100 default"));
+            assert!(!AGENT_LOCKDOWN_SCRIPT.contains("ip rule del priority 100"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("iptables -w -D OUTPUT -j PRIVATE_EGRESS_BOOT"));
+            assert!(GATEWAY_SETUP_SCRIPT.contains("destroy table inet coop_gateway_killswitch"));
+            assert!(!GATEWAY_SETUP_SCRIPT.contains("nft delete table"));
         }
     }
 }
@@ -787,6 +891,13 @@ pub fn configure_agent_guest(session: &SshSession, cfg: &CoopConfig) -> Result<(
     {
         let gateway = platform::gateway_ipv4()?.to_string();
         let management_user = session.target.user.as_ref();
+        session
+            .target
+            .exec_with_stdin(
+                RemoteCommand::new().literal("sudo sh -s"),
+                BOOT_GUARD_INSTALL_SCRIPT.as_bytes().to_vec(),
+            )
+            .context("Failed to install the early-boot egress guard in agent VM")?;
         let command = RemoteCommand::new()
             .literal("peer=${SSH_CONNECTION%% *}; sudo sh -s -- ")
             .arg(&gateway)
@@ -865,7 +976,7 @@ pub fn restricted_agent_command(
         let manager = session.target.user.as_ref();
         let mut command = vec![
             "sudo".to_string(),
-            "-E".to_string(),
+            "--".to_string(),
             "/usr/local/sbin/dev-session".to_string(),
             manager.to_string(),
             binary.to_string(),
@@ -878,6 +989,51 @@ pub fn restricted_agent_command(
         command
     }
 }
+
+pub(crate) fn boot_guard_install_script() -> &'static [u8] {
+    BOOT_GUARD_INSTALL_SCRIPT.as_bytes()
+}
+
+/// Installed into the private-egress base image before an agent VM is ever
+/// created. On every boot it denies new outbound traffic before networking is
+/// configured; DHCP and replies to inbound management SSH remain possible.
+const BOOT_GUARD_INSTALL_SCRIPT: &str = r"set -eu
+install -d -o root -g root -m 0755 /usr/local/sbin
+cat >/usr/local/sbin/private-egress-boot-guard <<'SCRIPT'
+#!/bin/sh
+set -eu
+sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+sysctl -qw net.ipv6.conf.default.disable_ipv6=1
+iptables -w -N PRIVATE_EGRESS_BOOT 2>/dev/null || true
+iptables -w -F PRIVATE_EGRESS_BOOT
+iptables -w -A PRIVATE_EGRESS_BOOT -o lo -j ACCEPT
+iptables -w -A PRIVATE_EGRESS_BOOT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -w -A PRIVATE_EGRESS_BOOT -p udp --sport 68 --dport 67 -j ACCEPT
+while iptables -w -D OUTPUT -j PRIVATE_EGRESS_BOOT 2>/dev/null; do :; done
+iptables -w -I OUTPUT 1 -j PRIVATE_EGRESS_BOOT
+iptables -w -P OUTPUT DROP
+ip6tables -w -P OUTPUT DROP
+SCRIPT
+chmod 0755 /usr/local/sbin/private-egress-boot-guard
+cat >/etc/systemd/system/private-egress-boot-guard.service <<'UNIT'
+[Unit]
+Description=Early boot fail-closed egress guard
+DefaultDependencies=no
+After=systemd-modules-load.service local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/private-egress-boot-guard
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+systemctl daemon-reload
+systemctl enable private-egress-boot-guard.service >/dev/null
+";
 
 #[cfg(target_os = "macos")]
 const AGENT_LOCKDOWN_SCRIPT: &str = r##"set -eu
@@ -1155,14 +1311,11 @@ if [[ "$TOOL_HOME" != /nonexistent && ${1-} == "$TOOL_HOME/"* ]]; then
 fi
 
 exec setpriv --reuid="$AGENT_UID" --regid="$AGENT_GID" --init-groups \
-  env \
-    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
-    -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
-    -u COOP_PRIVATE_EGRESS_ACTIVE \
-    -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID \
-    -u SSH_CLIENT -u SSH_CONNECTION -u SSH_TTY \
+  env -i \
     HOME=/home/developer USER=developer LOGNAME=developer \
-    HOSTNAME=devbox TZ=America/Los_Angeles \
+    SHELL=/bin/bash HOSTNAME=devbox TZ=America/Los_Angeles \
+    TERM="${TERM:-xterm-256color}" COLORTERM="${COLORTERM:-truecolor}" \
+    LANG="${LANG:-C.UTF-8}" \
     XDG_RUNTIME_DIR="/run/user/$AGENT_UID" \
     PATH="/opt/tooling/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     "$@"
@@ -1202,14 +1355,12 @@ set -eu
 . /etc/network-guard.conf
 sysctl -qw net.ipv6.conf.all.disable_ipv6=1
 sysctl -qw net.ipv6.conf.default.disable_ipv6=1
-while ip rule del priority 100 2>/dev/null; do :; done
-ip -4 route flush table 100 2>/dev/null || true
-ip -4 route add table 100 "$GATEWAY/32" dev "$IFACE" scope link
+ip -4 route replace table 100 "$GATEWAY/32" dev "$IFACE" scope link
 if [ -n "$SSH_PEER" ]; then
-  ip -4 route add table 100 "$SSH_PEER/32" dev "$IFACE" scope link
+  ip -4 route replace table 100 "$SSH_PEER/32" dev "$IFACE" scope link
 fi
-ip -4 route add table 100 default via "$GATEWAY" dev "$IFACE"
-ip rule add priority 100 lookup 100
+ip -4 route replace table 100 default via "$GATEWAY" dev "$IFACE"
+ip rule show priority 100 | grep -q 'lookup 100' || ip rule add priority 100 lookup 100
 if command -v resolvectl >/dev/null 2>&1; then
   resolvectl dns "$IFACE" "$GATEWAY"
   resolvectl domain "$IFACE" '~.'
@@ -1229,12 +1380,17 @@ iptables -w -A "$NEXT" -d "$GATEWAY" -p tcp --dport 53 -j ACCEPT
 for cidr in 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4; do
   iptables -w -A "$NEXT" -d "$cidr" -j REJECT
 done
+iptables -w -A "$NEXT" -j ACCEPT
 iptables -w -I OUTPUT 1 -j "$NEXT"
 if [ -n "$ACTIVE" ]; then
   while iptables -w -D OUTPUT -j "$ACTIVE" 2>/dev/null; do :; done
   iptables -w -F "$ACTIVE"
   iptables -w -X "$ACTIVE"
 fi
+while iptables -w -D OUTPUT -j PRIVATE_EGRESS_BOOT 2>/dev/null; do :; done
+iptables -w -F PRIVATE_EGRESS_BOOT 2>/dev/null || true
+iptables -w -X PRIVATE_EGRESS_BOOT 2>/dev/null || true
+iptables -w -P OUTPUT DROP
 ip6tables -w -P OUTPUT DROP
 SCRIPT
 chmod 0755 /usr/local/sbin/network-guard

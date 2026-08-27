@@ -32,6 +32,9 @@
   fingerprints without changing the network namespace or weakening the
   fail-closed route. This is practical fingerprint reduction, not a guarantee
   against timing side channels or direct kernel-level inference.
+  Agent images now contain an early-boot OUTPUT guard before their first boot,
+  agent commands start from an empty environment, subscription listener ports
+  are removed, and the gateway bootstrap resolver is discovered dynamically.
 
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side

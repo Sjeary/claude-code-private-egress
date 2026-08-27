@@ -179,8 +179,10 @@ never writes either value to a repository file or prints it back to the screen.
 If `~/.coop/config.toml` does not exist, it also creates an owner-only config
 containing the Los Angeles timezone and Keychain-backed references above.
 
-The gateway rewrites the subscription into Mihomo `mode: global`, enables TUN
-`strict-route`, DNS interception, IPv4 forwarding, and disables IPv6. Agent DNS
+The gateway rewrites the subscription into Mihomo `mode: global`, removes every
+HTTP/SOCKS/redir/tproxy listener inherited from the subscription, disables LAN
+proxy access, enables TUN `strict-route`, DNS interception, IPv4 forwarding, and
+disables IPv6. Agent DNS
 queries are sent to Cloudflare DoH through the configured exit group, for both
 UDP and TCP clients. Coop pins the entry, exit, and built-in `GLOBAL` selectors,
 persists those choices in the gateway's root-only state, restores them after
@@ -189,19 +191,33 @@ every Mihomo service start, and verifies the observed public IPv4 against
 failure aborts startup.
 
 The proxy server hostname has to be resolved before the encrypted chain exists.
-Mihomo therefore uses Lima's local resolver only for this cold-start bootstrap;
+Mihomo therefore discovers the gateway VM's DHCP-provided default next hop and
+uses it as Lima's local resolver only for this cold-start bootstrap;
 it is not exposed to the agent and is not used for agent DNS queries. Avoiding
 even that gateway control-plane exception requires subscription endpoints
 pinned to stable IP addresses. The agent VM itself has no direct fallback path.
 
-The agent VM uses policy routing table 100 with the gateway as its only default
-next hop. DHCP routes in the normal table cannot become a fallback. A root-owned
-timer reasserts the route and firewall, while a second firewall in the gateway
-drops any forwarded packet Mihomo did not intercept. If Mihomo or the gateway
-stops, the agent loses network instead of falling back to the Mac connection.
+Before creating an agent VM, Coop derives a private-egress base image from the
+ordinary golden image. The derivative contains no workspace, credentials, or
+host mounts and has an early systemd unit that sets IPv4 and IPv6 OUTPUT to DROP
+before `network-pre.target`; only DHCP and replies to inbound management SSH are
+allowed. The agent VM therefore starts fail-closed on its first boot, rather than
+waiting for Coop to connect over SSH. The derivative and its source fingerprint
+are stored beside the ordinary image under `data_dir/images/<image>/` and are
+rebuilt whenever the source image or guard implementation changes.
+
+After SSH connects, the agent VM uses policy routing table 100 with the gateway
+as its only default next hop. DHCP routes in the normal table cannot become a
+fallback. A root-owned timer reasserts the route and firewall, while a second
+firewall in the gateway drops any forwarded packet Mihomo did not intercept. If
+Mihomo or the gateway stops, the agent loses network instead of falling back to
+the Mac connection.
 
 Claude and Codex run as `developer`, which has no sudo permission and is not in
-the Docker group. Their launcher also creates a private mount/UTS view with a
+the Docker group. Their launcher starts from `env -i` and adds only ordinary
+terminal, locale, identity, path, runtime, and timezone variables; host-forwarded
+tokens and proxy variables are not inherited. The launcher also creates a
+private mount/UTS view with a
 neutral hostname and hardware inventory, a minimal `/dev`, filtered process
 metadata, and no ordinary Lima, Rosetta, cloud-init, proxy, SSH-session, or Coop
 name markers. Installed agent tools are remapped under `/opt/tooling`; the
