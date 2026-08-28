@@ -271,7 +271,21 @@ impl<'a> FirecrackerVm<'a, Configured> {
                  is it installed and in PATH?",
             )?;
 
-        let pid = child.id();
+        // Give Firecracker a moment to start and open its API socket.
+        std::thread::sleep(Duration::from_secs(1));
+
+        // sudo forks rather than execs when `use_pty` is on (its default
+        // since 1.9.14), so the spawned PID is the wrapper's — take the
+        // socket owner, or SIGKILL in stop() leaves the VM orphaned.
+        let pid = pid_on_socket(&socket_path).unwrap_or_else(|| {
+            let sudo_pid = child.id();
+            tracing::warn!(
+                "Could not resolve the Firecracker PID from {} — \
+                 recording the sudo wrapper PID {sudo_pid} instead",
+                socket_path.display()
+            );
+            sudo_pid
+        });
         fs::write(self.inst.pid_file_path(), pid.to_string())
             .context("Failed to write PID file")?;
 
@@ -287,9 +301,6 @@ impl<'a> FirecrackerVm<'a, Configured> {
             _state: PhantomData,
         };
 
-        // Give Firecracker a moment to start, then check it
-        // didn't crash
-        std::thread::sleep(Duration::from_secs(1));
         running.check_alive().context(
             "Firecracker exited immediately — \
              check logs with `coop logs`",
@@ -534,6 +545,18 @@ impl<'a> FirecrackerVm<'a, Running> {
         }
         Ok(())
     }
+}
+
+/// Return the PID holding the given Unix socket, or `None` if `lsof`
+/// finds nothing. Firecracker owns its API socket; `sudo` does not.
+fn pid_on_socket(socket_path: &std::path::Path) -> Option<u32> {
+    let stdout = Cmd::new("lsof")
+        .arg("-t")
+        .arg(socket_path)
+        .sudo()
+        .capture()
+        .ok()?;
+    stdout.split_whitespace().next()?.parse().ok()
 }
 
 /// Find and kill any process holding the given Unix socket.
