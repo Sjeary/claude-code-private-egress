@@ -1138,7 +1138,7 @@ fn restart_instance(
     }
     .save(inst)?;
 
-    bootstrap_and_post_start(
+    bootstrap_guest(
         be,
         cfg,
         inst,
@@ -1147,6 +1147,7 @@ fn restart_instance(
         opts,
         backend::BootMode::Restart,
     )?;
+    run_configured_post_start(cfg, inst, &target, repo.as_ref(), opts)?;
 
     tracing::info!(
         "Instance '{}' restarted — SSH: {}:{}",
@@ -1245,7 +1246,7 @@ fn start_instance(
         .save(inst)?;
     }
 
-    bootstrap_and_post_start(
+    bootstrap_guest(
         be,
         cfg,
         inst,
@@ -1318,6 +1319,11 @@ fn start_instance(
             );
         }
     }
+
+    // Project hooks run only after every workspace transport has made the
+    // project available. This matters for copied/cloned workspaces and for
+    // Firecracker mounts, which are implemented as a one-time sync.
+    run_configured_post_start(cfg, inst, &target, repo.as_ref(), opts)?;
 
     tracing::info!(
         "Instance '{}' started — SSH: {}:{}",
@@ -1511,10 +1517,12 @@ pub(crate) fn open_ssh_session(
 /// is already authoritative for that one process; restart and every
 /// post-start command pass `Some` because the on-disk snapshot is
 /// the only place the original `--env` set still lives.
-/// Open a session and run the post-boot agent bootstrap plus any
-/// `postStartCommand`, honoring `--no-agents`. Shared by fresh start and
-/// restart, which differ only in the [`backend::BootMode`].
-fn bootstrap_and_post_start(
+/// Open a session and run the post-boot agent bootstrap, honoring
+/// `--no-agents`. Shared by fresh start and restart, which differ only in the
+/// [`backend::BootMode`]. Project hooks are deliberately separate because a
+/// fresh start must provision its workspace after bootstrap but before the
+/// hook runs.
+fn bootstrap_guest(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
@@ -1523,7 +1531,6 @@ fn bootstrap_and_post_start(
     opts: &StartOpts<'_>,
     mode: backend::BootMode,
 ) -> Result<()> {
-    let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
             || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
@@ -1549,7 +1556,7 @@ fn bootstrap_and_post_start(
     }) {
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
-    if opts.no_agents && post_start.is_none() && cfg.guest_timezone.is_none() {
+    if opts.no_agents && cfg.guest_timezone.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         return Ok(());
     }
@@ -1565,21 +1572,28 @@ fn bootstrap_and_post_start(
         let guest_host = be.guest_host_address(&cfg.network);
         backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
     }
-    if let Some(cmd) = post_start {
-        // Agent bootstrap may have just minted the per-instance capability
-        // token (proxy mode), which is forwarded to sessions via `SendEnv`
-        // (Codex's `COOP_LOCAL_API_KEY`). The session above was built before
-        // the token existed, so re-prepare it here — otherwise a `post_start`
-        // that runs Codex in proxy mode would lack the token and fail to
-        // authenticate. Under --no-agents no proxy started, so nothing new to
-        // pick up; keep the original session.
-        let session = if opts.no_agents {
-            session
-        } else {
-            prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?
-        };
-        backend::run_post_start(&session, cmd);
-    }
+    Ok(())
+}
+
+/// Run the configured project hook in a newly prepared session. Preparing the
+/// session here, after bootstrap, picks up any capability token minted by the
+/// credential proxy before a hook launches Codex.
+fn run_configured_post_start(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    target: &backend::SshTarget,
+    repo: Option<&github_repo::RepoSlug>,
+    opts: &StartOpts<'_>,
+) -> Result<()> {
+    let Some(command) = opts.post_start_override.or(cfg.post_start.as_deref()) else {
+        return Ok(());
+    };
+    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
+    // A fresh transfer/clone may have recreated files with the management
+    // user's group and source modes. Reapply the idempotent restricted-view
+    // setup so private-egress hooks can edit the fully provisioned workspace.
+    crate::private_egress::configure_agent_guest(&session, cfg)?;
+    backend::run_post_start(&session, command);
     Ok(())
 }
 

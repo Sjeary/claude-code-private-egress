@@ -5098,12 +5098,13 @@ test_post_start() {
     local inst_name="${INSTANCE}-poststart"
     local marker="/tmp/coop-post-start-$$.marker"
 
-    # --post-start runs the command in the guest after SSH is ready.
-    # The marker file written by the hook is the assertion.
+    # --post-start runs only after the workspace is available. Reading a file
+    # copied from the host catches hooks accidentally running before sync.
     local post_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$post_ws"
+    echo "workspace-ready" > "$post_ws/post-start-input"
     if coop up "$post_ws" --name "$inst_name" --no-agents --no-devcontainer \
-        --post-start "echo hooked > $marker"; then
+        --post-start "cat /workspace/post-start-input > /workspace/post-start-output && cat /workspace/post-start-output > $marker"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up --post-start exits 0"
     else
@@ -5116,10 +5117,10 @@ test_post_start() {
     seen=$(guest_exec cat "$marker" 2>/dev/null) || seen=""
     unset GUEST_INSTANCE
 
-    if [[ "$seen" == *hooked* ]]; then
-        pass "--post-start hook ran in the guest"
+    if [[ "$seen" == *workspace-ready* ]]; then
+        pass "--post-start hook ran after workspace provisioning"
     else
-        fail "--post-start hook ran in the guest" "marker contents: '$seen'"
+        fail "--post-start hook ran after workspace provisioning" "marker contents: '$seen'"
     fi
 
     # Verify a failing hook does not fail `coop up` (warn-and-continue).
