@@ -158,7 +158,8 @@ unit-tested): `tools_needing_prompt`, `switch_report_lines`,
 ModelMode` in `lib.rs`. Excluded as IO/backend/TTY: `model.rs`'s `render_status`
 / `write_tool_line` / `set_local` / `set_remote` / `report_switch` /
 `apply_to_running` / `prompt_endpoint`, and `lifecycle.rs`'s
-`bootstrap_and_post_start` / `prepare_session_from_target`.
+`bootstrap_guest` / `run_configured_post_start` /
+`prepare_session_from_target`.
 
 **Keep `.cargo/mutants.toml` in sync in the same PR that adds the code** — this
 is not a follow-up chore. #352 was merged without scoping its new IO/backend/TTY

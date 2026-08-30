@@ -18,7 +18,7 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
 | `guest_timezone` | string | unset | IANA timezone applied to the guest system and `TZ` on every boot, for example `"America/Los_Angeles"`. The clock remains synchronized with real time. |
 | `private_egress` | table | unset | macOS/Lima transparent full-tunnel gateway. See [Private egress](#private-egress). |
-| `post_start` | string | unset | Shell command run in the guest after every successful boot, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
+| `post_start` | string | unset | Shell command run in the guest after every successful boot, after agent bootstrap and workspace provisioning but before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
 
 ## GitHub auth
 
@@ -235,6 +235,18 @@ a new container signal and all traffic still uses the VM's fail-closed policy
 route. The ordinary `coop shell` remains a management shell; do not run an agent
 manually from that shell if the route, firewall, or normalized-view controls are
 part of your threat model.
+
+`developer` is reserved for this restricted account, so private-egress images
+must use a different management `--guest-user` such as the default `ubuntu`.
+Coop rejects the reserved name during setup and before booting an existing
+image. The management and restricted accounts share the agent configuration
+directories, allowing bootstrap and live model switches to update the exact
+state the restricted launch consumes without exposing the management home.
+
+In private-egress mode, `post_start` and devcontainer `postStartCommand` hooks
+also run as the restricted `developer` account inside the normalized view. They
+can modify the workspace but cannot use the management account's passwordless
+sudo to change routing or firewall policy.
 
 The normalized view reduces passive and ordinary shell-level fingerprinting; it
 is not a claim that virtualization is cryptographically undetectable. In

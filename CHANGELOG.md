@@ -39,6 +39,17 @@
   concurrent reconfiguration is serialized, and HTTPS redirects cannot
   downgrade subscription or Mihomo downloads to plaintext HTTP. Healthy,
   unchanged gateways are reused instead of restarting on every agent launch.
+  Instance network modes are now persisted and checked before boot or disk
+  replacement. Private-egress restores retain the early-boot guard, while
+  commits that would publish a guarded disk as an ordinary image are rejected.
+  Project post-start hooks now run in the restricted non-sudo view, and the
+  `developer` username is reserved for that view rather than being accepted as
+  the passwordless-sudo management account. Agent bootstrap and restricted
+  launches share configuration state so model/proxy changes apply immediately.
+  Enabling the OpenAI credential proxy also removes any `auth.json` left by an
+  earlier non-proxy boot. Project post-start hooks now wait for workspace copy,
+  clone, or mount synchronization to finish, including permission normalization
+  for the restricted developer account.
 
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side

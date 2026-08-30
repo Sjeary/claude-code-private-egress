@@ -242,7 +242,7 @@ instances, pass the instance name.
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable). Lives for the lifetime of the VM; torn down on `coop stop`. |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
-| `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
+| `--post-start <cmd>` | Shell command to run inside the guest after boot and workspace provisioning. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. Under private egress it runs as the restricted, non-sudo `developer` user. |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
 | `--devcontainer <path>` | Dry-run translation aid; normal restarts reject devcontainer creation options. |
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation (escape hatch for CI). |
@@ -755,6 +755,8 @@ coop resize my-project --mem 4096 --start
 
 Save a stopped instance's filesystem as a reusable image, like `docker container commit`. The committed image is an ordinary coop image: `coop images` lists it and `coop up --image <name>` launches new instances from it. The instance must be stopped first so the filesystem is consistent.
 
+This command rejects private-egress instances because their enabled early-boot network guard is incompatible with an ordinary reusable image.
+
 ```
 coop commit [NAME] --image <name> [FLAGS]
 ```
@@ -797,6 +799,8 @@ coop restore [NAME] --image <name>
 | `--image <name>` | Name of the image to restore from (required) |
 
 Unlike `destroy` + `up --image`, `restore` keeps the same instance identity (name, index, IP) instead of allocating a new one. The disk is reset to the image's size, so restoring an image built before a `coop resize` returns the instance to the smaller size.
+
+The instance and current configuration must use the same network mode. Restoring a private-egress instance automatically uses the selected image's guarded derivative.
 
 ### `profiles`
 
