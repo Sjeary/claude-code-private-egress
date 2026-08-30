@@ -1233,8 +1233,12 @@ pub fn run() -> Result<()> {
                 args.insert(0, "--permission-mode".to_string());
             }
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-            let command =
-                private_egress::restricted_agent_command(&sess, claude_bin.as_ref(), args);
+            let command = private_egress::restricted_agent_command(
+                &sess,
+                private_egress::RestrictedAgent::Claude,
+                claude_bin.as_ref(),
+                args,
+            );
             ssh::run_interactive(&sess, &command)
         }
         Commands::ClaudeAgents { name, mut args } => {
@@ -1243,8 +1247,12 @@ pub fn run() -> Result<()> {
             private_egress::configure_agent_guest(&sess, &cfg)?;
             args.insert(0, "agents".to_string());
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-            let command =
-                private_egress::restricted_agent_command(&sess, claude_bin.as_ref(), args);
+            let command = private_egress::restricted_agent_command(
+                &sess,
+                private_egress::RestrictedAgent::Claude,
+                claude_bin.as_ref(),
+                args,
+            );
             ssh::run_interactive(&sess, &command)
         }
         Commands::Codex { name, ask, args } => {
@@ -1265,7 +1273,12 @@ pub fn run() -> Result<()> {
             } else {
                 guest::codex_bin()
             };
-            let command = private_egress::restricted_agent_command(&sess, codex_bin.as_ref(), args);
+            let command = private_egress::restricted_agent_command(
+                &sess,
+                private_egress::RestrictedAgent::Codex,
+                codex_bin.as_ref(),
+                args,
+            );
             ssh::run_interactive(&sess, &command)
         }
         Commands::Stop { name } => {

@@ -1527,7 +1527,9 @@ pub fn run_post_start(session: &SshSession, command: &str) {
     tracing::info!("Running post_start hook in guest");
     tracing::debug!("post_start: {command}");
 
-    match session.exec(RemoteCommand::new().literal(command)) {
+    match session.exec(crate::private_egress::restricted_post_start_command(
+        session, command,
+    )) {
         Ok(()) => tracing::debug!("post_start hook completed"),
         Err(e) => tracing::warn!("post_start hook failed (continuing): {e}"),
     }
@@ -2523,6 +2525,14 @@ fn copy_codex_config(
     proxy_active: bool,
     keyring_materialized: bool,
 ) -> Result<()> {
+    if proxy_active {
+        // Omitting host auth.json from staging is insufficient for an existing
+        // VM that received it during an earlier non-proxy boot.
+        target
+            .exec(RemoteCommand::new().literal("rm -f ~/.codex/auth.json"))
+            .context("Failed to remove Codex auth.json while enabling proxy mode")?;
+    }
+
     // The guest's config.toml holds the Codex CLI's installed `[marketplaces.*]`
     // / `[plugins.*]` tables. We only need to carry them across a *rewrite* of
     // that file, so read the guest config only when a rewrite will actually

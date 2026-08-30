@@ -3,16 +3,20 @@
 //! The agent VM never receives proxy settings. A separate Lima VM owns the
 //! Mihomo subscription and TUN device; the agent VM gets only an L3 next hop.
 
-use anyhow::Result;
+use std::io::ErrorKind;
+
 #[cfg(target_os = "macos")]
-use anyhow::{Context, ensure};
+use anyhow::ensure;
+use anyhow::{Context, Result};
 
 use crate::backend::SshSession;
 use crate::config::CoopConfig;
-#[cfg(target_os = "macos")]
 use crate::remote_command::RemoteCommand;
 
 pub const GATEWAY_NAME: &str = "coop-egress";
+pub(crate) const OPENAI_PROXY_ACTIVE_ENV: &str = "COOP_OPENAI_PROXY_ACTIVE";
+const INSTANCE_MODE_MARKER: &str = "private-egress-mode";
+const INSTANCE_MODE_VERSION: &str = "version=1\n";
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -979,6 +983,13 @@ rules: [MATCH,DIRECT]
             assert!(BOOT_GUARD_INSTALL_SCRIPT.contains("iptables -w -P OUTPUT DROP"));
             assert!(BOOT_GUARD_INSTALL_SCRIPT.contains("--sport 68 --dport 67"));
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("env -i"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("for item in .claude .claude.json .codex"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("ln -s \"$DEST\" \"$MANAGER_ITEM\""));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("rm -f /home/developer/.codex/auth.json"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("usermod -G developers developer"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("mount --bind /dev/null /usr/bin/sudo"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("TZ=\"$AGENT_TZ\""));
+            assert!(!AGENT_LOCKDOWN_SCRIPT.contains("TZ=America/Los_Angeles"));
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("iptables -w -A \"$NEXT\" -j ACCEPT"));
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("ip -4 route replace table 100 default"));
             assert!(!AGENT_LOCKDOWN_SCRIPT.contains("ip rule del priority 100"));
@@ -1020,6 +1031,76 @@ pub fn ensure_gateway(cfg: &CoopConfig) -> Result<()> {
     }
 }
 
+/// Persist the network mode used to create an instance. A stopped Lima VM
+/// cannot be converted safely after the fact because an ordinary image may
+/// emit traffic before Coop can reconnect over SSH and install its guard.
+pub(crate) fn record_instance_mode(cfg: &CoopConfig, inst: &crate::config::Instance) -> Result<()> {
+    let marker = inst.dir.join(INSTANCE_MODE_MARKER);
+    if cfg.private_egress.is_some() {
+        crate::fs_util::atomic_write_with_mode(&marker, INSTANCE_MODE_VERSION, 0o600)
+            .context("Failed to record private-egress instance mode")?;
+    } else if let Err(error) = std::fs::remove_file(&marker)
+        && error.kind() != ErrorKind::NotFound
+    {
+        return Err(error).context("Failed to clear stale private-egress mode marker");
+    }
+    Ok(())
+}
+
+/// Refuse to use an instance under a different network mode from the one it
+/// was created with. In particular, enabling private egress must not boot a
+/// legacy unguarded image and leave a direct-egress window before SSH is ready.
+pub(crate) fn ensure_instance_mode(cfg: &CoopConfig, inst: &crate::config::Instance) -> Result<()> {
+    let configured = cfg.private_egress.is_some();
+    let marker = inst.dir.join(INSTANCE_MODE_MARKER);
+    let recorded = match std::fs::read_to_string(&marker) {
+        Ok(contents) if contents == INSTANCE_MODE_VERSION => true,
+        Ok(_) => anyhow::bail!(
+            "Instance '{}' has an invalid or unsupported private-egress mode marker at {}. \
+             Destroy and recreate this instance before using it",
+            inst.name,
+            marker.display(),
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to read instance mode marker {}", marker.display())
+            });
+        }
+    };
+    if configured != recorded {
+        let configured_mode = if configured {
+            "private egress"
+        } else {
+            "ordinary networking"
+        };
+        let recorded_mode = if recorded {
+            "private egress"
+        } else {
+            "ordinary networking"
+        };
+        anyhow::bail!(
+            "Instance '{}' was created with {recorded_mode}, but the current config uses \
+             {configured_mode}. Destroy and recreate this instance before using it under the \
+             new network mode",
+            inst.name
+        );
+    }
+    Ok(())
+}
+
+/// The restricted account is a security boundary only when it is distinct
+/// from the image's passwordless-sudo management account.
+pub(crate) fn ensure_management_user(cfg: &CoopConfig, user: &str) -> Result<()> {
+    if cfg.private_egress.is_some() && user == "developer" {
+        anyhow::bail!(
+            "private_egress reserves guest user 'developer' for restricted agent sessions. \
+             Rebuild the image with a different --guest-user (for example, 'ubuntu')"
+        );
+    }
+    Ok(())
+}
+
 /// Replace the agent guest's network with a policy-routing table whose only
 /// default next hop is the separate gateway VM, then create the unprivileged
 /// account used for agent processes.
@@ -1027,10 +1108,20 @@ pub fn configure_agent_guest(session: &SshSession, cfg: &CoopConfig) -> Result<(
     if cfg.private_egress.is_none() {
         return Ok(());
     }
+    ensure_management_user(cfg, session.target.user.as_ref())?;
     #[cfg(target_os = "macos")]
     {
         let gateway = platform::gateway_ipv4()?.to_string();
         let management_user = session.target.user.as_ref();
+        let timezone = cfg
+            .guest_timezone
+            .as_ref()
+            .map_or("", crate::config::GuestTimeZone::as_str);
+        let drop_codex_auth = if session.env.contains(OPENAI_PROXY_ACTIVE_ENV) {
+            "1"
+        } else {
+            "0"
+        };
         session
             .target
             .exec_with_stdin(
@@ -1043,7 +1134,10 @@ pub fn configure_agent_guest(session: &SshSession, cfg: &CoopConfig) -> Result<(
             .arg(&gateway)
             .literal(" ")
             .arg(management_user)
-            .literal(" \"$peer\"");
+            .literal(" \"$peer\" ")
+            .arg(timezone)
+            .literal(" ")
+            .arg(drop_codex_auth);
         session
             .target
             .exec_with_stdin(command, AGENT_LOCKDOWN_SCRIPT.as_bytes().to_vec())
@@ -1103,8 +1197,15 @@ fn verify_agent_route(session: &SshSession, cfg: &CoopConfig, gateway: &str) -> 
 /// launcher builds a private mount/UTS view, then drops to an account with
 /// neither sudo nor Docker access. Network namespaces are deliberately shared
 /// so the fail-closed route remains authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestrictedAgent {
+    Claude,
+    Codex,
+}
+
 pub fn restricted_agent_command(
     session: &SshSession,
+    agent: RestrictedAgent,
     binary: &str,
     args: Vec<String>,
 ) -> Vec<String> {
@@ -1114,19 +1215,44 @@ pub fn restricted_agent_command(
         .contains_key("COOP_PRIVATE_EGRESS_ACTIVE")
     {
         let manager = session.target.user.as_ref();
-        let mut command = vec![
-            "sudo".to_string(),
+        let mut command = vec!["sudo".to_string()];
+        if agent == RestrictedAgent::Codex
+            && session
+                .env
+                .contains(crate::model_state::CODEX_LOCAL_ENV_KEY)
+        {
+            command.push(format!(
+                "--preserve-env={}",
+                crate::model_state::CODEX_LOCAL_ENV_KEY
+            ));
+        }
+        command.extend([
             "--".to_string(),
             "/usr/local/sbin/dev-session".to_string(),
             manager.to_string(),
             binary.to_string(),
-        ];
+        ]);
         command.extend(args);
         command
     } else {
         let mut command = vec![binary.to_string()];
         command.extend(args);
         command
+    }
+}
+
+/// Run a project-provided post-start hook inside the same unprivileged view as
+/// agents. Devcontainer hooks are guest-controlled input and must not inherit
+/// the management user's passwordless sudo in private-egress mode.
+pub fn restricted_post_start_command(session: &SshSession, command: &str) -> RemoteCommand {
+    if session.env.contains("COOP_PRIVATE_EGRESS_ACTIVE") {
+        RemoteCommand::new()
+            .literal("sudo -- /usr/local/sbin/dev-session ")
+            .arg(session.target.user.as_ref())
+            .literal(" /bin/bash -c ")
+            .arg(command)
+    } else {
+        RemoteCommand::new().literal(command)
     }
 }
 
@@ -1180,6 +1306,13 @@ const AGENT_LOCKDOWN_SCRIPT: &str = r##"set -eu
 GATEWAY=$1
 MANAGER=$2
 SSH_PEER=$3
+AGENT_TZ=$4
+DROP_CODEX_AUTH=$5
+if [ -z "$AGENT_TZ" ]; then
+  AGENT_TZ=$(cat /etc/timezone 2>/dev/null || printf '%s\n' UTC)
+fi
+printf '%s\n' "$AGENT_TZ" >/etc/dev-session-timezone
+chmod 0644 /etc/dev-session-timezone
 IFACE=$(ip -4 route get "$GATEWAY" | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
 test -n "$IFACE"
 MANAGER_HOME=$(getent passwd "$MANAGER" | cut -d: -f6)
@@ -1202,6 +1335,7 @@ rm -f "$ENV_TMP"
 getent group developers >/dev/null || groupadd --system developers
 id developer >/dev/null 2>&1 || useradd --create-home --shell /bin/bash --gid developers developer
 usermod -g developers developer
+usermod -G developers developer
 passwd -l developer >/dev/null 2>&1 || true
 usermod -aG developers "$MANAGER"
 install -d -o developer -g developers -m 0750 /home/developer
@@ -1210,7 +1344,9 @@ case "$CLAUDE_BINARY" in
   /home/*/.local/*) TOOL_HOME=${CLAUDE_BINARY%%/.local/*} ;;
   *) TOOL_HOME=/nonexistent ;;
 esac
-for item in .claude .claude.json; do
+for item in .claude .claude.json .codex; do
+  DEST="/home/developer/$item"
+  MANAGER_ITEM="$MANAGER_HOME/$item"
   SOURCE=
   for source_home in "$MANAGER_HOME" "$TOOL_HOME"; do
     if [ -e "$source_home/$item" ] || [ -L "$source_home/$item" ]; then
@@ -1218,17 +1354,40 @@ for item in .claude .claude.json; do
       break
     fi
   done
-  if [ -n "$SOURCE" ]; then
-    [ -L "/home/developer/$item" ] && rm -f "/home/developer/$item"
-    if [ ! -e "/home/developer/$item" ]; then
-      cp -a "$SOURCE" "/home/developer/$item"
+
+  # Migrate pre-shared state once, then make bootstrap and restricted launches
+  # use the same files. Directory copies merge so developer-owned histories
+  # survive while current manager-side settings win on name collisions.
+  if [ -n "$SOURCE" ] && [ "$(readlink -f "$SOURCE" 2>/dev/null || true)" != "$DEST" ]; then
+    [ -L "$DEST" ] && rm -f "$DEST"
+    if [ -d "$SOURCE" ] && [ -d "$DEST" ]; then
+      cp -a "$SOURCE/." "$DEST/"
+    elif [ ! -e "$DEST" ]; then
+      cp -a "$SOURCE" "$DEST"
     fi
-    chown -R developer:developers "/home/developer/$item"
+  fi
+
+  if [ ! -e "$DEST" ]; then
+    case "$item" in
+      .claude.json) printf '%s\n' '{}' >"$DEST" ;;
+      *) install -d -o developer -g developers -m 2770 "$DEST" ;;
+    esac
+  fi
+  chown -R developer:developers "$DEST"
+  if [ -d "$DEST" ]; then
+    chmod -R g+rwX "$DEST"
+    find "$DEST" -type d -exec chmod g+s {} +
+  else
+    chmod 0660 "$DEST"
+  fi
+
+  if [ "$(readlink -f "$MANAGER_ITEM" 2>/dev/null || true)" != "$DEST" ]; then
+    rm -rf "$MANAGER_ITEM"
+    ln -s "$DEST" "$MANAGER_ITEM"
   fi
 done
-if [ -d "$MANAGER_HOME/.claude" ]; then
-  chgrp -R developers "$MANAGER_HOME/.claude"
-  chmod -R g+rwX "$MANAGER_HOME/.claude"
+if [ "$DROP_CODEX_AUTH" = 1 ]; then
+  rm -f /home/developer/.codex/auth.json
 fi
 chgrp -R developers /workspace
 chmod -R g+rwX /workspace
@@ -1303,10 +1462,12 @@ cat >/usr/local/libexec/dev-session-enter <<'SCRIPT'
 set -euo pipefail
 RUNTIME=$1
 TOOL_HOME=$2
-shift 2
+AGENT_TZ=$3
+shift 3
 VIEW=/usr/local/share/dev-session
 AGENT_UID=$(id -u developer)
 AGENT_GID=$(getent group developers | cut -d: -f3)
+CODEX_API_KEY=${COOP_LOCAL_API_KEY-}
 
 mount --make-rprivate /
 hostname devbox
@@ -1413,6 +1574,7 @@ ln -s /proc/self/fd /dev/fd
 ln -s /proc/self/fd/0 /dev/stdin
 ln -s /proc/self/fd/1 /dev/stdout
 ln -s /proc/self/fd/2 /dev/stderr
+[ -e /usr/bin/sudo ] && mount --bind /dev/null /usr/bin/sudo
 
 # The implementation itself is outside the unprivileged view as well.
 install -d -o root -g root -m 0700 \
@@ -1453,11 +1615,12 @@ fi
 exec setpriv --reuid="$AGENT_UID" --regid="$AGENT_GID" --init-groups \
   env -i \
     HOME=/home/developer USER=developer LOGNAME=developer \
-    SHELL=/bin/bash HOSTNAME=devbox TZ=America/Los_Angeles \
+    SHELL=/bin/bash HOSTNAME=devbox TZ="$AGENT_TZ" \
     TERM="${TERM:-xterm-256color}" COLORTERM="${COLORTERM:-truecolor}" \
     LANG="${LANG:-C.UTF-8}" \
     XDG_RUNTIME_DIR="/run/user/$AGENT_UID" \
     PATH="/opt/tooling/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    COOP_LOCAL_API_KEY="$CODEX_API_KEY" \
     "$@"
 SCRIPT
 chmod 0755 /usr/local/libexec/dev-session-enter
@@ -1473,13 +1636,14 @@ MANAGER=$1
 shift
 MANAGER_HOME=$(getent passwd "$MANAGER" | cut -d: -f6)
 test -n "$MANAGER_HOME" && test -d "$MANAGER_HOME"
+AGENT_TZ=$(cat /etc/dev-session-timezone)
 CLAUDE_BINARY=$(readlink -f /usr/local/bin/claude 2>/dev/null || true)
 case "$CLAUDE_BINARY" in
   /home/*/.local/*) TOOL_HOME=${CLAUDE_BINARY%%/.local/*} ;;
   *) TOOL_HOME=/nonexistent ;;
 esac
 unshare --mount --uts --fork --kill-child=TERM \
-  /usr/local/libexec/dev-session-enter "$RUNTIME" "$TOOL_HOME" "$@"
+  /usr/local/libexec/dev-session-enter "$RUNTIME" "$TOOL_HOME" "$AGENT_TZ" "$@"
 SCRIPT
 chmod 0755 /usr/local/sbin/dev-session
 
@@ -1577,5 +1741,159 @@ systemctl restart network-guard.timer
 pub fn mark_session(session: &mut SshSession, cfg: &CoopConfig) {
     if cfg.private_egress.is_some() {
         session.env.set("COOP_PRIVATE_EGRESS_ACTIVE", "1");
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test failures should identify fixtures")]
+mod mode_tests {
+    use super::*;
+    use crate::backend::{EnvForward, Hostname, SshTarget, SshUser};
+    use crate::config::{ImageName, Instance, InstanceIndex, InstanceName};
+
+    fn instance(dir: &std::path::Path) -> Instance {
+        Instance {
+            name: InstanceName::new("test").expect("valid instance name"),
+            index: InstanceIndex::new(0).expect("valid instance index"),
+            dir: dir.to_path_buf(),
+            image: ImageName::new("default").expect("valid image name"),
+        }
+    }
+
+    fn private_config() -> CoopConfig {
+        toml::from_str(
+            r#"
+[private_egress]
+subscription = "cmd:printf subscription"
+expected_egress_ip = "cmd:printf 203.0.113.10"
+entry_group = "entry-group"
+entry_choice = "us-entry"
+exit_group = "exit-group"
+exit_choice_prefix = "los-angeles-exit"
+exit_choice_suffix = ""
+"#,
+        )
+        .expect("valid private-egress config")
+    }
+
+    #[test]
+    fn instance_mode_marker_rejects_both_configuration_mismatches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = instance(dir.path());
+        let private = private_config();
+        let ordinary = CoopConfig::default();
+
+        assert!(ensure_instance_mode(&private, &inst).is_err());
+        record_instance_mode(&private, &inst).expect("record private mode");
+        ensure_instance_mode(&private, &inst).expect("matching private mode");
+        assert!(ensure_instance_mode(&ordinary, &inst).is_err());
+
+        record_instance_mode(&ordinary, &inst).expect("record ordinary mode");
+        ensure_instance_mode(&ordinary, &inst).expect("matching ordinary mode");
+        assert!(ensure_instance_mode(&private, &inst).is_err());
+    }
+
+    #[test]
+    fn instance_mode_marker_rejects_unknown_or_corrupt_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = instance(dir.path());
+        let marker = inst.dir.join(INSTANCE_MODE_MARKER);
+
+        std::fs::write(&marker, "version=2\n").expect("write unknown marker version");
+        assert!(ensure_instance_mode(&private_config(), &inst).is_err());
+        assert!(ensure_instance_mode(&CoopConfig::default(), &inst).is_err());
+
+        std::fs::write(&marker, "").expect("write corrupt marker");
+        assert!(ensure_instance_mode(&private_config(), &inst).is_err());
+        assert!(ensure_instance_mode(&CoopConfig::default(), &inst).is_err());
+    }
+
+    #[test]
+    fn private_egress_reserves_the_restricted_developer_account() {
+        let private = private_config();
+        assert!(ensure_management_user(&private, "developer").is_err());
+        ensure_management_user(&private, "ubuntu").expect("distinct manager is valid");
+        ensure_management_user(&CoopConfig::default(), "developer")
+            .expect("ordinary networking has no restricted account");
+    }
+
+    #[test]
+    fn restricted_command_preserves_only_the_managed_codex_key_without_exposing_its_value() {
+        let mut env = EnvForward::default();
+        env.set("COOP_PRIVATE_EGRESS_ACTIVE", "1");
+        env.set("COOP_LOCAL_API_KEY", "secret-capability");
+        let session = SshSession {
+            target: SshTarget {
+                host: Hostname::new("127.0.0.1").expect("valid host"),
+                port: std::num::NonZeroU16::new(22).expect("non-zero port"),
+                user: SshUser::new("ubuntu").expect("valid user"),
+                key_path: std::path::PathBuf::from("/tmp/test-key"),
+            },
+            env,
+        };
+
+        let command = restricted_agent_command(
+            &session,
+            RestrictedAgent::Codex,
+            "/usr/bin/codex",
+            vec!["--ask".into()],
+        );
+        assert_eq!(
+            command,
+            [
+                "sudo",
+                "--preserve-env=COOP_LOCAL_API_KEY",
+                "--",
+                "/usr/local/sbin/dev-session",
+                "ubuntu",
+                "/usr/bin/codex",
+                "--ask",
+            ]
+        );
+        assert!(!command.iter().any(|arg| arg == "secret-capability"));
+
+        let claude = restricted_agent_command(
+            &session,
+            RestrictedAgent::Claude,
+            "/usr/bin/claude",
+            Vec::new(),
+        );
+        assert!(!claude.iter().any(|arg| arg.contains("COOP_LOCAL_API_KEY")));
+    }
+
+    #[test]
+    fn private_post_start_runs_in_restricted_view_and_quotes_the_hook() {
+        let mut env = EnvForward::default();
+        env.set("COOP_PRIVATE_EGRESS_ACTIVE", "1");
+        let session = SshSession {
+            target: SshTarget {
+                host: Hostname::new("127.0.0.1").expect("valid host"),
+                port: std::num::NonZeroU16::new(22).expect("non-zero port"),
+                user: SshUser::new("ubuntu").expect("valid user"),
+                key_path: std::path::PathBuf::from("/tmp/test-key"),
+            },
+            env,
+        };
+
+        let rendered = restricted_post_start_command(
+            &session,
+            "echo ready; sudo iptables -F; touch '$HOME/proof'",
+        )
+        .into_string();
+        assert_eq!(
+            rendered,
+            "sudo -- /usr/local/sbin/dev-session 'ubuntu' /bin/bash -c \
+             'echo ready; sudo iptables -F; touch '\\''$HOME/proof'\\'''"
+        );
+
+        let ordinary = SshSession {
+            target: session.target,
+            env: EnvForward::default(),
+        };
+        assert_eq!(
+            restricted_post_start_command(&ordinary, "echo ready && touch /tmp/proof")
+                .into_string(),
+            "echo ready && touch /tmp/proof",
+        );
     }
 }

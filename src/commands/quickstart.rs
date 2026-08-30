@@ -109,8 +109,12 @@ pub(crate) fn cmd_quickstart(
     crate::private_egress::ensure_gateway(cfg)?;
     crate::private_egress::configure_agent_guest(&sess, cfg)?;
     let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-    let command =
-        crate::private_egress::restricted_agent_command(&sess, claude_bin.as_ref(), Vec::new());
+    let command = crate::private_egress::restricted_agent_command(
+        &sess,
+        crate::private_egress::RestrictedAgent::Claude,
+        claude_bin.as_ref(),
+        Vec::new(),
+    );
     ssh::run_interactive(&sess, &command)
 }
 

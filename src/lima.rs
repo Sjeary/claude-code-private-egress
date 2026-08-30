@@ -52,6 +52,7 @@ pub const HOST_GATEWAY: &str = "host.lima.internal";
 
 /// Run first-time setup for Lima backend.
 pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
+    crate::private_egress::ensure_management_user(cfg, opts.guest_user.as_ref())?;
     fs::create_dir_all(&cfg.data_dir).context("Failed to create data directory")?;
 
     check_requirements()?;
@@ -104,6 +105,8 @@ pub fn create_and_start(
     let name = lima_name(inst);
     let template_path = cfg.lima_template_path(&inst.image);
     let base_img = cfg.lima_base_path(&inst.image);
+    let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
+    crate::private_egress::ensure_management_user(cfg, guest_user.as_ref())?;
 
     if !template_path.exists() || !base_img.exists() {
         bail!(
@@ -144,11 +147,12 @@ pub fn create_and_start(
             "Lima instance '{name}' already exists (status: {state}) — \
              cleaning up before re-creating"
         );
-        if let Err(e) = Command::new("limactl")
+        let status = Command::new("limactl")
             .args(["delete", "--force", &name])
             .status()
-        {
-            tracing::debug!("Failed to force-delete stale instance (non-fatal): {e}");
+            .context("Failed to force-delete stale Lima instance")?;
+        if !status.success() {
+            bail!("Failed to force-delete stale Lima instance '{name}'");
         }
     }
 
@@ -176,7 +180,6 @@ pub fn create_and_start(
         .spawn()
         .context("Failed to spawn limactl start")?;
 
-    let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
     if let Err(e) = wait_for_lima_ssh(
         &inst.name,
         &mut child,
@@ -199,7 +202,12 @@ pub fn create_and_start(
         );
     }
 
+    // Commit the host-side mode record only after the VM was created under
+    // that mode. On failure, leaving the marker untouched prevents a retry
+    // from trusting state that was never applied to a Lima instance.
+    let mode_result = crate::private_egress::record_instance_mode(cfg, inst);
     reap_in_background(child);
+    mode_result?;
     tracing::info!("Lima instance '{name}' started");
     Ok(())
 }
@@ -207,6 +215,10 @@ pub fn create_and_start(
 /// Start an existing stopped Lima instance (no template — resumes in place).
 pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     let name = lima_name(inst);
+
+    crate::private_egress::ensure_instance_mode(cfg, inst)?;
+    let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
+    crate::private_egress::ensure_management_user(cfg, guest_user.as_ref())?;
 
     if is_running(inst) {
         bail!("Lima instance '{name}' is already running");
@@ -222,7 +234,6 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         .spawn()
         .context("Failed to spawn limactl start")?;
 
-    let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
     if let Err(e) = wait_for_lima_ssh(
         &inst.name,
         &mut child,
@@ -449,6 +460,15 @@ fn is_top_level_key(line: &str, key: &str) -> bool {
 /// so it points at the new base. The caller has gated on the instance
 /// being stopped and decided whether overwriting is allowed.
 pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
+    if cfg.private_egress.is_some() {
+        bail!(
+            "Cannot commit private-egress instance '{}' to a reusable image. \
+             Its disk contains an enabled early-boot network guard that is incompatible with \
+             ordinary networking",
+            inst.name,
+        );
+    }
+
     let src = disk_path(inst)?;
     if !src.exists() {
         bail!(
@@ -473,7 +493,13 @@ pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Resu
 
 /// Replace a stopped instance's disk with image `image`'s base image.
 pub fn restore_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
-    let base_img = cfg.lima_base_path(image);
+    // A private-egress instance must never receive the ordinary golden disk:
+    // it lacks the guard that blocks traffic before SSH-time lockdown runs.
+    let base_img = if cfg.private_egress.is_some() {
+        ensure_private_egress_base(cfg, image)?
+    } else {
+        cfg.lima_base_path(image)
+    };
     if !base_img.exists() {
         bail!("No image '{image}' found at {}.", base_img.display());
     }
@@ -2097,6 +2123,36 @@ fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_egress_instance_cannot_be_committed_as_an_ordinary_image() {
+        let cfg: CoopConfig = toml::from_str(
+            r#"
+[private_egress]
+subscription = "cmd:printf subscription"
+expected_egress_ip = "cmd:printf 203.0.113.10"
+entry_group = "entry-group"
+entry_choice = "us-entry"
+exit_group = "exit-group"
+exit_choice_prefix = "los-angeles-exit"
+exit_choice_suffix = ""
+"#,
+        )
+        .unwrap();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: PathBuf::from("/unused"),
+            image: ImageName::new("default").unwrap(),
+        };
+
+        let error = commit_disk(&cfg, &inst, &ImageName::new("checkpoint").unwrap()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot commit private-egress instance")
+        );
+    }
 
     #[test]
     fn private_egress_fingerprint_tracks_source_and_guard_version() {

@@ -180,6 +180,8 @@ coop commit my-project --image my-project-baseline
 
 The committed image is an ordinary coop image stored under `~/.coop/images/<name>/`: it carries over the source image's `template-config.json` (profiles, guest user, hashes) with a fresh creation timestamp, so `coop images` lists it and `coop up --image <name>` launches new instances from it. The instance must be stopped first for filesystem consistency. Committing onto an existing image name requires `--force`.
 
+Instances created with `[private_egress]` cannot be committed. Their disks contain an enabled early-boot network guard, so publishing one as an ordinary image would produce an image that cannot use ordinary networking. Recreate the desired state in an ordinary-network instance before committing it.
+
 `coop restore` rolls a stopped instance back to an image's filesystem in place:
 
 ```bash
@@ -191,6 +193,8 @@ coop start my-project
 ```
 
 Restore keeps the instance's name, index, IP, and workspace association — only the disk is replaced and the instance's recorded image is updated. That makes it the ergonomic choice over `destroy` + `up --image` for the destructive-undo loop, which would allocate a different instance.
+
+The instance and current configuration must use the same network mode. For a private-egress instance, coop restores the guarded derivative of the selected image so the early-boot fail-closed guarantee remains intact.
 
 ## Template versioning and staleness
 

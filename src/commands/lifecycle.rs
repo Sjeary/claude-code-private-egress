@@ -1616,6 +1616,10 @@ pub(crate) fn prepare_session_from_target(
     target: backend::SshTarget,
     repo: Option<&github_repo::RepoSlug>,
 ) -> Result<backend::SshSession> {
+    if let Some(inst) = inst {
+        crate::private_egress::ensure_instance_mode(cfg, inst)?;
+    }
+
     // Load the per-instance model selection once: it decides both the
     // proxy-mode key suppression and the Codex local-key forwarding below.
     let model = match inst {
@@ -1718,6 +1722,9 @@ pub(crate) fn prepare_session_from_target(
             {
                 env.set(model_state::CODEX_LOCAL_ENV_KEY, token);
             }
+        }
+        if proxy_openai {
+            env.set(crate::private_egress::OPENAI_PROXY_ACTIVE_ENV, "1");
         }
     }
     let mut session = backend::SshSession { target, env };
@@ -1956,6 +1963,7 @@ pub(crate) fn cmd_commit(
     force: bool,
 ) -> Result<()> {
     let inst = cfg.resolve_instance(name)?;
+    crate::private_egress::ensure_instance_mode(cfg, &inst)?;
     let source_image = inst.image.clone();
 
     // Refuse to clobber an existing image unless asked. Checked before
@@ -2002,6 +2010,7 @@ pub(crate) fn cmd_restore(
     image: &config::ImageName,
 ) -> Result<()> {
     let inst = cfg.resolve_instance(name)?;
+    crate::private_egress::ensure_instance_mode(cfg, &inst)?;
 
     if !be.image_is_built(cfg, image) {
         bail!("No image '{image}' found. Run `coop images` to list available images.");
@@ -2487,6 +2496,42 @@ mod tests {
             envs.get("COOP_TEST_PASSTHROUGH").map(String::as_str),
             Some("kept"),
             "non-suppressed entries must still flow through",
+        );
+    }
+
+    #[test]
+    fn prepare_session_marks_openai_proxy_for_stale_auth_cleanup() {
+        use std::num::NonZeroU16;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("valid name"),
+            index: super::config::InstanceIndex::new(0).expect("0 is in range"),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
+                .expect("DEFAULT_IMAGE is valid"),
+        };
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.proxy.openai = Some(super::config::ProxyUpstream {
+            credential: super::config::Secret::new("cmd:true".to_string()),
+            auth: super::config::ProxyAuthScheme::Bearer,
+        });
+        let target = super::backend::SshTarget {
+            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            port: NonZeroU16::new(22).expect("non-zero"),
+            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
+            key_path: tmp.path().join("id_test"),
+        };
+
+        let session =
+            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+        assert_eq!(
+            session
+                .env
+                .as_envs()
+                .get(crate::private_egress::OPENAI_PROXY_ACTIVE_ENV)
+                .map(String::as_str),
+            Some("1"),
         );
     }
 

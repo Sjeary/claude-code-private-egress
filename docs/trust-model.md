@@ -34,6 +34,15 @@ exposure.
 Treat the guest as **untrusted** from the host's point of view, even though the
 user launched it.
 
+Private-egress mode adds a defense-in-depth boundary *inside* the guest without
+changing the VM's role as the host isolation boundary. The configured guest
+user remains the passwordless-sudo management account, while `developer` is a
+reserved, non-sudo account used for agents and project-provided post-start
+hooks. Its mount view hides management credentials, Docker, `sudo`, and the
+private-egress control scripts; its only default route is through the managed
+gateway. The two accounts must never be the same, and a path that lets
+`developer` recover management privileges or direct egress is a finding.
+
 ## Trust zones
 
 | Zone | Trust | Notes |
@@ -100,7 +109,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   guest gets only a per-instance capability token (Claude via `settings.json`,
   Codex via the `coop_local` provider's bearer `env_key`). In proxy mode Codex's
   `~/.codex/auth.json` is also **not** staged onto the guest disk (it holds a
-  refreshable subscription token). Each credential is resolved on the host and
+  refreshable subscription token), and any copy left by an earlier non-proxy
+  boot is removed before Codex runs. Each credential is resolved on the host and
   handed to `coop-proxy` over **stdin**, never argv or disk; a resolution failure
   fails the boot closed. A per-VM override
   (`proxy_state.rs`, `<inst.dir>/proxy.json`) selects a different host-side
