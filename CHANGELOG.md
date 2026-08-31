@@ -49,7 +49,9 @@
   Enabling the OpenAI credential proxy also removes any `auth.json` left by an
   earlier non-proxy boot. Project post-start hooks now wait for workspace copy,
   clone, or mount synchronization to finish, including permission normalization
-  for the restricted developer account.
+  for the restricted developer account. Git also trusts the fixed `/workspace`
+  path in that account so a management-owned copied repository remains usable
+  without trusting any other guest or host path.
 
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side

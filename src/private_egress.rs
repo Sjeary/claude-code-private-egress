@@ -987,6 +987,10 @@ rules: [MATCH,DIRECT]
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("ln -s \"$DEST\" \"$MANAGER_ITEM\""));
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("rm -f /home/developer/.codex/auth.json"));
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("usermod -G developers developer"));
+            assert!(
+                AGENT_LOCKDOWN_SCRIPT
+                    .contains("git config --global --add safe.directory /workspace")
+            );
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("mount --bind /dev/null /usr/bin/sudo"));
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("TZ=\"$AGENT_TZ\""));
             assert!(!AGENT_LOCKDOWN_SCRIPT.contains("TZ=America/Los_Angeles"));
@@ -1392,6 +1396,14 @@ fi
 chgrp -R developers /workspace
 chmod -R g+rwX /workspace
 find /workspace -type d -exec chmod g+s {} +
+# Git rejects repositories owned by the management account even when the
+# restricted account has intentional group write access. Trust only Coop's
+# fixed workspace path in developer's protected global configuration.
+if ! runuser -u developer -- env HOME=/home/developer \
+  git config --global --get-all safe.directory 2>/dev/null | grep -Fxq /workspace; then
+  runuser -u developer -- env HOME=/home/developer \
+    git config --global --add safe.directory /workspace
+fi
 
 # Give agent processes an ordinary, privacy-normalized Linux view without
 # adding PID, user, or network namespaces that would themselves look like a
