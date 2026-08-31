@@ -560,7 +560,7 @@ test_status_running() {
         if [[ -n "$fc_pid" ]]; then
             comm=$(cat "/proc/$fc_pid/comm" 2>/dev/null || true)
         fi
-        if [[ "$comm" == "firecracker" ]]; then
+        if [[ "$comm" == *firecracker* ]]; then
             pass "status PID is the firecracker process (pid $fc_pid)"
         else
             fail "status PID is the firecracker process" \

@@ -256,8 +256,12 @@ impl<'a> FirecrackerVm<'a, Configured> {
         // records its own PID and execs, or SIGKILL in stop() would hit
         // sudo and leave the VM orphaned.
         let fc_cmd = Cmd::new("sh")
-            .args(["-c", r#"echo $$ > "$1" || exit 1; shift; exec "$@""#, "sh"])
-            .arg(self.inst.pid_file_path())
+            .args([
+                "-c",
+                r#"rm -f "$1" || exit 1; echo $$ > "$1" || exit 1; shift; exec "$@""#,
+                "sh",
+            ])
+            .arg(&pid_path)
             .arg(&self.cfg.firecracker_bin)
             .arg("--api-sock")
             .arg(&socket_path)
@@ -278,16 +282,10 @@ impl<'a> FirecrackerVm<'a, Configured> {
                  is it installed and in PATH?",
             )?;
 
-        // Give Firecracker a moment to start, then check it
-        // didn't crash
-        std::thread::sleep(Duration::from_secs(1));
-
-        let pid =
-            fs::read_to_string(self.inst.pid_file_path()).context("Failed to read PID file")?;
+        let pid = wait_for_pid_file(&pid_path, Duration::from_secs(5))?;
         tracing::info!(
-            "Firecracker started with PID {} \
+            "Firecracker started with PID {pid} \
              (instance '{}')",
-            pid.trim(),
             self.inst.name
         );
 
@@ -296,6 +294,10 @@ impl<'a> FirecrackerVm<'a, Configured> {
             inst: self.inst,
             _state: PhantomData,
         };
+
+        // Give Firecracker a moment to start, then check it
+        // didn't crash
+        std::thread::sleep(Duration::from_secs(1));
 
         running.check_alive().context(
             "Firecracker exited immediately — \
@@ -561,6 +563,27 @@ fn kill_process_on_socket(socket_path: &std::path::Path) {
             tracing::debug!("Failed to kill PID {pid_str} (non-fatal): {e}");
         }
     }
+}
+
+/// Poll until the PID file contains a valid PID or the timeout elapses.
+fn wait_for_pid_file(pid_path: &Path, timeout: Duration) -> Result<u32> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        match fs::read_to_string(pid_path) {
+            Ok(pid_str) => {
+                if let Ok(pid) = pid_str.trim().parse() {
+                    return Ok(pid);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("Failed to read PID file"),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    bail!(
+        "Timed out waiting for valid PID file at {}",
+        pid_path.display()
+    );
 }
 
 /// Poll `kill -0` until the process exits or the timeout elapses.
