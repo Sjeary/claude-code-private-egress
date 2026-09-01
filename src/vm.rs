@@ -622,7 +622,10 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
-    use super::{MachineConfig, MiB, NonZeroU8, apply_machine_resources, read_machine_config};
+    use super::{
+        Duration, Instant, MachineConfig, MiB, NonZeroU8, apply_machine_resources,
+        read_machine_config, wait_for_pid_file,
+    };
 
     const SAMPLE_CONFIG_JSON: &str = r#"{
         "boot-source": {"kernel_image_path": "/k", "boot_args": "console=ttyS0"},
@@ -692,5 +695,72 @@ mod tests {
         let back: MachineConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.vcpu_count, 4);
         assert_eq!(back.mem_size_mib, 3072);
+    }
+
+    #[test]
+    fn wait_for_pid_file_returns_immediately_when_already_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.pid");
+        std::fs::write(&path, "4242\n").unwrap();
+
+        let start = Instant::now();
+        let pid = wait_for_pid_file(&path, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(pid, 4242);
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "a ready PID file must not cost a poll interval"
+        );
+    }
+
+    #[test]
+    fn wait_for_pid_file_retries_past_the_empty_write_window() {
+        // The trampoline's `echo $$ > "$1"` truncates before it writes, so a
+        // reader can legitimately observe a zero-byte file. That must retry,
+        // not fail.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.pid");
+        std::fs::write(&path, "").unwrap();
+
+        let writer = path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            std::fs::write(&writer, "777\n").unwrap();
+        });
+
+        assert_eq!(
+            wait_for_pid_file(&path, Duration::from_secs(5)).unwrap(),
+            777
+        );
+    }
+
+    #[test]
+    fn wait_for_pid_file_times_out_when_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-written.pid");
+
+        let err = wait_for_pid_file(&path, Duration::from_millis(300)).unwrap_err();
+
+        assert!(err.to_string().contains("Timed out"), "got: {err}");
+    }
+
+    #[test]
+    fn wait_for_pid_file_propagates_errors_other_than_not_found() {
+        // A directory reads as EISDIR, not NotFound: abort rather than spin
+        // until the timeout. This is the arm an unreadable root-owned PID
+        // file also takes.
+        let dir = tempfile::tempdir().unwrap();
+
+        let start = Instant::now();
+        let err = wait_for_pid_file(dir.path(), Duration::from_secs(30)).unwrap_err();
+
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a non-NotFound error must return at once, not poll to timeout"
+        );
+        assert!(
+            err.to_string().contains("Failed to read PID file"),
+            "got: {err}"
+        );
     }
 }
