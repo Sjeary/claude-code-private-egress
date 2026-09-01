@@ -253,16 +253,11 @@ impl<'a> FirecrackerVm<'a, Configured> {
             }
         }
 
-        // sudo forks rather than execs when `use_pty` is on (its default
-        // since 1.9.14), so the spawned child is the wrapper — the shell
-        // records its own PID and execs, or SIGKILL in stop() would hit
-        // sudo and leave the VM orphaned.
+        // Launched through PID_TRAMPOLINE so the recorded PID is the VMM
+        // rather than sudo's wrapper. Paths ride as positional argv ($1,
+        // $@), so nothing is interpolated into the shell string.
         let fc_cmd = Cmd::new("sh")
-            .args([
-                "-c",
-                r#"rm -f "$1" || exit 1; echo $$ > "$1" || exit 1; shift; exec "$@""#,
-                "sh",
-            ])
+            .args(["-c", PID_TRAMPOLINE, "sh"])
             .arg(&pid_path)
             .arg(&self.cfg.firecracker_bin)
             .arg("--api-sock")
@@ -566,6 +561,25 @@ fn kill_process_on_socket(socket_path: &std::path::Path) {
         }
     }
 }
+
+/// Shell wrapper that makes the recorded PID Firecracker's own.
+///
+/// `sudo` forks rather than execs when `use_pty` is on (its default since
+/// 1.9.14), so the spawned child is the wrapper and `Child::id()` names it
+/// instead of the VMM — `stop()`'s SIGKILL would then hit sudo and leave
+/// the VM running. This shell records its own PID and execs in place, so
+/// the PID file names the process SIGKILL must reach.
+///
+/// The mode is pinned because root's umask here comes from the host's
+/// PAM/`login.defs`, not ours: under a hardened `UMASK` (027 in the CIS
+/// baseline) the file would land unreadable to every unprivileged reader
+/// of it — `stop`, `status`, `check_alive` and `Instance::is_running`.
+const PID_TRAMPOLINE: &str = concat!(
+    r#"rm -f "$1" || exit 1; "#,
+    r#"echo $$ > "$1" || exit 1; "#,
+    r#"chmod 644 "$1" || exit 1; "#,
+    r#"shift; exec "$@""#,
+);
 
 /// Poll for the PID file until its contents parse as a PID.
 ///
