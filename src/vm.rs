@@ -228,8 +228,10 @@ impl<'a> FirecrackerVm<'a, Configured> {
         let log_path = self.inst.log_path();
         let socket_path = self.inst.api_socket_path();
 
-        // Kill orphaned Firecracker process if socket exists but no
-        // PID file (crash between spawn and PID write).
+        // Kill an orphaned Firecracker if the socket is present without a
+        // PID file: stop() removes the PID file unconditionally, and
+        // is_running() drops it whenever its liveness probe fails, so the
+        // file can go missing while the process still holds the socket.
         let pid_path = self.inst.pid_file_path();
         if socket_path.exists() && !pid_path.exists() {
             tracing::warn!(
@@ -295,10 +297,10 @@ impl<'a> FirecrackerVm<'a, Configured> {
             _state: PhantomData,
         };
 
-        // Give Firecracker a moment to start, then check it
-        // didn't crash
+        // The PID file only proves the trampoline reached its exec, so
+        // give Firecracker a beat to die before probing — otherwise
+        // check_alive() races an immediate crash.
         std::thread::sleep(Duration::from_secs(1));
-
         running.check_alive().context(
             "Firecracker exited immediately — \
              check logs with `coop logs`",
@@ -548,8 +550,8 @@ impl<'a> FirecrackerVm<'a, Running> {
 /// Find and kill any process holding the given Unix socket.
 ///
 /// Uses `lsof` to find the PID, then sends SIGKILL. This handles
-/// orphaned Firecracker processes left behind when the PID file
-/// was never written (crash between spawn and PID write).
+/// orphaned Firecracker processes whose PID file was removed while
+/// the process still held the socket.
 fn kill_process_on_socket(socket_path: &std::path::Path) {
     let Ok(stdout) = Cmd::new("lsof").arg("-t").arg(socket_path).sudo().capture() else {
         return;
@@ -565,7 +567,10 @@ fn kill_process_on_socket(socket_path: &std::path::Path) {
     }
 }
 
-/// Poll until the PID file contains a valid PID or the timeout elapses.
+/// Poll for the PID file until its contents parse as a PID.
+///
+/// Returns an error on timeout, or on the first read error that is
+/// not `NotFound`.
 fn wait_for_pid_file(pid_path: &Path, timeout: Duration) -> Result<u32> {
     let start = Instant::now();
     while start.elapsed() < timeout {
