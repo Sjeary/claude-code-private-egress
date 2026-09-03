@@ -1422,33 +1422,12 @@ pub fn prepare_env_forwarding(
         suppressed.push("OPENAI_API_KEY");
     }
     if cfg.private_egress.is_some() {
-        suppressed.extend([
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        ]);
+        suppressed.extend(crate::private_egress::PROXY_ENV_NAMES);
     }
     let suppression_reason = |name: &str| {
         if name == "OPENAI_API_KEY" {
             openai_suppression_reason
-        } else if cfg.private_egress.is_some()
-            && matches!(
-                name,
-                "HTTP_PROXY"
-                    | "HTTPS_PROXY"
-                    | "ALL_PROXY"
-                    | "NO_PROXY"
-                    | "http_proxy"
-                    | "https_proxy"
-                    | "all_proxy"
-                    | "no_proxy"
-            )
-        {
+        } else if cfg.private_egress.is_some() && crate::private_egress::is_proxy_env_name(name) {
             "private-egress mode"
         } else {
             "proxy mode"

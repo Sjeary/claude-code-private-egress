@@ -1684,32 +1684,12 @@ pub(crate) fn prepare_session_from_target(
                 if (proxy_anthropic && name.as_str() == "ANTHROPIC_API_KEY")
                     || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
                     || (cfg.private_egress.is_some()
-                        && matches!(
-                            name.as_str(),
-                            "HTTP_PROXY"
-                                | "HTTPS_PROXY"
-                                | "ALL_PROXY"
-                                | "NO_PROXY"
-                                | "http_proxy"
-                                | "https_proxy"
-                                | "all_proxy"
-                                | "no_proxy"
-                        ))
+                        && crate::private_egress::is_proxy_env_name(name.as_str()))
                 {
                     let reason = if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
                         "codex.auth = \"chatgpt\""
                     } else if cfg.private_egress.is_some()
-                        && matches!(
-                            name.as_str(),
-                            "HTTP_PROXY"
-                                | "HTTPS_PROXY"
-                                | "ALL_PROXY"
-                                | "NO_PROXY"
-                                | "http_proxy"
-                                | "https_proxy"
-                                | "all_proxy"
-                                | "no_proxy"
-                        )
+                        && crate::private_egress::is_proxy_env_name(name.as_str())
                     {
                         "private-egress mode"
                     } else {

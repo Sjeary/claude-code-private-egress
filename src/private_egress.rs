@@ -15,8 +15,22 @@ use crate::remote_command::RemoteCommand;
 
 pub const GATEWAY_NAME: &str = "coop-egress";
 pub(crate) const OPENAI_PROXY_ACTIVE_ENV: &str = "COOP_OPENAI_PROXY_ACTIVE";
+pub(crate) const PROXY_ENV_NAMES: [&str; 8] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
 const INSTANCE_MODE_MARKER: &str = "private-egress-mode";
 const INSTANCE_MODE_VERSION: &str = "version=1\n";
+
+pub(crate) fn is_proxy_env_name(name: &str) -> bool {
+    PROXY_ENV_NAMES.contains(&name)
+}
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -32,7 +46,7 @@ mod platform {
     use serde_yaml_ng::{Mapping, Value};
     use url::Url;
 
-    use super::GATEWAY_NAME;
+    use super::{GATEWAY_NAME, PROXY_ENV_NAMES};
     use crate::cmd::Cmd;
     use crate::config::{CoopConfig, PrivateEgressConfig};
     use crate::sha256_hash::Sha256Hash;
@@ -43,16 +57,7 @@ mod platform {
 
     fn lima_cmd() -> Cmd {
         let mut command = Cmd::new("limactl");
-        for name in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        ] {
+        for name in PROXY_ENV_NAMES {
             command = command.env_remove(name);
         }
         command
@@ -60,16 +65,7 @@ mod platform {
 
     fn host_curl_cmd() -> Cmd {
         let mut command = Cmd::new("curl");
-        for name in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        ] {
+        for name in PROXY_ENV_NAMES {
             command = command.env_remove(name);
         }
         command
