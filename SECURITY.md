@@ -5,7 +5,7 @@
 Do not report security vulnerabilities through public GitHub issues, pull
 requests, or discussions.
 
-Report them privately through either channel:
+Report them through this private channel:
 
 - **GitHub private vulnerability reporting** — open a report at
   <https://github.com/Sjeary/claude-code-private-egress/security/advisories/new>. It stays

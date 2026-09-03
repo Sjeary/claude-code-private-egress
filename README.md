@@ -28,12 +28,14 @@ provide this downstream's Mihomo gateway mode.
 
 ## Install from source
 
-Install [Rust](https://rustup.rs/) and Lima (`brew install lima`), then:
+Install [Rust](https://rustup.rs/), CMake, and Lima
+(`brew install cmake lima`), then:
 
 ```shell
 git clone https://github.com/Sjeary/claude-code-private-egress.git
 cd claude-code-private-egress
 cargo build --release --workspace
+mkdir -p "$HOME/.local/bin"
 install -m 0755 target/release/coop "$HOME/.local/bin/coop"
 install -m 0755 target/release/coop-proxy "$HOME/.local/bin/coop-proxy"
 ```

@@ -11,6 +11,7 @@ does not currently provide private-egress mode.
 
 - [Lima](https://github.com/lima-vm/lima) installed with `limactl` on your `PATH`
   (`brew install lima`) — `coop setup` fails without it
+- CMake for the `coop-proxy` TLS dependency (`brew install cmake`)
 - Apple Silicon (arm64)
 - Rosetta 2 for x86_64 guests on Apple Silicon: `softwareupdate --install-rosetta`
 
@@ -29,6 +30,7 @@ Build and install the current downstream from source:
 git clone https://github.com/Sjeary/claude-code-private-egress.git
 cd claude-code-private-egress
 cargo build --release --workspace
+mkdir -p "$HOME/.local/bin"
 install -m 0755 target/release/coop "$HOME/.local/bin/coop"
 install -m 0755 target/release/coop-proxy "$HOME/.local/bin/coop-proxy"
 ```
