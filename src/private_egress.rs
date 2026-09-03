@@ -175,13 +175,14 @@ mod platform {
         expected_egress: &str,
     ) -> String {
         let source = format!(
-            "version={GATEWAY_CONFIG_VERSION}\nsubscription={}\nexpected={}\nentry_group={}\nentry_choice={}\nexit_group={}\nexit_prefix={}\nexit_suffix={}\n",
+            "version={GATEWAY_CONFIG_VERSION}\nsubscription={}\nexpected={}\nentry_group={}\nentry_choice={}\nexit_group={}\nexit_choice={}\nexit_prefix={}\nexit_suffix={}\n",
             Sha256Hash::of(subscription.as_bytes()),
             Sha256Hash::of(expected_egress.as_bytes()),
             config.entry_group,
             config.entry_choice,
             config.exit_group,
-            config.exit_choice_prefix,
+            config.exit_choice.as_deref().unwrap_or_default(),
+            config.exit_choice_prefix.as_deref().unwrap_or_default(),
             config.exit_choice_suffix,
         );
         Sha256Hash::of(source.as_bytes()).to_string()
@@ -484,8 +485,13 @@ provision:
             name == config.entry_choice
         })?;
         let exit = prioritize_choice(groups, &config.exit_group, |name| {
-            name.starts_with(&config.exit_choice_prefix)
-                && name.ends_with(&config.exit_choice_suffix)
+            config.exit_choice.as_deref().map_or_else(
+                || {
+                    name.starts_with(config.exit_choice_prefix.as_deref().unwrap_or_default())
+                        && name.ends_with(&config.exit_choice_suffix)
+                },
+                |exact| name == exact,
+            )
         })?;
         let selections = vec![
             (config.entry_group.clone(), entry),
@@ -848,8 +854,7 @@ expected_egress_ip = "cmd:printf 203.0.113.10"
 entry_group = "entry-group"
 entry_choice = "us-entry"
 exit_group = "exit-group"
-exit_choice_prefix = "los-angeles-exit"
-exit_choice_suffix = ""
+exit_choice = "los-angeles-exit"
 "#,
             )
             .expect("valid test config");
@@ -902,7 +907,7 @@ proxy-groups:
     proxies: [other-entry, us-entry]
   - name: exit-group
     type: select
-    proxies: [DIRECT, los-angeles-exit]
+    proxies: [DIRECT, los-angeles-exit-backup, los-angeles-exit]
 rules: [MATCH,DIRECT]
 "#,
             )
@@ -986,6 +991,41 @@ rules: [MATCH,DIRECT]
                 profile.get(Value::String("store-selected".into())),
                 Some(&Value::Bool(true))
             );
+        }
+
+        #[test]
+        fn prefix_suffix_exit_choice_remains_supported() {
+            let cfg: CoopConfig = toml::from_str(
+                r#"
+[private_egress]
+subscription = "cmd:printf subscription"
+expected_egress_ip = "cmd:printf 203.0.113.10"
+entry_group = "entry-group"
+entry_choice = "us-entry"
+exit_group = "exit-group"
+exit_choice_prefix = "los-angeles-"
+exit_choice_suffix = "-exit"
+"#,
+            )
+            .expect("valid prefix/suffix config");
+            let subscription: Value = serde_yaml_ng::from_str(
+                r"
+proxy-groups:
+  - name: entry-group
+    proxies: [us-entry]
+  - name: exit-group
+    proxies: [DIRECT, los-angeles-2026-exit]
+",
+            )
+            .expect("valid subscription fixture");
+
+            let (_, _, selections) = harden_config(
+                subscription,
+                cfg.private_egress.as_ref().expect("private egress"),
+                Ipv4Addr::new(192, 0, 2, 53),
+            )
+            .expect("prefix/suffix selection");
+            assert!(selections.contains(&("exit-group".into(), "los-angeles-2026-exit".into())));
         }
 
         #[test]

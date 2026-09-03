@@ -1625,6 +1625,7 @@ impl<'de> Deserialize<'de> for SecretCommand {
 
 /// Transparent, fail-closed egress gateway settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawPrivateEgressConfig")]
 pub struct PrivateEgressConfig {
     /// Command that prints the Mihomo subscription URL on stdout.
     pub subscription: SecretCommand,
@@ -1636,8 +1637,77 @@ pub struct PrivateEgressConfig {
     pub entry_group: String,
     pub entry_choice: String,
     pub exit_group: String,
-    pub exit_choice_prefix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_choice_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub exit_choice_suffix: String,
+}
+
+#[derive(Deserialize)]
+struct RawPrivateEgressConfig {
+    subscription: SecretCommand,
+    expected_egress_ip: SecretCommand,
+    entry_group: String,
+    entry_choice: String,
+    exit_group: String,
+    #[serde(default)]
+    exit_choice: Option<String>,
+    #[serde(default)]
+    exit_choice_prefix: Option<String>,
+    #[serde(default)]
+    exit_choice_suffix: String,
+}
+
+impl TryFrom<RawPrivateEgressConfig> for PrivateEgressConfig {
+    type Error = String;
+
+    fn try_from(raw: RawPrivateEgressConfig) -> Result<Self, Self::Error> {
+        for (field, value) in [
+            ("entry_group", raw.entry_group.as_str()),
+            ("entry_choice", raw.entry_choice.as_str()),
+            ("exit_group", raw.exit_group.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(format!("private_egress.{field} must not be empty"));
+            }
+        }
+
+        match (&raw.exit_choice, &raw.exit_choice_prefix) {
+            (Some(exact), None) if exact.is_empty() => {
+                return Err("private_egress.exit_choice must not be empty".to_string());
+            }
+            (Some(_), None) if !raw.exit_choice_suffix.is_empty() => {
+                return Err(
+                    "private_egress.exit_choice_suffix requires exit_choice_prefix".to_string(),
+                );
+            }
+            (None, Some(prefix)) if prefix.is_empty() => {
+                return Err("private_egress.exit_choice_prefix must not be empty".to_string());
+            }
+            (Some(_), None) | (None, Some(_)) => {}
+            (Some(_), Some(_)) => {
+                return Err(
+                    "private_egress.exit_choice conflicts with exit_choice_prefix".to_string(),
+                );
+            }
+            (None, None) => {
+                return Err("private_egress requires exit_choice or exit_choice_prefix".to_string());
+            }
+        }
+
+        Ok(Self {
+            subscription: raw.subscription,
+            expected_egress_ip: raw.expected_egress_ip,
+            entry_group: raw.entry_group,
+            entry_choice: raw.entry_choice,
+            exit_group: raw.exit_group,
+            exit_choice: raw.exit_choice,
+            exit_choice_prefix: raw.exit_choice_prefix,
+            exit_choice_suffix: raw.exit_choice_suffix,
+        })
+    }
 }
 
 /// Validated IANA-style timezone name used inside the guest.
@@ -3756,6 +3826,25 @@ exit_choice_prefix = "los-angeles-exit"
 exit_choice_suffix = ""
 "#;
         assert!(toml::from_str::<CoopConfig>(command_backed).is_ok());
+
+        let exact = r#"
+[private_egress]
+subscription = "cmd:secret-tool lookup service subscription"
+expected_egress_ip = "cmd:secret-tool lookup service exit-ip"
+entry_group = "entry-group"
+entry_choice = "us-entry"
+exit_group = "exit-group"
+exit_choice = "los-angeles-exit"
+"#;
+        assert!(toml::from_str::<CoopConfig>(exact).is_ok());
+
+        let conflicting =
+            format!("{exact}exit_choice_prefix = \"los-angeles\"\nexit_choice_suffix = \"exit\"\n");
+        let error = toml::from_str::<CoopConfig>(&conflicting).unwrap_err();
+        assert!(
+            error.to_string().contains("exit_choice conflicts"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3768,6 +3857,21 @@ expected_egress_ip = "cmd:secret-tool lookup service exit-ip"
         let err = toml::from_str::<CoopConfig>(missing_selectors).unwrap_err();
         assert!(
             err.to_string().contains("missing field `entry_group`"),
+            "{err}"
+        );
+
+        let missing_exit_choice = r#"
+[private_egress]
+subscription = "cmd:secret-tool lookup service subscription"
+expected_egress_ip = "cmd:secret-tool lookup service exit-ip"
+entry_group = "entry-group"
+entry_choice = "us-entry"
+exit_group = "exit-group"
+"#;
+        let err = toml::from_str::<CoopConfig>(missing_exit_choice).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires exit_choice or exit_choice_prefix"),
             "{err}"
         );
     }

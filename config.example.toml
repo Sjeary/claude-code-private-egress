@@ -12,13 +12,15 @@
 #                                # Agent commands also get a normalized Linux
 #                                # hardware/process view; see docs for limits.
 #                                # Both fields MUST use cmd:; plaintext is rejected.
-# subscription = "cmd:security find-generic-password -s coop-mihomo-subscription -w"
-# expected_egress_ip = "cmd:security find-generic-password -s coop-mihomo-egress-ip -w"
+# subscription = "cmd:security find-generic-password -a '<macOS-account>' -s coop-mihomo-subscription -w"
+# expected_egress_ip = "cmd:security find-generic-password -a '<macOS-account>' -s coop-mihomo-egress-ip -w"
 # entry_group = "your-entry-group"
 # entry_choice = "your-us-entry-choice"
 # exit_group = "your-exit-group"
-# exit_choice_prefix = "your-los-angeles-exit"
-# exit_choice_suffix = ""
+# exit_choice = "your-exact-los-angeles-exit"
+# Advanced alternative for provider names with a changing middle component:
+# exit_choice_prefix = "your-los-angeles-prefix"
+# exit_choice_suffix = "your-stable-suffix"
 # GitHub auth strategy. Pick ONE of the two forms below — `github` cannot
 # be both a string and a table at the same time.
 #

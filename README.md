@@ -53,9 +53,11 @@ coop validate
 coop setup
 ```
 
-The selector names come from your Mihomo subscription. For a single fixed exit,
-enter the full exit node name as the prefix and leave the suffix empty. Startup
-also compares the observed public IPv4 with the expected value you supplied.
+The selector names come from your Mihomo subscription. For a fixed exit, enter
+its complete node name as `exit_choice`. Prefix/suffix matching remains
+available for providers that change a middle component of the node name.
+Startup also compares the observed public IPv4 with the expected value you
+supplied.
 
 ## Use Claude Code
 

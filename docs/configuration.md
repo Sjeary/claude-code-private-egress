@@ -154,13 +154,12 @@ host mounts, including devcontainer bind mounts.
 guest_timezone = "America/Los_Angeles"
 
 [private_egress]
-subscription = "cmd:security find-generic-password -s coop-mihomo-subscription -w"
-expected_egress_ip = "cmd:security find-generic-password -s coop-mihomo-egress-ip -w"
+subscription = "cmd:security find-generic-password -a '<macOS-account>' -s coop-mihomo-subscription -w"
+expected_egress_ip = "cmd:security find-generic-password -a '<macOS-account>' -s coop-mihomo-egress-ip -w"
 entry_group = "your-entry-group"
 entry_choice = "your-us-entry-choice"
 exit_group = "your-exit-group"
-exit_choice_prefix = "your-los-angeles-exit"
-exit_choice_suffix = ""
+exit_choice = "your-exact-los-angeles-exit"
 ```
 
 Both secret fields require a non-empty `cmd:` resolver; plaintext values are
@@ -168,18 +167,24 @@ rejected while loading the config. Store the subscription URL and expected
 IPv4 exit in Keychain, 1Password, `pass`, or another host-side secret manager.
 Never place either value in the repository or `.env.example`.
 
-The five selector fields are required because Mihomo subscription providers do
-not use a common naming scheme. `entry_group` and `exit_group` name selector
-groups, `entry_choice` is an exact member of the entry group, and the exit is
-the first member whose name starts with `exit_choice_prefix` and ends with
-`exit_choice_suffix`. Use the full exit name as the prefix and an empty suffix
-when you want an exact, location-pinned choice.
+The selector fields are required because Mihomo subscription providers do not
+use a common naming scheme. `entry_group` and `exit_group` name selector groups;
+`entry_choice` and `exit_choice` are exact members of those groups. Exact exit
+matching is the recommended location-pinned form and cannot silently select a
+longer similarly named node.
+
+As an advanced alternative, omit `exit_choice` and configure both
+`exit_choice_prefix` and `exit_choice_suffix`. Coop then selects the first member
+whose name starts and ends with those values. This accommodates providers that
+change a node name's middle component. Exact and prefix/suffix forms are
+mutually exclusive.
 
 On macOS, `scripts/setup-private-egress-keychain.sh` prompts with terminal echo
-disabled and creates the two Keychain entries used by the example. The script
-never writes either value to a repository file or prints it back to the screen.
-If `~/.coop/config.toml` does not exist, it also creates an owner-only config
-containing the Los Angeles timezone and Keychain-backed references above.
+disabled and creates the two account-scoped Keychain entries used by the
+example. The script never writes either value to a repository file or prints it
+back to the screen. It atomically creates or updates the owner-only
+`~/.coop/config.toml`, replacing only the root `guest_timezone` value and the
+`[private_egress]` section while preserving unrelated configuration.
 
 The gateway rewrites the subscription into Mihomo `mode: global`, removes every
 HTTP/SOCKS/redir/tproxy listener inherited from the subscription, disables LAN
