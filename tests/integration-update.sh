@@ -160,6 +160,10 @@ cp "$PROJECT_DIR/target/release/coop" "$TMPDIR/bin/coop-dev"
 export HOME="$TMPDIR/home"
 export XDG_STATE_HOME="$HOME/.local/state"
 export XDG_DATA_HOME="$HOME/.local/share"
+# Assertions below inspect coop's normal INFO messages. Do not let a caller's
+# logging filter hide them and turn a successful update check into a false
+# failure.
+unset RUST_LOG
 mkdir -p "$XDG_STATE_HOME" "$XDG_DATA_HOME"
 
 # ── Fabricate a "newer" release tarball ──────────────────────────────────────
