@@ -83,10 +83,13 @@ agent view.
 
 ## Security boundary
 
-This design isolates the agent from the macOS host and removes an agent-VM
-fallback to the host's ordinary network. It is not an anonymity guarantee: the
-Mihomo provider and destination services can observe traffic metadata, and
-kernel-level or timing inspection can still identify virtualization. See the
+With `--copy` or `--git-repo`, this design isolates the agent from the macOS
+host filesystem and removes an agent-VM fallback to the host's ordinary
+network. Private-egress mode rejects `--mount`, `--extra-mount`, and
+devcontainer host bind mounts because writable Lima virtiofs would cross that
+boundary. It is not an anonymity guarantee: the Mihomo provider and destination
+services can observe traffic metadata, and kernel-level or timing inspection
+can still identify virtualization. See the
 [trust model](docs/trust-model.md) and
 [private-egress reference](docs/configuration.md#private-egress) for the exact
 guarantees and limitations.

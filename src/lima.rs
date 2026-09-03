@@ -102,6 +102,7 @@ pub fn create_and_start(
     disk_gib: Option<crate::config::GiB>,
     mounts: &[crate::config::Mount],
 ) -> Result<()> {
+    crate::private_egress::ensure_no_host_mounts(cfg, mounts)?;
     let name = lima_name(inst);
     let template_path = cfg.lima_template_path(&inst.image);
     let base_img = cfg.lima_base_path(&inst.image);
@@ -217,6 +218,12 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     let name = lima_name(inst);
 
     crate::private_egress::ensure_instance_mode(cfg, inst)?;
+    if cfg.private_egress.is_some() && inst.dir.join("lima-template.yaml").exists() {
+        bail!(
+            "private-egress instance '{}' was created with host mounts; destroy and recreate it with `coop up --copy` or `coop up --git-repo`",
+            inst.name
+        );
+    }
     let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
     crate::private_egress::ensure_management_user(cfg, guest_user.as_ref())?;
 

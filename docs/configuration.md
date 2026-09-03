@@ -147,6 +147,8 @@ Firecracker TAP networking. These fields apply to Linux only. The Lima backend o
 separate `coop-egress` Lima VM running Mihomo TUN and connects agent VMs to it
 through Lima `user-v2`. No `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, proxy port,
 subscription URL, or Mihomo controller credential is placed in the agent VM.
+The mode accepts copied or guest-cloned workspaces and rejects all writable
+host mounts, including devcontainer bind mounts.
 
 ```toml
 guest_timezone = "America/Los_Angeles"

@@ -22,6 +22,11 @@ creating the project instance. If the instance already exists, destroy it
 first to change creation-time choices such as transport, image, disk size, or
 extra mounts.
 
+When `[private_egress]` is enabled, use the default copy transport or
+`--git-repo`. Coop rejects project mounts, extra mounts, and devcontainer bind
+mounts in that mode because a writable macOS host path is outside its VM-only
+filesystem boundary.
+
 `coop up` in copy mode tar-pipes the project into `/workspace` inside the
 guest over SSH. Both sides independently SHA-256-hash the tar stream. If the
 checksums diverge, the transfer aborts. coop persists the host-to-guest path

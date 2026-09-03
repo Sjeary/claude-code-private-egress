@@ -35,6 +35,11 @@ running, `up` reports success without creating another VM. If a matching
 instance is stopped, `up` restarts it. If no matching instance exists, `up`
 creates one.
 
+Private-egress mode accepts copied workspaces and repositories cloned inside
+the VM, but rejects `--mount`, `--extra-mount`, and devcontainer host bind
+mounts. Writable Lima virtiofs would give the restricted agent a direct path to
+modify host files and invalidate the mode's filesystem-isolation guarantee.
+
 By default, `up` copies/syncs the project into `/workspace`. Pass `--mount`
 to use the mount transport for the project at `/workspace` instead. On
 macOS/Lima this is a live virtiofs mount; on Linux/Firecracker it is a

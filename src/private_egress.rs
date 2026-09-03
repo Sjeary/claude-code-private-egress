@@ -35,6 +35,18 @@ pub(crate) fn is_proxy_env_name(name: &str) -> bool {
     PROXY_ENV_NAMES.contains(&name)
 }
 
+/// Private egress promises a VM-only filesystem boundary. A writable Lima
+/// virtiofs mount would let the restricted agent modify host files directly,
+/// so copied or guest-cloned workspaces are the only supported transports.
+pub fn ensure_no_host_mounts(cfg: &CoopConfig, mounts: &[crate::config::Mount]) -> Result<()> {
+    if cfg.private_egress.is_some() && !mounts.is_empty() {
+        anyhow::bail!(
+            "private-egress mode rejects host mounts because they bypass the VM filesystem boundary; use `coop up --copy` or `coop up --git-repo`"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use std::fs::{self, File};
@@ -1893,6 +1905,28 @@ exit_choice_suffix = ""
         ensure_management_user(&private, "ubuntu").expect("distinct manager is valid");
         ensure_management_user(&CoopConfig::default(), "developer")
             .expect("ordinary networking has no restricted account");
+    }
+
+    #[test]
+    fn private_egress_rejects_every_host_mount() {
+        let dir = tempfile::tempdir().expect("mount source");
+        let mount = crate::config::Mount::parse(
+            dir.path()
+                .to_str()
+                .expect("temporary directory path is UTF-8"),
+        )
+        .expect("valid mount");
+
+        ensure_no_host_mounts(&CoopConfig::default(), std::slice::from_ref(&mount))
+            .expect("ordinary mode permits an explicit mount");
+        let error = ensure_no_host_mounts(&private_config(), &[mount])
+            .expect_err("private egress must reject host mounts");
+        assert!(
+            error
+                .to_string()
+                .contains("bypass the VM filesystem boundary")
+        );
+        ensure_no_host_mounts(&private_config(), &[]).expect("copy mode has no host mounts");
     }
 
     #[test]

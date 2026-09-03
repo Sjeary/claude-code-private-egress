@@ -24,12 +24,14 @@ tool is to run AI coding agents (Claude Code, Codex) with broad autonomy
   `--dangerously-bypass-approvals-and-sandbox` / `--dangerously-skip-permissions`
   unless the user passes `--ask`.
 
-This is intentional and correct: there is **no privilege boundary inside the
-guest to protect** — the whole VM is the blast radius. The security model is
-"anything the agent does stays in the VM." Every rule below exists to keep that
-true: to stop guest-authored (therefore untrusted) data from escalating across
-the VM boundary into host code execution, host filesystem escape, or credential
-exposure.
+This is intentional and correct: there is **no privilege boundary inside an
+ordinary guest to protect** — the whole VM is the blast radius. The default
+copy/clone security model is "agent writes stay in the VM until the user
+explicitly pulls them." Ordinary mode also offers opt-in live host mounts,
+which intentionally cross that boundary. Private-egress mode rejects those
+mounts and adds the restricted account described below. Every rule below exists
+to stop other guest-authored (therefore untrusted) data from escalating into
+host code execution, host filesystem escape, or credential exposure.
 
 Treat the guest as **untrusted** from the host's point of view, even though the
 user launched it.

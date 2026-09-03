@@ -1207,6 +1207,7 @@ fn start_instance(
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
+    crate::private_egress::ensure_no_host_mounts(cfg, &opts.mounts)?;
     crate::private_egress::ensure_gateway(cfg)?;
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
 
