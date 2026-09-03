@@ -54,6 +54,38 @@ jobs:
       - name: Integration test — coop uninstall
         run: ./tests/integration-uninstall.sh
 
+  macos-private-egress:
+    name: macOS private egress
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      # The Mihomo gateway implementation is cfg-gated to macOS. This job must
+      # compile and test the root package on ARM rather than relying on Linux CI.
+      - name: Clippy
+        run: cargo clippy --package coop --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --package coop
+
+      - name: Build configuration-test binary
+        run: cargo build --package coop --bin coop
+
+      - name: Test Keychain setup helper
+        run: COOP_TEST_BIN="$PWD/target/debug/coop" bash tests/setup-private-egress-keychain.sh
+
   deny:
     runs-on: ubuntu-latest
     steps:
