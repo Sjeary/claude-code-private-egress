@@ -236,13 +236,14 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 
 Self-update (`update.rs`) must preserve, in order:
 
-1. Metadata from the pinned `trailofbits/coop` GitHub repo (compile-time const).
+1. Metadata from the pinned `Sjeary/claude-code-private-egress` GitHub repo
+   (compile-time const).
 2. `normalize_tag` — the version tag is validated as semver **before** it enters
    the API URL path (path-traversal guard).
 3. **Mandatory checksum.** The `SHA256SUMS` asset must be present (install is
    refused otherwise) and every downloaded tarball is verified against it
    (`verify_sha256`, constant-size `Sha256Hash` compare).
-4. **Best-effort attestation.** `gh attestation verify --repo trailofbits/coop
+4. **Best-effort attestation.** `gh attestation verify --repo Sjeary/claude-code-private-egress
    --bundle attestations.jsonl` (Sigstore provenance), against the bundle asset
    downloaded from the same release.
 
@@ -275,9 +276,9 @@ Self-update (`update.rs`) must preserve, in order:
 
    What still defeats a substituted bundle is the **subject-digest binding** —
    `gh` digests the artifact and requires a matching subject. `--repo
-   trailofbits/coop` pins the source repository and constrains the signer SAN
+   Sjeary/claude-code-private-egress` pins the source repository and constrains the signer SAN
    to that repo, but not to a specific workflow file or ref: any workflow on
-   any ref in `trailofbits/coop` holding `id-token: write` +
+   any ref in `Sjeary/claude-code-private-egress` holding `id-token: write` +
    `attestations: write` mints a bundle that satisfies it. `--signer-workflow`
    / `--cert-identity` are the tighter pin and neither client passes one — the
    API path is keyed by digest against the same repo-scoped store and is

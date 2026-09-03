@@ -8,11 +8,12 @@ requests, or discussions.
 Report them privately through either channel:
 
 - **GitHub private vulnerability reporting** — open a report at
-  <https://github.com/trailofbits/coop/security/advisories/new>. It stays
+  <https://github.com/Sjeary/claude-code-private-egress/security/advisories/new>. It stays
   visible only to the maintainers until a fix is published.
-- **Trail of Bits security contact** — follow the process in
-  <https://www.trailofbits.com/.well-known/security.txt> (encrypted upload via
-  SendSafely, or email dan@trailofbits.com).
+
+For a vulnerability that also affects unmodified upstream coop, reporters may
+separately use the upstream project's disclosure process. Do not send
+downstream-only configuration, credentials, or private-egress details there.
 
 Include as much of the following as you can:
 
@@ -29,11 +30,11 @@ a release and credit you unless you ask us not to.
 
 ## Supported Versions
 
-coop ships as a rolling release. Only the latest release receives security
-fixes. Fixes land on `main` and go out in the next tagged release; there are no
-long-term support branches. `coop update` installs the latest release, verifying
-its SHA-256 checksum and — when `gh` is present — the GitHub build-provenance
-attestation.
+Before the first downstream release, only source builds from `main` are
+supported. After tagged releases begin, only the latest release will receive
+security fixes; there are no long-term support branches. `coop update` installs
+that latest downstream release, verifying its SHA-256 checksum and — when `gh`
+is present — the GitHub build-provenance attestation.
 
 ## Scope
 

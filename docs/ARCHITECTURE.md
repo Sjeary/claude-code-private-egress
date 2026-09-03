@@ -175,7 +175,7 @@ dir: `instance.json`, `vm_config.json`, `workspace.json`, `forwards.json`,
 ## `coop update`
 
 `update.rs` self-updates the binary: fetch release metadata from the pinned
-`trailofbits/coop` repo, download the platform tarball + `SHA256SUMS` +
+`Sjeary/claude-code-private-egress` repo, download the platform tarball + `SHA256SUMS` +
 `attestations.jsonl`, verify the checksum (mandatory), verify the Sigstore
 attestation via `gh` against that bundle, falling back to the attestations API
 when the release publishes no usable one (best-effort),

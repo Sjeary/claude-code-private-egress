@@ -828,7 +828,11 @@ coop profiles show rust
 
 ### `update`
 
-Replace the running coop binary with a release from `github.com/trailofbits/coop`. Downloads the tarball matching the current host triple, verifies its SHA-256 against the release's `SHA256SUMS`, and (when `gh` is installed) verifies the GitHub build-provenance attestation before swapping the binary atomically.
+Replace the running coop binary with a release from
+`github.com/Sjeary/claude-code-private-egress`. Downloads the tarball matching
+the current host triple, verifies its SHA-256 against the release's
+`SHA256SUMS`, and (when `gh` is installed) verifies the GitHub build-provenance
+attestation before swapping the binary atomically.
 
 No authentication is required. When [`gh`](https://cli.github.com/) is authenticated against `github.com` or `GITHUB_TOKEN` is set, `coop update` uses it, which helps avoid GitHub API rate limits.
 

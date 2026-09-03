@@ -62,7 +62,7 @@ cleanup() {
 trap cleanup EXIT
 
 FIXTURE="$TMPDIR/fixture"
-mkdir -p "$FIXTURE/repos/trailofbits/coop/releases/tags"
+mkdir -p "$FIXTURE/repos/Sjeary/claude-code-private-egress/releases/tags"
 mkdir -p "$TMPDIR/bin" "$TMPDIR/build/${FAKE_DIR}"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -197,7 +197,7 @@ export COOP_UPDATE_API_BASE_URL="$BASE_URL"
 # ── Test 1: success flow ─────────────────────────────────────────────────────
 
 write_release_json \
-    "$FIXTURE/repos/trailofbits/coop/releases/latest" \
+    "$FIXTURE/repos/Sjeary/claude-code-private-egress/releases/latest" \
     "$FAKE_TAG" \
     "$(full_assets_block)"
 
@@ -233,7 +233,7 @@ fi
 cp "$RELEASE_BIN" "$COOP_BIN"
 CURRENT_VERSION="$("$COOP_BIN" --version | awk '{print $2}')"
 write_release_json \
-    "$FIXTURE/repos/trailofbits/coop/releases/latest" \
+    "$FIXTURE/repos/Sjeary/claude-code-private-egress/releases/latest" \
     "v${CURRENT_VERSION}" \
     "[]"
 
@@ -255,7 +255,7 @@ ORIG_SHA="$(sha_of "$COOP_BIN")"
 
 # Restore the newer-release fixture but corrupt SHA256SUMS.
 write_release_json \
-    "$FIXTURE/repos/trailofbits/coop/releases/latest" \
+    "$FIXTURE/repos/Sjeary/claude-code-private-egress/releases/latest" \
     "$FAKE_TAG" \
     "$(full_assets_block)"
 echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ${FAKE_TARBALL}" \

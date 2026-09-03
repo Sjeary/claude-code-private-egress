@@ -38,8 +38,8 @@ backend. The sections below note where that applies.
 Clone the repository and build:
 
 ```bash
-git clone https://github.com/trailofbits/coop
-cd coop
+git clone https://github.com/Sjeary/claude-code-private-egress
+cd claude-code-private-egress
 cargo build --release
 ```
 
@@ -158,7 +158,7 @@ described above.
 
 ## Reporting issues
 
-Open an issue on the [issue tracker](https://github.com/trailofbits/coop/issues).
+Open an issue on the [issue tracker](https://github.com/Sjeary/claude-code-private-egress/issues).
 For bug reports, include the platform and backend, the command you ran, and the
 output (coop's tracing output goes to stderr — `RUST_LOG=debug` adds detail).
 

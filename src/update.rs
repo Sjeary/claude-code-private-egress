@@ -24,7 +24,7 @@ use crate::fs_util::atomic_write_json;
 use crate::prompt::confirm;
 use crate::sha256_hash::Sha256Hash;
 
-const REPO: &str = "trailofbits/coop";
+const REPO: &str = "Sjeary/claude-code-private-egress";
 const DEFAULT_API_BASE: &str = "https://api.github.com";
 /// Release asset holding the Sigstore provenance bundle, published since #421.
 const BUNDLE_ASSET: &str = "attestations.jsonl";

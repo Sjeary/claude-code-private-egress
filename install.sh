@@ -8,7 +8,7 @@ set -euo pipefail
 #   VERSION=v0.2.1 ./install.sh           # specific version
 #   INSTALL_DIR=/usr/local/bin ./install.sh
 
-REPO="trailofbits/coop"
+REPO="Sjeary/claude-code-private-egress"
 BINARY="coop"
 BUNDLE="attestations.jsonl"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"

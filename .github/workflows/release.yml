@@ -74,7 +74,7 @@ jobs:
           # coop-proxy rides in the same tarball, inheriting the identical
           # SLSA build-provenance attestation with no new machinery.
           cp "target/${{ matrix.target }}/release/${BINARY}-proxy" "staging/${name}/"
-          cp LICENSE* staging/${name}/ 2>/dev/null || true
+          cp LICENSE* NOTICE* staging/${name}/ 2>/dev/null || true
           tar -czf "${name}.tar.gz" -C staging "${name}"
           echo "TARBALL=${name}.tar.gz" >> "$GITHUB_ENV"
 

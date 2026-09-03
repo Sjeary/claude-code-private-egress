@@ -156,7 +156,7 @@ pub(crate) fn cmd_uninstall(
 
     remove_self_binary(&binary_path)?;
     tracing::info!(
-        "coop uninstalled. To reinstall: curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | sh"
+        "coop uninstalled. To reinstall: curl -fsSL https://raw.githubusercontent.com/Sjeary/claude-code-private-egress/main/install.sh | sh"
     );
     Ok(())
 }

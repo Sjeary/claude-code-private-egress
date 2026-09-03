@@ -4,6 +4,13 @@
 
 ### New features
 
+- **Claude Code Private Egress downstream** — The project is now distributed as
+  a Claude Code-focused downstream of Trail of Bits' `coop`, with explicit
+  attribution and an independent release/update trust root. The command remains
+  `coop` for compatibility. Mihomo selector names are now required configuration
+  instead of provider-specific defaults, so private egress works with arbitrary
+  subscription naming schemes without publishing local selector details.
+
 - **Codex ChatGPT account auth** — New `[codex] auth = "chatgpt"` mode for
   account/workspace access without OpenAI API billing. coop installs Linux
   Secret Service support in the guest image, writes Codex's

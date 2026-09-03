@@ -1,6 +1,9 @@
 # Getting Started
 
-coop runs Claude Code and Codex inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
+This Claude Code-focused downstream runs agent CLIs inside isolated virtual
+machines. On macOS, its private-egress mode adds a separate fail-closed Mihomo
+gateway to the Lima VM path. The inherited Linux backend uses Firecracker and
+does not currently provide private-egress mode.
 
 ## Prerequisites
 
@@ -20,23 +23,27 @@ coop runs Claude Code and Codex inside isolated virtual machines. On Linux, it s
 
 ## Install
 
-Install the latest release:
+Build and install the current downstream from source:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | bash
+git clone https://github.com/Sjeary/claude-code-private-egress.git
+cd claude-code-private-egress
+cargo build --release --workspace
+install -m 0755 target/release/coop "$HOME/.local/bin/coop"
+install -m 0755 target/release/coop-proxy "$HOME/.local/bin/coop-proxy"
 ```
 
-`install.sh` verifies the downloaded tarball's SHA-256 against the release's
+After the first signed downstream release, `install.sh` verifies the downloaded
+tarball's SHA-256 against the release's
 `SHA256SUMS` and, when the [GitHub CLI](https://cli.github.com/) is installed,
 also verifies its Sigstore build-provenance attestation. `coop update` runs the
 same verification, except that it treats the checksum as mandatory and refuses
 to install without it. To verify a tarball by hand, download
 `attestations.jsonl` from the same release and pass `--bundle` (this needs no
-GitHub credential — releases up to v0.5.4 predate the bundle asset and do
-not publish it):
+GitHub credential):
 
 ```sh
-gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
+gh attestation verify coop-<version>-<triple>.tar.gz --repo Sjeary/claude-code-private-egress \
   --bundle attestations.jsonl
 ```
 

@@ -9,16 +9,16 @@ members = ["coop-proxy"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.5.4"
+version = "0.6.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/trailofbits/coop"
+repository = "https://github.com/Sjeary/claude-code-private-egress"
 
 [package]
 name = "coop"
 version.workspace = true
 edition.workspace = true
-description = "Isolated VM environment for running Claude Code"
+description = "Claude Code VM with fail-closed private egress"
 license.workspace = true
 repository.workspace = true
 
