@@ -13,6 +13,7 @@ use crate::backend::SshSession;
 use crate::config::CoopConfig;
 use crate::remote_command::RemoteCommand;
 
+#[cfg(target_os = "macos")]
 pub const GATEWAY_NAME: &str = "coop-egress";
 pub(crate) const OPENAI_PROXY_ACTIVE_ENV: &str = "COOP_OPENAI_PROXY_ACTIVE";
 pub(crate) const PROXY_ENV_NAMES: [&str; 8] = [
