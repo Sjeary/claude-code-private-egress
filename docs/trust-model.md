@@ -85,6 +85,13 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   `ps`/`/proc`. Known exceptions are the macOS `security` and 1Password `op`
   backends, which take the secret on argv because their CLIs offer no stdin
   path; this is documented at the call sites and limited to the store step.
+- **Restricted launches preserve data, not privileged variable semantics.** In
+  private-egress mode, arbitrary forwarded names must not be passed directly
+  through `sudo`: names such as `BASH_ENV` can change how a privileged shell
+  starts. Coop hex-encodes the selected agent environment behind one fixed,
+  inert variable name, clears the launcher's exported environment, decodes the
+  values, and only then drops to `developer`. The capsule itself is removed
+  before the agent starts and its value never appears on argv or disk.
 - **`GITHUB_TOKEN` defaults to Off.** It is only forwarded with an explicit
   `github = auto|env|pat` opt-in (`backend.rs:resolve_github_token`). When
   forwarded, `bootstrap_agents` runs `gh auth setup-git`, which makes the token

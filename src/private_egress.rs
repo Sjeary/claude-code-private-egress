@@ -3,6 +3,7 @@
 //! The agent VM never receives proxy settings. A separate Lima VM owns the
 //! Mihomo subscription and TUN device; the agent VM gets only an L3 next hop.
 
+use std::fmt::Write as _;
 use std::io::ErrorKind;
 
 #[cfg(target_os = "macos")]
@@ -28,6 +29,7 @@ pub(crate) const PROXY_ENV_NAMES: [&str; 8] = [
 ];
 const INSTANCE_MODE_MARKER: &str = "private-egress-mode";
 const INSTANCE_MODE_VERSION: &str = "version=1\n";
+const RESTRICTED_AGENT_ENV: &str = "COOP_RESTRICTED_AGENT_ENV";
 
 pub(crate) fn is_proxy_env_name(name: &str) -> bool {
     PROXY_ENV_NAMES.contains(&name)
@@ -979,7 +981,9 @@ rules: [MATCH,DIRECT]
             assert!(BOOT_GUARD_INSTALL_SCRIPT.contains("Before=network-pre.target"));
             assert!(BOOT_GUARD_INSTALL_SCRIPT.contains("iptables -w -P OUTPUT DROP"));
             assert!(BOOT_GUARD_INSTALL_SCRIPT.contains("--sport 68 --dport 67"));
-            assert!(AGENT_LOCKDOWN_SCRIPT.contains("env -i"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("for NAME in $(compgen -e)"));
+            assert!(AGENT_LOCKDOWN_SCRIPT.contains("done <<<\"$AGENT_ENV_CAPSULE\""));
+            assert!(!AGENT_LOCKDOWN_SCRIPT.contains("env -i"));
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("for item in .claude .claude.json .codex"));
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("ln -s \"$DEST\" \"$MANAGER_ITEM\""));
             assert!(AGENT_LOCKDOWN_SCRIPT.contains("rm -f /home/developer/.codex/auth.json"));
@@ -1205,7 +1209,7 @@ pub enum RestrictedAgent {
 }
 
 pub fn restricted_agent_command(
-    session: &SshSession,
+    session: &mut SshSession,
     agent: RestrictedAgent,
     binary: &str,
     args: Vec<String>,
@@ -1216,17 +1220,12 @@ pub fn restricted_agent_command(
         .contains_key("COOP_PRIVATE_EGRESS_ACTIVE")
     {
         let manager = session.target.user.as_ref();
-        let mut command = vec!["sudo".to_string()];
-        if agent == RestrictedAgent::Codex
-            && session
-                .env
-                .contains(crate::model_state::CODEX_LOCAL_ENV_KEY)
-        {
-            command.push(format!(
-                "--preserve-env={}",
-                crate::model_state::CODEX_LOCAL_ENV_KEY
-            ));
-        }
+        let capsule = restricted_agent_env_capsule(session, agent);
+        session.env.set(RESTRICTED_AGENT_ENV, capsule);
+        let mut command = vec![
+            "sudo".to_string(),
+            format!("--preserve-env={RESTRICTED_AGENT_ENV}"),
+        ];
         command.extend([
             "--".to_string(),
             "/usr/local/sbin/dev-session".to_string(),
@@ -1240,6 +1239,40 @@ pub fn restricted_agent_command(
         command.extend(args);
         command
     }
+}
+
+/// Encode the intended agent environment behind one inert variable name before
+/// crossing the passwordless-sudo boundary. Preserving arbitrary names such as
+/// `BASH_ENV` directly would let their shell semantics affect the root launcher.
+/// Values are hex encoded so neither secrets nor shell syntax enter argv.
+fn restricted_agent_env_capsule(session: &SshSession, agent: RestrictedAgent) -> String {
+    const NORMALIZED_NAMES: [&str; 13] = [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "HOSTNAME",
+        "TZ",
+        "TERM",
+        "COLORTERM",
+        "LANG",
+        "XDG_RUNTIME_DIR",
+        "PATH",
+        "COOP_PRIVATE_EGRESS_ACTIVE",
+        RESTRICTED_AGENT_ENV,
+    ];
+
+    let mut capsule = String::new();
+    for (name, value) in session.env.as_envs() {
+        if NORMALIZED_NAMES.contains(&name.as_str())
+            || name == OPENAI_PROXY_ACTIVE_ENV
+            || (name == crate::model_state::CODEX_LOCAL_ENV_KEY && agent != RestrictedAgent::Codex)
+        {
+            continue;
+        }
+        let _ = writeln!(&mut capsule, "{name}={}", hex::encode(value.as_bytes()));
+    }
+    capsule
 }
 
 /// Run a project-provided post-start hook inside the same unprivileged view as
@@ -1472,11 +1505,12 @@ set -euo pipefail
 RUNTIME=$1
 TOOL_HOME=$2
 AGENT_TZ=$3
+AGENT_ENV_CAPSULE=${COOP_RESTRICTED_AGENT_ENV-}
+export -n AGENT_ENV_CAPSULE 2>/dev/null || true
 shift 3
 VIEW=/usr/local/share/dev-session
 AGENT_UID=$(id -u developer)
 AGENT_GID=$(getent group developers | cut -d: -f3)
-CODEX_API_KEY=${COOP_LOCAL_API_KEY-}
 
 mount --make-rprivate /
 hostname devbox
@@ -1621,16 +1655,39 @@ if [[ "$TOOL_HOME" != /nonexistent && ${1-} == "$TOOL_HOME/"* ]]; then
   set -- "$TOOL_BINARY" "$@"
 fi
 
-exec setpriv --reuid="$AGENT_UID" --regid="$AGENT_GID" --init-groups \
-  env -i \
-    HOME=/home/developer USER=developer LOGNAME=developer \
-    SHELL=/bin/bash HOSTNAME=devbox TZ="$AGENT_TZ" \
-    TERM="${TERM:-xterm-256color}" COLORTERM="${COLORTERM:-truecolor}" \
-    LANG="${LANG:-C.UTF-8}" \
-    XDG_RUNTIME_DIR="/run/user/$AGENT_UID" \
-    PATH="/opt/tooling/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    COOP_LOCAL_API_KEY="$CODEX_API_KEY" \
-    "$@"
+SESSION_TERM=${TERM:-xterm-256color}
+SESSION_COLORTERM=${COLORTERM:-truecolor}
+SESSION_LANG=${LANG:-C.UTF-8}
+for NAME in $(compgen -e); do
+  unset "$NAME"
+done
+
+# Decode NAME=HEX records only after the root shell has started with a clean,
+# fixed environment. The original variable names therefore cannot influence
+# bash or sudo while either process is privileged.
+while IFS='=' read -r NAME VALUE_HEX; do
+  [ -n "$NAME" ] || continue
+  [[ $NAME =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
+  [ $(( ${#VALUE_HEX} % 2 )) -eq 0 ]
+  VALUE=
+  while [ -n "$VALUE_HEX" ]; do
+    BYTE=${VALUE_HEX:0:2}
+    VALUE_HEX=${VALUE_HEX:2}
+    [[ $BYTE =~ ^[0-9a-f]{2}$ ]] && [ "$BYTE" != 00 ]
+    printf -v CHAR '%b' "\\x$BYTE"
+    VALUE+=$CHAR
+  done
+  export "$NAME=$VALUE"
+done <<<"$AGENT_ENV_CAPSULE"
+
+export HOME=/home/developer USER=developer LOGNAME=developer
+export SHELL=/bin/bash HOSTNAME=devbox TZ="$AGENT_TZ"
+export TERM="$SESSION_TERM" COLORTERM="$SESSION_COLORTERM" LANG="$SESSION_LANG"
+export XDG_RUNTIME_DIR="/run/user/$AGENT_UID"
+export PATH="/opt/tooling/.local/bin:/usr/local/bin:/usr/bin:/bin"
+unset AGENT_ENV_CAPSULE NAME VALUE_HEX VALUE BYTE CHAR
+
+exec setpriv --reuid="$AGENT_UID" --regid="$AGENT_GID" --init-groups "$@"
 SCRIPT
 chmod 0755 /usr/local/libexec/dev-session-enter
 
@@ -1785,6 +1842,18 @@ exit_choice_suffix = ""
         .expect("valid private-egress config")
     }
 
+    fn decode_agent_capsule(capsule: &str) -> std::collections::BTreeMap<String, String> {
+        capsule
+            .lines()
+            .map(|line| {
+                let (name, encoded) = line.split_once('=').expect("capsule record");
+                let bytes = hex::decode(encoded).expect("hex value");
+                let value = String::from_utf8(bytes).expect("UTF-8 environment value");
+                (name.to_string(), value)
+            })
+            .collect()
+    }
+
     #[test]
     fn instance_mode_marker_rejects_both_configuration_mismatches() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1827,11 +1896,17 @@ exit_choice_suffix = ""
     }
 
     #[test]
-    fn restricted_command_preserves_only_the_managed_codex_key_without_exposing_its_value() {
+    fn restricted_command_capsules_agent_env_without_exposing_values_on_argv() {
         let mut env = EnvForward::default();
         env.set("COOP_PRIVATE_EGRESS_ACTIVE", "1");
         env.set("COOP_LOCAL_API_KEY", "secret-capability");
-        let session = SshSession {
+        env.set("COOP_OPENAI_PROXY_ACTIVE", "1");
+        env.set("ANTHROPIC_API_KEY", "sk-ant-secret-value");
+        env.set("CLAUDE_CODE_OAUTH_TOKEN", "oauth\nvalue");
+        env.set("CUSTOM_TOKEN", "custom;$(not-shell)");
+        env.set("BASH_ENV", "/workspace/untrusted.sh");
+        env.set("HOME", "/host/home");
+        let mut session = SshSession {
             target: SshTarget {
                 host: Hostname::new("127.0.0.1").expect("valid host"),
                 port: std::num::NonZeroU16::new(22).expect("non-zero port"),
@@ -1842,7 +1917,7 @@ exit_choice_suffix = ""
         };
 
         let command = restricted_agent_command(
-            &session,
+            &mut session,
             RestrictedAgent::Codex,
             "/usr/bin/codex",
             vec!["--ask".into()],
@@ -1851,7 +1926,7 @@ exit_choice_suffix = ""
             command,
             [
                 "sudo",
-                "--preserve-env=COOP_LOCAL_API_KEY",
+                "--preserve-env=COOP_RESTRICTED_AGENT_ENV",
                 "--",
                 "/usr/local/sbin/dev-session",
                 "ubuntu",
@@ -1859,15 +1934,65 @@ exit_choice_suffix = ""
                 "--ask",
             ]
         );
-        assert!(!command.iter().any(|arg| arg == "secret-capability"));
+        for secret in [
+            "secret-capability",
+            "sk-ant-secret-value",
+            "oauth\nvalue",
+            "custom;$(not-shell)",
+        ] {
+            assert!(!command.iter().any(|arg| arg.contains(secret)));
+        }
+
+        let codex_env = decode_agent_capsule(
+            session
+                .env
+                .as_envs()
+                .get(RESTRICTED_AGENT_ENV)
+                .expect("capsule set on SSH session"),
+        );
+        assert_eq!(
+            codex_env.get("COOP_LOCAL_API_KEY").map(String::as_str),
+            Some("secret-capability")
+        );
+        assert_eq!(
+            codex_env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-ant-secret-value")
+        );
+        assert_eq!(
+            codex_env.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some("oauth\nvalue")
+        );
+        assert_eq!(
+            codex_env.get("CUSTOM_TOKEN").map(String::as_str),
+            Some("custom;$(not-shell)")
+        );
+        assert_eq!(
+            codex_env.get("BASH_ENV").map(String::as_str),
+            Some("/workspace/untrusted.sh")
+        );
+        assert!(!codex_env.contains_key("COOP_PRIVATE_EGRESS_ACTIVE"));
+        assert!(!codex_env.contains_key("COOP_OPENAI_PROXY_ACTIVE"));
+        assert!(!codex_env.contains_key("HOME"));
 
         let claude = restricted_agent_command(
-            &session,
+            &mut session,
             RestrictedAgent::Claude,
             "/usr/bin/claude",
             Vec::new(),
         );
         assert!(!claude.iter().any(|arg| arg.contains("COOP_LOCAL_API_KEY")));
+        let claude_env = decode_agent_capsule(
+            session
+                .env
+                .as_envs()
+                .get(RESTRICTED_AGENT_ENV)
+                .expect("Claude capsule set"),
+        );
+        assert!(!claude_env.contains_key("COOP_LOCAL_API_KEY"));
+        assert_eq!(
+            claude_env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-ant-secret-value")
+        );
     }
 
     #[test]

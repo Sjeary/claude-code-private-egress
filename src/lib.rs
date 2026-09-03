@@ -1223,7 +1223,7 @@ pub fn run() -> Result<()> {
             ask,
             mut args,
         } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let mut sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             private_egress::ensure_gateway(&cfg)?;
             private_egress::configure_agent_guest(&sess, &cfg)?;
             // Guest user settings set `defaultMode: bypassPermissions`. Opting in
@@ -1234,7 +1234,7 @@ pub fn run() -> Result<()> {
             }
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
             let command = private_egress::restricted_agent_command(
-                &sess,
+                &mut sess,
                 private_egress::RestrictedAgent::Claude,
                 claude_bin.as_ref(),
                 args,
@@ -1242,13 +1242,13 @@ pub fn run() -> Result<()> {
             ssh::run_interactive(&sess, &command)
         }
         Commands::ClaudeAgents { name, mut args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let mut sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             private_egress::ensure_gateway(&cfg)?;
             private_egress::configure_agent_guest(&sess, &cfg)?;
             args.insert(0, "agents".to_string());
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
             let command = private_egress::restricted_agent_command(
-                &sess,
+                &mut sess,
                 private_egress::RestrictedAgent::Claude,
                 claude_bin.as_ref(),
                 args,
@@ -1256,7 +1256,7 @@ pub fn run() -> Result<()> {
             ssh::run_interactive(&sess, &command)
         }
         Commands::Codex { name, ask, args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let mut sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             private_egress::ensure_gateway(&cfg)?;
             private_egress::configure_agent_guest(&sess, &cfg)?;
             let args = codex_launch_args(ask, args);
@@ -1274,7 +1274,7 @@ pub fn run() -> Result<()> {
                 guest::codex_bin()
             };
             let command = private_egress::restricted_agent_command(
-                &sess,
+                &mut sess,
                 private_egress::RestrictedAgent::Codex,
                 codex_bin.as_ref(),
                 args,

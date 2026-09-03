@@ -78,6 +78,13 @@ Every field is optional. An empty `[claude]` section (or omitting it entirely) s
 
 coop forwards `ANTHROPIC_API_KEY` to the guest via SSH `SendEnv` on every session: `coop claude`, `coop shell`, and `coop exec` alike. The key is never written to disk inside the guest.
 
+In private-egress mode, `coop claude` crosses from the management account into
+the restricted `developer` account. Coop carries the resolved Claude and
+user-configured environment through that boundary in a single encoded,
+ephemeral environment value, clears the privileged launcher's environment,
+then restores the intended variables immediately before dropping privileges.
+Secret values are not placed on the command line or written to guest storage.
+
 Resolution order:
 
 1. `claude.api_key` in `config.toml`
